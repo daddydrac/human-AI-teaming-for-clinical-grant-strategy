@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "endpoints": {
+    "nih_reporter_projects": "https://api.reporter.nih.gov/v2/projects/search",
+    "clinical_trials_studies": "https://clinicaltrials.gov/api/v2/studies",
+    "openalex_works": "https://api.openalex.org/works"
+  },
+  "providers": {
+    "nih_reporter": true,
+    "clinical_trials": true,
+    "openalex": true,
+    "ip_web": true,
+    "technology_web": true
+  },
+  "limits": {
+    "max_profile_search_queries": 12,
+    "nih_reporter_results_per_query": 50,
+    "clinical_trials_results_per_query": 50,
+    "openalex_results_per_query": 50,
+    "max_candidates": 40,
+    "enrich_top_candidates": 15,
+    "max_assets_per_candidate": 100,
+    "max_assets_total": 2500,
+    "ip_web_results_per_candidate": 8,
+    "technology_web_results_per_candidate": 8,
+    "strategy_candidates": 12,
+    "strategy_assets_per_candidate": 6,
+    "strategy_max_chars": 90000,
+    "web_enrichment_concurrency": 4
+  },
+  "rate_limits": {
+    "nih_reporter_min_interval_ms": 1100,
+    "clinical_trials_min_interval_ms": 150,
+    "openalex_min_interval_ms": 150
+  },
+  "scoring": {
+    "asset_type_weights": {
+      "grant": 0.3,
+      "publication": 0.2,
+      "clinical_trial": 0.22,
+      "patent_ip": 0.18,
+      "technology": 0.1
+    },
+    "breadth_weight": 0.1,
+    "top_assets_per_type": 5,
+    "count_saturation": 5.0,
+    "minimum_asset_relevance": 0.35,
+    "provider_reliability": {
+      "nih_reporter": 1.0,
+      "clinical_trials": 1.0,
+      "openalex": 0.95,
+      "ip_web": 0.65,
+      "technology_web": 0.7
+    }
+  },
+  "ip_search_domains": [
+    "patents.google.com",
+    "data.uspto.gov",
+    "patentscope.wipo.int"
+  ],
+  "technology_search_domains": [],
+  "organization_suffixes": [
+    "INC",
+    "INCORPORATED",
+    "LLC",
+    "LTD",
+    "LIMITED",
+    "CORP",
+    "CORPORATION",
+    "PLC",
+    "LP"
+  ],
+  "updates": {
+    "auto_revise_sections": true,
+    "max_sections_per_refresh": 20,
+    "candidate_score_delta": 0.05,
+    "update_all_sections_on_strategy_change": true,
+    "update_all_sections_on_material_change": true,
+    "section_refresh_high_value": true
+  }
+}

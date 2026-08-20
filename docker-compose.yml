@@ -1,0 +1,196 @@
+services:
+  embedding-cpu:
+    profiles: ["cpu-embedding"]
+    build:
+      context: .
+      dockerfile: Dockerfile.embedding-cpu
+    environment:
+      CPU_EMBEDDING_MODEL: ${CPU_EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
+      CPU_EMBEDDING_API_MODEL: ${CPU_EMBEDDING_API_MODEL:-grant-embedding-cpu}
+      CPU_EMBEDDING_THREADS: ${CPU_EMBEDDING_THREADS:-2}
+      CPU_EMBEDDING_BATCH_SIZE: ${CPU_EMBEDDING_BATCH_SIZE:-16}
+      FASTEMBED_CACHE_PATH: /models
+      OMP_NUM_THREADS: ${CPU_EMBEDDING_THREADS:-2}
+      OPENBLAS_NUM_THREADS: 1
+      TOKENIZERS_PARALLELISM: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+    volumes:
+      - grant-embedding-models:/models
+    ports: ["127.0.0.1:8010:8010"]
+    mem_limit: ${EMBEDDING_MEMORY_LIMIT:-768m}
+    cpus: ${EMBEDDING_CPU_LIMIT:-2.0}
+    pids_limit: 256
+    read_only: true
+    init: true
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp:size=256m,mode=1777"]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health', timeout=5).read()"]
+      interval: 15s
+      timeout: 8s
+      retries: 20
+      start_period: 30s
+
+  core:
+    build:
+      context: .
+      dockerfile: Dockerfile.core
+    environment:
+      GRANT_WORKSPACE: /workspace
+      GRANT_RUNTIME_PROFILE: ${GRANT_RUNTIME_PROFILE:-unknown}
+      GRANT_BUILD_VERSION: ${GRANT_BUILD_VERSION:-0.8.0}
+      GRANT_BUILD_REVISION: ${GRANT_BUILD_REVISION:-development}
+      MODEL_ROUTING_MODE: ${MODEL_ROUTING_MODE:-hybrid}
+      OLMO_URL: ${OLMO_URL:-http://host.docker.internal:8000/v1/chat/completions}
+      OLMO_MODEL: ${OLMO_API_MODEL:-grant-olmo}
+      EMBEDDING_URL: ${EMBEDDING_URL:-http://host.docker.internal:8000/v1/embeddings}
+      EMBEDDING_MODEL: ${EMBEDDING_API_MODEL:-grant-embedding}
+      EMBEDDING_DOCUMENT_PREFIX: "${EMBEDDING_DOCUMENT_PREFIX:-}"
+      EMBEDDING_QUERY_PREFIX: "${EMBEDDING_QUERY_PREFIX:-}"
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-64}
+      INDEX_EMBED_BATCH_RECORDS: ${INDEX_EMBED_BATCH_RECORDS:-64}
+      EMBEDDING_HTTP_TIMEOUT_SECONDS: ${EMBEDDING_HTTP_TIMEOUT_SECONDS:-120}
+      DOCUMENT_CHUNK_WORDS: ${DOCUMENT_CHUNK_WORDS:-420}
+      DOCUMENT_CHUNK_OVERLAP_WORDS: ${DOCUMENT_CHUNK_OVERLAP_WORDS:-64}
+      CONTEXT_RETRIEVAL_K: ${CONTEXT_RETRIEVAL_K:-24}
+      CONTEXT_MAX_CHARS: ${CONTEXT_MAX_CHARS:-48000}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-4-5}
+      BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
+      BRAVE_SEARCH_ENDPOINT: ${BRAVE_SEARCH_ENDPOINT:-https://api.search.brave.com/res/v1/web/search}
+      RESEARCH_MAX_CONCURRENCY: ${RESEARCH_MAX_CONCURRENCY:-8}
+      RESEARCH_HTTP_TIMEOUT_SECONDS: ${RESEARCH_HTTP_TIMEOUT_SECONDS:-30}
+      RESEARCH_MAX_BODY_BYTES: ${RESEARCH_MAX_BODY_BYTES:-8388608}
+      MODEL_HTTP_TIMEOUT_SECONDS: ${MODEL_HTTP_TIMEOUT_SECONDS:-300}
+      EMBEDDING_HEALTH_TTL_SECONDS: ${EMBEDDING_HEALTH_TTL_SECONDS:-600}
+      CLAUDE_TASK_KINDS: ${CLAUDE_TASK_KINDS:-competitive_positioning,complex_scientific_synthesis}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-1}
+      RAYON_NUM_THREADS: ${RAYON_NUM_THREADS:-4}
+      RETRIEVAL_WEIGHT_SEMANTIC: ${RETRIEVAL_WEIGHT_SEMANTIC:-0.45}
+      RETRIEVAL_WEIGHT_LEXICAL: ${RETRIEVAL_WEIGHT_LEXICAL:-0.25}
+      RETRIEVAL_WEIGHT_EVIDENCE: ${RETRIEVAL_WEIGHT_EVIDENCE:-0.20}
+      RETRIEVAL_WEIGHT_FRESHNESS: ${RETRIEVAL_WEIGHT_FRESHNESS:-0.10}
+      RETRIEVAL_GRAPH_BOOST: ${RETRIEVAL_GRAPH_BOOST:-0.08}
+      RETRIEVAL_CANDIDATE_MULTIPLIER: ${RETRIEVAL_CANDIDATE_MULTIPLIER:-4}
+      RETRIEVAL_OPENMP_THRESHOLD: ${RETRIEVAL_OPENMP_THRESHOLD:-4096}
+      RETRIEVAL_FRESHNESS_HALF_LIFE_DAYS: ${RETRIEVAL_FRESHNESS_HALF_LIFE_DAYS:-365}
+      BM25_K1: ${BM25_K1:-1.2}
+      BM25_B: ${BM25_B:-0.75}
+      ORGANIZATION_NAME: ${ORGANIZATION_NAME:-Organization}
+      COMPETITIVE_CONFIG_PATH: ${COMPETITIVE_CONFIG_PATH:-/app/config/competitive_intelligence.json}
+      COMPETITIVE_HTTP_TIMEOUT_SECONDS: ${COMPETITIVE_HTTP_TIMEOUT_SECONDS:-45}
+      COMPETITIVE_REFRESH_TTL_SECONDS: ${COMPETITIVE_REFRESH_TTL_SECONDS:-14400}
+      COMPETITIVE_BACKGROUND_REFRESH_ENABLED: ${COMPETITIVE_BACKGROUND_REFRESH_ENABLED:-true}
+      COMPETITIVE_BACKGROUND_REFRESH_SECONDS: ${COMPETITIVE_BACKGROUND_REFRESH_SECONDS:-14400}
+      COMPETITIVE_USER_AGENT: ${COMPETITIVE_USER_AGENT:-GrantWriterCompetitive/1.0}
+      COMPETITIVE_HOME_ORGANIZATION_ALIASES: ${COMPETITIVE_HOME_ORGANIZATION_ALIASES:-}
+      OPENALEX_MAILTO: ${OPENALEX_MAILTO:-}
+      OPENALEX_API_KEY: ${OPENALEX_API_KEY:-}
+    volumes:
+      - grant-data:/workspace
+      - ./config:/app/config:ro
+    ports: ["127.0.0.1:8080:8080"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    mem_limit: ${CORE_MEMORY_LIMIT:-1536m}
+    cpus: ${CORE_CPU_LIMIT:-4.0}
+    pids_limit: 512
+    read_only: true
+    init: true
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp:size=128m,mode=1777"]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health/ready"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  renderer:
+    build:
+      context: .
+      dockerfile: Dockerfile.renderer
+    environment:
+      PROJECT_ROOT: /workspace/projects
+      OUTPUT_ROOT: /exports
+      RENDERER_CONFIG_ROOT: /app/config
+      ORGANIZATION_NAME: ${ORGANIZATION_NAME:-Organization}
+      COMPETITIVE_UPDATE_LABEL: ${COMPETITIVE_UPDATE_LABEL:-Competitive Edge Auto-Update}
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+    volumes:
+      - grant-data:/workspace
+      - ./config:/app/config:ro
+      - ${GRANT_EXPORT_HOME:-./exports}:/exports
+    ports: ["127.0.0.1:8090:8090"]
+    mem_limit: ${RENDERER_MEMORY_LIMIT:-768m}
+    cpus: ${RENDERER_CPU_LIMIT:-1.5}
+    pids_limit: 256
+    read_only: true
+    init: true
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp:size=512m,mode=1777"]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    environment:
+      CORE_URL: http://core:8080
+      RENDERER_URL: http://renderer:8090
+      GRANT_WORKSPACE: /workspace
+      UI_CONFIG_ROOT: /app/config
+      ORGANIZATION_NAME: ${ORGANIZATION_NAME:-Organization}
+      GRANT_BUILD_VERSION: ${GRANT_BUILD_VERSION:-0.8.0}
+      GRANT_SECTIONS: ${GRANT_SECTIONS:-}
+      COMPETITIVE_UI_POLL_SECONDS: ${COMPETITIVE_UI_POLL_SECONDS:-14400}
+      COMPETITIVE_UPDATE_LABEL: ${COMPETITIVE_UPDATE_LABEL:-Competitive Edge Auto-Update}
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+    depends_on:
+      core:
+        condition: service_healthy
+      renderer:
+        condition: service_healthy
+    volumes:
+      - grant-data:/workspace
+      - ./config:/app/config:ro
+      - ${GRANT_EXPORT_HOME:-./exports}:/exports
+    ports: ["127.0.0.1:7860:7860"]
+    mem_limit: ${UI_MEMORY_LIMIT:-768m}
+    cpus: ${UI_CPU_LIMIT:-1.0}
+    pids_limit: 256
+    read_only: true
+    init: true
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp:size=256m,mode=1777"]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+volumes:
+  grant-data:
+  grant-embedding-models:

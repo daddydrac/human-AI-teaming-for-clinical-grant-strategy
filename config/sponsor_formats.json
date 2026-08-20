@@ -1,0 +1,18 @@
+{
+  "nih": {
+    "body_font": "Arial",
+    "body_size_pt": 11.0,
+    "margin_top_in": 0.5,
+    "margin_bottom_in": 0.5,
+    "margin_left_in": 0.5,
+    "margin_right_in": 0.5
+  },
+  "national institutes of health": {
+    "body_font": "Arial",
+    "body_size_pt": 11.0,
+    "margin_top_in": 0.5,
+    "margin_bottom_in": 0.5,
+    "margin_left_in": 0.5,
+    "margin_right_in": 0.5
+  }
+}

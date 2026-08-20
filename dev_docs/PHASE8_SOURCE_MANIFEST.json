@@ -1,0 +1,414 @@
+{
+  "application": "mdanderson-grant-agent",
+  "build_environment": {
+    "machine": "x86_64",
+    "platform": "Linux-6.18.35-x86_64-with-glibc2.41"
+  },
+  "container_base_references": {
+    "Dockerfile.core": [
+      "rust:1.91.0-bookworm",
+      "debian:bookworm-slim"
+    ],
+    "Dockerfile.embedding-cpu": [
+      "python:3.12-slim"
+    ],
+    "Dockerfile.renderer": [
+      "python:3.12-slim"
+    ],
+    "Dockerfile.ui": [
+      "python:3.12-slim"
+    ]
+  },
+  "contains_secrets": false,
+  "generated_at_utc": "2026-08-20T22:19:06.583555+00:00",
+  "locks": {
+    "cargo_lock_present": false,
+    "cargo_lock_sha256": null,
+    "competitive_config_sha256": "384d04a727cfed0b89df7c64bf6b36189acd00362f5fdd55a1b49cb76852d25f",
+    "sponsor_formats_sha256": "ffad3b93d4d5e56eaa8c866956a75d9ba3e8b57558ecdf455801911189702ba8"
+  },
+  "model_provenance": "Apple MLX startup resolves model repositories to immutable revisions and records them at runtime; release operators should preserve the generated runtime manifest with regulated runs.",
+  "release_controls": {
+    "capabilities_dropped": true,
+    "loopback_only_ports": true,
+    "no_new_privileges": true,
+    "read_only_root_filesystems": true,
+    "sbom_format": "CycloneDX 1.5",
+    "signed_release_supported": true
+  },
+  "runtime_defaults": {
+    "apple_silicon_profile": "apple_mlx",
+    "competitive_refresh_seconds": 14400,
+    "ports": {
+      "core": 8080,
+      "embedding_cpu": 8010,
+      "renderer": 8090,
+      "ui": 7860
+    },
+    "weak_mac_profile": "docker_cpu"
+  },
+  "schema_version": 2,
+  "source_files": [
+    {
+      "bytes": 124,
+      "path": ".dockerignore",
+      "sha256": "776324820016da254bc87a879cedddd21a225bd483761a1091dc001ff453741e"
+    },
+    {
+      "bytes": 4233,
+      "path": ".env.example",
+      "sha256": "3b48ae585f5cbe742451523d47786658c3383e2c1034e37de27f3c0357ed8855"
+    },
+    {
+      "bytes": 1020,
+      "path": ".github/workflows/ci.yml",
+      "sha256": "09e66bb1f7072d4f02e1854778fb31414ccdf98224e9565b12a805981274af05"
+    },
+    {
+      "bytes": 151,
+      "path": ".gitignore",
+      "sha256": "ea640dc552a1e09e3725813258895a9269a4b8b99cb56ae80a44010ac3a28684"
+    },
+    {
+      "bytes": 1421,
+      "path": "Dockerfile.core",
+      "sha256": "dca0a79796437ecc4bff5aab059d1186b54c2754d4af98d1ffc22b6733191ef0"
+    },
+    {
+      "bytes": 576,
+      "path": "Dockerfile.embedding-cpu",
+      "sha256": "461895bfa30bffe34cd6414ea48d8ae2677f7a8106475960c4971bb21f163902"
+    },
+    {
+      "bytes": 635,
+      "path": "Dockerfile.renderer",
+      "sha256": "2201010359d428ddcc1933b6a112482fc9bcd630a1fb0b5d61f8f4736f84d78e"
+    },
+    {
+      "bytes": 400,
+      "path": "Dockerfile.ui",
+      "sha256": "41302be15cb10cd09d79888a076681c6f46315454dfc279378be4a56eb4e9769"
+    },
+    {
+      "bytes": 3839,
+      "path": "PHASE6_VALIDATION.md",
+      "sha256": "f8bbcb7c384982d27c766532c457f04a8111dee3705156146ee6a783efea64d9"
+    },
+    {
+      "bytes": 3274,
+      "path": "PHASE7_VALIDATION.md",
+      "sha256": "80a1148d48bf71e0d5b4de8dec301931fc9e729769d89e4e329ce02ce26a3620"
+    },
+    {
+      "bytes": 10121,
+      "path": "PHASE8_SOURCE_SBOM.cdx.json",
+      "sha256": "346883555e9fffd8b255b267fa3bf913c8975465154c65100048cfce51b3d424"
+    },
+    {
+      "bytes": 5147,
+      "path": "PHASE8_VALIDATION.md",
+      "sha256": "341810c6e094b495cdaf7374662e063861316891a10b7050861191b91c4e1abb"
+    },
+    {
+      "bytes": 29398,
+      "path": "README.md",
+      "sha256": "9590ae3cb0ac252756fcc994ac60c992939ddda42c3066ff686912fa147c1b91"
+    },
+    {
+      "bytes": 2116,
+      "path": "config/competitive_intelligence.json",
+      "sha256": "384d04a727cfed0b89df7c64bf6b36189acd00362f5fdd55a1b49cb76852d25f"
+    },
+    {
+      "bytes": 491,
+      "path": "config/default_design.json",
+      "sha256": "4b0a155037c36b2cd0ff0131f2514651280d5fbdf7010c023723e2995840063b"
+    },
+    {
+      "bytes": 107,
+      "path": "config/default_sections.json",
+      "sha256": "580cd20827909db6c205c51637a762a936b5e8e530893fefeeddfd6a2435c220"
+    },
+    {
+      "bytes": 16,
+      "path": "config/mlx-runtime.in",
+      "sha256": "0ac03b0cc86adfa97bc7c22eb53edfb91d7edb8092d05777e1794d9f58a983a2"
+    },
+    {
+      "bytes": 383,
+      "path": "config/sponsor_formats.json",
+      "sha256": "ffad3b93d4d5e56eaa8c866956a75d9ba3e8b57558ecdf455801911189702ba8"
+    },
+    {
+      "bytes": 1009,
+      "path": "core/Cargo.toml",
+      "sha256": "032f18ec1923933a8c6d15b6572a68245fed4521d49dd0d38268ded68260932a"
+    },
+    {
+      "bytes": 437,
+      "path": "core/build.rs",
+      "sha256": "ac97fcbf2a09c51da6a7a4196df1baa30710e497703c84cb308cbfe2d8549e45"
+    },
+    {
+      "bytes": 86,
+      "path": "core/rust-toolchain.toml",
+      "sha256": "57dc91c7ef18e7f2f5b5b52265f2eb79c240359fbdebdf3d2f9661de3143a2e6"
+    },
+    {
+      "bytes": 1879,
+      "path": "core/src/chunker.rs",
+      "sha256": "030e81311e0611911934ac6540d1c867a796cdde1013898b3437aff5013f687a"
+    },
+    {
+      "bytes": 25072,
+      "path": "core/src/clinical.rs",
+      "sha256": "52261597154f5fe9ff45c16453f804a1ad588eb93bde238693021342c5389756"
+    },
+    {
+      "bytes": 44092,
+      "path": "core/src/competitive.rs",
+      "sha256": "97614c678738ac67a586cc87d49be6847a42757079536b5c710f0b1a6313d4b4"
+    },
+    {
+      "bytes": 11189,
+      "path": "core/src/competitive_updates.rs",
+      "sha256": "126a0b95e885518fdf84a96a1ba234688a086b6b428adcaf6f1272c908cbb0e7"
+    },
+    {
+      "bytes": 12684,
+      "path": "core/src/compliance.rs",
+      "sha256": "60ed5e8528baf1829247e793feba948371798ee1d829950b2c0fb6047835d143"
+    },
+    {
+      "bytes": 2337,
+      "path": "core/src/context_compiler.rs",
+      "sha256": "5c6a62571ad5047e97e645765d8b67015a47756747dcc45f9746e74adea8abbf"
+    },
+    {
+      "bytes": 3327,
+      "path": "core/src/csr.rs",
+      "sha256": "dcccc14d075a22bff7e662f9f994696bf0c1f068503a11fc3e634ed82301432b"
+    },
+    {
+      "bytes": 2805,
+      "path": "core/src/domain.rs",
+      "sha256": "b562f3d757bddc66a7abc0185921b6847f5c70def89a1b5fea149adc825c94b5"
+    },
+    {
+      "bytes": 4513,
+      "path": "core/src/embedding.rs",
+      "sha256": "a48f7161bbcdae004ac2799aeb0beb4be2b6ab9ee8d6dd3b65eeedabfbd9265a"
+    },
+    {
+      "bytes": 3582,
+      "path": "core/src/hpc.rs",
+      "sha256": "0f4530a5af5a147f4d8d06824bf01e202405facd3e25374351a7987f562c0c74"
+    },
+    {
+      "bytes": 1619,
+      "path": "core/src/json_extract.rs",
+      "sha256": "37acc3fb716d82e6a14636e767c066a7bc10d5fd70200a14c978f8a05e1ca94d"
+    },
+    {
+      "bytes": 6538,
+      "path": "core/src/lexical.rs",
+      "sha256": "670b6dd6de1e955379b6a4fd3942781aa21e9bf03c55070afc8f66cf2741871e"
+    },
+    {
+      "bytes": 64814,
+      "path": "core/src/main.rs",
+      "sha256": "3e18bba9783a376117fcfcf06c2bce5d9841582bc78faf66aeec1f80cc2d20c8"
+    },
+    {
+      "bytes": 5917,
+      "path": "core/src/models.rs",
+      "sha256": "f5f982ba16101232ef71c118190eb4d01449c17182bf5a7adff8dc28dac39d70"
+    },
+    {
+      "bytes": 2977,
+      "path": "core/src/parquet_store.rs",
+      "sha256": "9ca64a101151dfdaac3843dbdcc50008df50f4e677335eba1ab76e8a342ff053"
+    },
+    {
+      "bytes": 2892,
+      "path": "core/src/record_store.rs",
+      "sha256": "90dfb244cf26344e6db5dc043097623d8262eda160f9cb3ab22663bae8a6b0a9"
+    },
+    {
+      "bytes": 8080,
+      "path": "core/src/research.rs",
+      "sha256": "39bd72c1665a4908258713c2065c65fe1c16eff9ff2b08e72fcb7fd09e45521b"
+    },
+    {
+      "bytes": 11816,
+      "path": "core/src/retrieval.rs",
+      "sha256": "cf132ec89ca1de6c59b63cd83b6ed593fe2451a5df78336a4eecd7681326788f"
+    },
+    {
+      "bytes": 112057,
+      "path": "core/src/storage.rs",
+      "sha256": "7a7f69a9d877bd125bf0e1cb6c8623c7bae125cd15e320a2f737757b5fdc30bf"
+    },
+    {
+      "bytes": 3502,
+      "path": "core/src/vector_store.rs",
+      "sha256": "421302cb933d44686e009b1fe4685824a4ee9cc95bc1d17b43cba3286c237798"
+    },
+    {
+      "bytes": 1895,
+      "path": "core/src/workflow.rs",
+      "sha256": "c686922ee737e28a4d190e7152ee91a608f817e05b8ad55bc3c0b957f0201490"
+    },
+    {
+      "bytes": 7781,
+      "path": "docker-compose.yml",
+      "sha256": "6a823d606b7e935524568412837cdf0382fb68103ab066b59be452eb8a56f83f"
+    },
+    {
+      "bytes": 2492,
+      "path": "embedding_cpu/app.py",
+      "sha256": "67ef29406103544e5deedae30acaadf5225d88084c403dbfecd7afaa22082e79"
+    },
+    {
+      "bytes": 80,
+      "path": "embedding_cpu/requirements.txt",
+      "sha256": "f657b3286d854b2bd2d34b9c63287530ac842149244d034454417ce1455a15b4"
+    },
+    {
+      "bytes": 2627,
+      "path": "hpc/hpc_kernels.cpp",
+      "sha256": "b9b347cde960c0f7f3b71754619bb4916b384edac66586965f0e585a1f0ccd92"
+    },
+    {
+      "bytes": 1288,
+      "path": "install.sh",
+      "sha256": "d5428faa68373e2989d419f38c171abf9c7da4979ed0589e32bcc3081f849676"
+    },
+    {
+      "bytes": 24956,
+      "path": "renderer/app.py",
+      "sha256": "c35929e5bbf56eef04a2ed777b72d204d249b9e24af52a4ac05e7a85c1cf05f3"
+    },
+    {
+      "bytes": 114,
+      "path": "renderer/requirements.txt",
+      "sha256": "7a173bee45490aad0662f02ccf696391fa0d0e45db438608bc3b46f348f513c8"
+    },
+    {
+      "bytes": 726,
+      "path": "scripts/audit_dependencies.sh",
+      "sha256": "2378565f674e9c6a2e5f65c899011e2f32003c270b5569eef0f6b9c97817f6b6"
+    },
+    {
+      "bytes": 1738,
+      "path": "scripts/backup.sh",
+      "sha256": "2e67bf8fc02549c9decba76bcdfa2b84efbd94bdb8aedceaa9fd4efe9a592318"
+    },
+    {
+      "bytes": 1946,
+      "path": "scripts/benchmark.sh",
+      "sha256": "af1573ade19a387cd7a1a63fdb911396de30a53b3b2aa2629df342d7e80f67f7"
+    },
+    {
+      "bytes": 1632,
+      "path": "scripts/build_release.sh",
+      "sha256": "63cba70e64354e7b0fcf3408528dc75f7eeb106cce738329f4bb571df93f6514"
+    },
+    {
+      "bytes": 2843,
+      "path": "scripts/configure_runtime.sh",
+      "sha256": "b3ae95e189f24824498ddb65f860821ee2dee028664b58aa968e75f86498b0ce"
+    },
+    {
+      "bytes": 1071,
+      "path": "scripts/doctor.sh",
+      "sha256": "ff8750d7aadb76e79a2bc762da4b3d0f8b6ebf9d3ca5cbe058150680fe869063"
+    },
+    {
+      "bytes": 959,
+      "path": "scripts/freeze_mlx_dependencies.sh",
+      "sha256": "abe7eadf25ab2a5106f2e8dce97c3a25bc1d86ca42364ddca745634599883e2f"
+    },
+    {
+      "bytes": 595,
+      "path": "scripts/freeze_rust_dependencies.sh",
+      "sha256": "47b26550e6c3c2236835c6d40cc2c50977c092a281b5bd04dcdbcb770c8fbe90"
+    },
+    {
+      "bytes": 2487,
+      "path": "scripts/generate_release_manifest.py",
+      "sha256": "982d16f29a738524a39bdeb7b02e2dac56357bbb87eb5f71c65c74892b2093dc"
+    },
+    {
+      "bytes": 3408,
+      "path": "scripts/generate_sbom.py",
+      "sha256": "47c442492fcd6a89341a2b5b212719e936a29fbf7a2223d227e2d9c7ac77730b"
+    },
+    {
+      "bytes": 1722,
+      "path": "scripts/preflight.sh",
+      "sha256": "fde5824d8ac53a1ef7ecc54c8eecba3345007a2c16cde3fe0b2ac60412d227a0"
+    },
+    {
+      "bytes": 948,
+      "path": "scripts/release_acceptance.sh",
+      "sha256": "45daa318cdab988495f63d3dd201b4abfd6f3f043ec13a2a648115c37e10a757"
+    },
+    {
+      "bytes": 1736,
+      "path": "scripts/restore.sh",
+      "sha256": "1b83d4c44507f4ea8796641a5d9fdd39f7a24cd59efed4539315652ce811866f"
+    },
+    {
+      "bytes": 1598,
+      "path": "scripts/security_scan.sh",
+      "sha256": "80b9096d6dcc0c2a90e2e5cfe0eaff29df509fa62f507f8260085980706edb8b"
+    },
+    {
+      "bytes": 861,
+      "path": "scripts/sign_release.sh",
+      "sha256": "08b0749dba53f59d9c282f542536df53e9b85a049f86b9ea6e185956434b2e5d"
+    },
+    {
+      "bytes": 23848,
+      "path": "scripts/smoke_test.sh",
+      "sha256": "c98c2d910b30359d0edbd3e6a1edcb26a3c222a7c2b57384b0a3d1fcf4fddb82"
+    },
+    {
+      "bytes": 5487,
+      "path": "scripts/start_mlx.sh",
+      "sha256": "de1cea41bd43f490c67375077998cc33d4bdb4a3daabcb6b62859fc031f1b330"
+    },
+    {
+      "bytes": 212,
+      "path": "scripts/tune_mac.sh",
+      "sha256": "739d194bfd4c672c3adfdda2748a34b869c27e69a938237fe75f1ff543417307"
+    },
+    {
+      "bytes": 12777,
+      "path": "scripts/validate.sh",
+      "sha256": "490b2340d18fb6d58c6f03e0c2c76767d241b294d56923963aea160861461bc3"
+    },
+    {
+      "bytes": 1932,
+      "path": "start.sh",
+      "sha256": "05785ddf11bb164d2872c1da816a307b34d93e6acac975e9c9ca158feef73941"
+    },
+    {
+      "bytes": 530,
+      "path": "stop.sh",
+      "sha256": "77df57d8a3a3b43c2a531f3ca363b287f0d47e66b624a4e27e89fa052f33fe23"
+    },
+    {
+      "bytes": 78653,
+      "path": "ui/app.py",
+      "sha256": "f87473b9ff52229beb9f75f7f01ee1599ff5ee1b28927e247e505905f4093b6f"
+    },
+    {
+      "bytes": 86,
+      "path": "ui/requirements.txt",
+      "sha256": "5be185a75d130f791e8ba017416bf75896de5c1a2e0366850b03cf55d6f7c396"
+    }
+  ],
+  "version": "0.8.0"
+}

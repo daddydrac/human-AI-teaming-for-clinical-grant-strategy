@@ -1,0 +1,33 @@
+[package]
+name = "grant-core"
+version = "0.8.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+axum = { version = "=0.8.4", features = ["multipart"] }
+tokio = { version = "=1.47.1", features = ["full"] }
+serde = { version = "=1.0.219", features = ["derive"] }
+serde_json = "=1.0.143"
+uuid = { version = "=1.18.0", features = ["v4", "serde"] }
+anyhow = "=1.0.99"
+thiserror = "=2.0.16"
+tracing = "=0.1.41"
+tracing-subscriber = { version = "=0.3.20", features = ["env-filter", "json"] }
+reqwest = { version = "=0.12.23", features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+rayon = "=1.11.0"
+memmap2 = "=0.9.8"
+bytemuck = { version = "=1.23.2", features = ["derive"] }
+arrow = "=57.0.0"
+parquet = { version = "=57.0.0", features = ["arrow"] }
+walkdir = "=2.5.0"
+sha2 = "=0.10.9"
+hex = "=0.4.3"
+parking_lot = "=0.12.4"
+time = { version = "=0.3.41", features = ["formatting"] }
+html2text = "=0.14.2"
+futures = "=0.3.31"
+
+[build-dependencies]
+cc = "=1.2.37"

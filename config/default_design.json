@@ -1,0 +1,20 @@
+{
+  "organization_name": "Organization",
+  "body_font": "Arial",
+  "body_size_pt": 11.0,
+  "heading_font": "Arial",
+  "heading_size_pt": 16.0,
+  "document_title_size_pt": 20.0,
+  "brand_line_size_pt": 9.0,
+  "primary_color": "#333333",
+  "text_color": "#222222",
+  "page_width_in": 8.5,
+  "page_height_in": 11.0,
+  "margin_top_in": 0.5,
+  "margin_bottom_in": 0.5,
+  "margin_left_in": 0.5,
+  "margin_right_in": 0.5,
+  "line_height": 1.18,
+  "paragraph_spacing_pt": 6.0,
+  "logo_path": null
+}

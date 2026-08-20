@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1.7
+ARG APP_VERSION=0.8.0
+FROM rust:1.91.0-bookworm AS build
+ARG APP_VERSION
+LABEL org.opencontainers.image.title="Research Clinic Grant Agent" org.opencontainers.image.version="${APP_VERSION}"
+RUN apt-get update && apt-get install -y --no-install-recommends g++ libgomp1 libopenblas-dev pkg-config && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY core ./core
+COPY hpc ./hpc
+WORKDIR /src/core
+# A checked-in Cargo.lock is preferred. On a fresh source tree the first controlled build
+# resolves exact direct pins and generates the lock, which scripts/freeze_rust_dependencies.sh
+# can persist before a release artifact is created.
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git \
+    if [ -f Cargo.lock ]; then cargo build --release --locked; else cargo generate-lockfile && cargo build --release --locked; fi
+
+FROM debian:bookworm-slim
+ARG APP_VERSION
+LABEL org.opencontainers.image.title="Research Clinic Grant Agent" org.opencontainers.image.version="${APP_VERSION}"
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 libopenblas0-pthread ca-certificates curl tar gzip && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/core/target/release/grant-core /usr/local/bin/grant-core
+COPY config /app/config
+ENV RUST_LOG=info GRANT_WORKSPACE=/workspace OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1
+EXPOSE 8080
+CMD ["grant-core"]
