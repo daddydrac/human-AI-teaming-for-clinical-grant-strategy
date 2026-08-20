@@ -1,6 +1,6 @@
-# MD Anderson Grant Workbench
+# Clincial Grant Workbench
 
-MD Anderson Grant Workbench is a local, human-in-the-loop application for developing sponsor-ready grant proposals. It turns a funding opportunity and supporting project materials into structured requirements, evidence, clinical-study design, competitive intelligence, reviewed grant sections, and a final DOCX/PDF submission package. The app runs as a Gradio UI backed by containerized Rust and Python services; supported Apple Silicon Macs can use local MLX inference, while other Macs use Claude with local CPU embeddings.
+Clincial Grant Workbench is a local, human-in-the-loop application for developing sponsor-ready grant proposals. It turns a funding opportunity and supporting project materials into structured requirements, evidence, clinical-study design, competitive intelligence, reviewed grant sections, and a final DOCX/PDF submission package. The app runs as a Gradio UI backed by containerized Rust and Python services; supported Apple Silicon Macs can use local MLX inference, while other Macs use Claude with local CPU embeddings.
 
 ## UI workflow
 
