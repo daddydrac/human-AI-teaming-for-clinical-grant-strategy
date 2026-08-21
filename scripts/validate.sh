@@ -150,12 +150,26 @@ assert hasattr(r,'measure') and hasattr(r,'package')
 print('Phase 7 compliance/intake/renderer validation passed.')
 PYPH7
 
-TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
+TMP="$(mktemp)"; TMP_M4="$(mktemp)"; trap 'rm -f "$TMP" "$TMP_M4"' EXIT
 GRANT_RUNTIME_PROFILE=docker_cpu "$ROOT/scripts/configure_runtime.sh" "$TMP" >/dev/null
 grep -q '^COMPOSE_PROFILES=cpu-embedding$' "$TMP"
 grep -q '^MODEL_ROUTING_MODE=claude_only$' "$TMP"
 grep -q '^EMBEDDING_URL=http://embedding-cpu:8010/v1/embeddings$' "$TMP"
 grep -q '^OMP_NUM_THREADS=' "$TMP"
+GRANT_RUNTIME_PROFILE=apple_mlx "$ROOT/scripts/configure_runtime.sh" "$TMP_M4" >/dev/null
+python3 - "$ROOT/env.m4Mac.txt" "$TMP_M4" <<'PYM4'
+import sys
+def values(path):
+    return dict(line.strip().split('=',1) for line in open(path) if '=' in line and not line.lstrip().startswith('#'))
+template,runtime=map(values,sys.argv[1:])
+assert template['GRANT_RUNTIME_PROFILE']=='apple_mlx'
+assert template['MODEL_ROUTING_MODE']=='hybrid'
+assert template['REQUIRE_CLAUDE_IN_HYBRID']=='true'
+assert template['OMP_NUM_THREADS']==template['RAYON_NUM_THREADS']=='8'
+assert float(template['CORE_CPU_LIMIT'])>=int(template['OMP_NUM_THREADS'])
+assert runtime['OMP_NUM_THREADS']==runtime['RAYON_NUM_THREADS']
+assert float(runtime['CORE_CPU_LIMIT'])>=int(runtime['OMP_NUM_THREADS'])
+PYM4
 
 if command -v cargo >/dev/null 2>&1 && [[ -f "$ROOT/core/Cargo.lock" ]]; then
   (cd "$ROOT/core" && cargo test --release --locked)

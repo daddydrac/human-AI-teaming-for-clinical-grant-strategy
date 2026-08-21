@@ -194,6 +194,10 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn rule(id:&str,rule_type:&str,target:&str,numeric_value:Option<f64>)->ComplianceRule {
+        ComplianceRule{rule_id:id.into(),category:"format".into(),rule_type:rule_type.into(),scope:"section".into(),target:target.into(),severity:"hard".into(),mandatory:true,numeric_value,text_value:None,list_value:vec![],source_excerpt:"explicit sponsor rule".into(),source_locator:"p1".into(),notes:String::new()}
+    }
+
     #[test]
     fn required_section_and_words_are_deterministic(){
         let p=ComplianceProfile{sponsor:None,mechanism:None,submission_system:None,deadline_iso:None,rules:vec![
@@ -202,5 +206,34 @@ mod tests {
         ]};
         let f=ComplianceFacts{approved_sections:vec![("specific_aims".into(),"Specific Aims".into(),"one two three".into())],artifacts:vec![],design_profile:json!({}),measurements:None,project_period_months:None};
         assert!(evaluate(&p,&f,&HashMap::new()).get("ready").unwrap().as_bool().unwrap());
+    }
+
+    #[test]
+    fn page_limits_use_the_target_section_and_cannot_be_manually_bypassed(){
+        let p=ComplianceProfile{sponsor:None,mechanism:None,submission_system:None,deadline_iso:None,rules:vec![
+            rule("C1","max_pages","specific_aims",Some(1.0)),
+            rule("C2","max_pages","research_strategy",Some(12.0)),
+        ]};
+        let f=ComplianceFacts{
+            approved_sections:vec![],artifacts:vec![],design_profile:json!({}),project_period_months:None,
+            measurements:Some(json!({"page_count":39,"sections":{"specific_aims":{"pages":1},"research_strategy":{"pages":13}}})),
+        };
+        let resolutions=HashMap::from([("C2".to_string(),("satisfied".to_string(),"stale manual override".to_string()))]);
+        let result=evaluate(&p,&f,&resolutions);
+        assert_eq!(result.get("hard_failures").and_then(Value::as_u64),Some(1));
+        assert_eq!(result.pointer("/findings/0/status").and_then(Value::as_str),Some("pass"));
+        assert_eq!(result.pointer("/findings/1/status").and_then(Value::as_str),Some("fail"));
+        assert_eq!(result.pointer("/findings/1/observed/page_count").and_then(Value::as_f64),Some(13.0));
+    }
+
+    #[test]
+    fn required_forms_are_artifacts_not_narrative_sections(){
+        let p=ComplianceProfile{sponsor:None,mechanism:None,submission_system:None,deadline_iso:None,rules:vec![
+            rule("C1","required_form","sf424",None),
+        ]};
+        let without=ComplianceFacts{approved_sections:vec![("sf424".into(),"SF424".into(),"narrative text must not satisfy this".into())],artifacts:vec![],design_profile:json!({}),measurements:None,project_period_months:None};
+        assert!(!evaluate(&p,&without,&HashMap::new()).get("ready").and_then(Value::as_bool).unwrap());
+        let with=ComplianceFacts{artifacts:vec![("sf424".into(),"sf424.pdf".into(),"pdf".into())],..without};
+        assert!(evaluate(&p,&with,&HashMap::new()).get("ready").and_then(Value::as_bool).unwrap());
     }
 }

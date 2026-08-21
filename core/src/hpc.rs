@@ -42,9 +42,9 @@ pub fn parallel_topk(scores:&[f32], k:usize)->Vec<(usize,f32)> {
     let chunk_size=(scores.len()+chunks-1)/chunks;
     let mut candidates:Vec<(usize,f32)>=scores.par_chunks(chunk_size).enumerate().flat_map_iter(|(ci,ch)| {
         let base=ci*chunk_size; let mut v:Vec<_>=ch.iter().copied().enumerate().map(|(i,s)|(base+i,s)).collect();
-        v.sort_unstable_by(|a,b|b.1.total_cmp(&a.1)); v.truncate(k.min(v.len())); v
+        v.sort_unstable_by(|a,b|b.1.total_cmp(&a.1).then_with(||a.0.cmp(&b.0))); v.truncate(k.min(v.len())); v
     }).collect();
-    candidates.sort_unstable_by(|a,b|b.1.total_cmp(&a.1)); candidates.truncate(k.min(candidates.len())); candidates
+    candidates.sort_unstable_by(|a,b|b.1.total_cmp(&a.1).then_with(||a.0.cmp(&b.0))); candidates.truncate(k.min(candidates.len())); candidates
 }
 
 pub fn max_threads()->i32 { std::env::var("OMP_NUM_THREADS").ok().and_then(|x|x.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n|n.get() as i32).unwrap_or(1)) }
@@ -58,4 +58,29 @@ pub fn self_benchmark()->serde_json::Value {
     let t=Instant::now(); let top_rayon=parallel_topk(&f,10); let rayon_topk_ms=t.elapsed().as_secs_f64()*1000.0;
     let t=Instant::now(); let top_openmp=openmp_topk(&f,10); let openmp_topk_ms=t.elapsed().as_secs_f64()*1000.0;
     json!({"rows":rows,"dims":cols,"normalize_ms":norm_ms,"sgemv_ms":score_ms,"fuse_ms":fuse_ms,"rayon_topk_ms":rayon_topk_ms,"openmp_topk_ms":openmp_topk_ms,"threads_hint":max_threads(),"checksum":f.iter().take(32).sum::<f32>(),"top0_rayon":top_rayon.first().map(|x|x.0),"top0_openmp":top_openmp.first().map(|x|x.0)})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openmp_topk_matches_parallel_reference_and_is_deterministic_on_ties(){
+        let values=vec![0.4,0.9,0.1,0.9,0.7,0.2,0.7,0.8];
+        let openmp=openmp_topk(&values,5);
+        let rayon=parallel_topk(&values,5);
+        assert_eq!(openmp,rayon);
+        assert_eq!(openmp.iter().map(|x|x.0).collect::<Vec<_>>(),vec![1,3,7,4,6]);
+    }
+
+    #[test]
+    fn hpc_primitives_produce_expected_values(){
+        let mut matrix=vec![3.0,4.0,0.0,5.0];
+        normalize_rows(&mut matrix,2,2);
+        let scored=scores(&matrix,&[1.0,0.0],2,2);
+        assert!((scored[0]-0.6).abs()<1e-6);
+        assert!(scored[1].abs()<1e-6);
+        let fused=fuse(&scored,&scored,&scored,&scored,[0.45,0.25,0.20,0.10]);
+        assert!((fused[0]-0.6).abs()<1e-6);
+    }
 }
