@@ -281,6 +281,16 @@ def load_profile(req: RenderRequest) -> Dict[str, Any]:
     return normalize_profile(profile)
 
 
+def markdown_to_text(value: str) -> str:
+    """Remove the small Markdown subset commonly emitted by drafting models."""
+    value = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", value)
+    value = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", value)
+    value = re.sub(r"(\*\*|__)(.*?)\1", r"\2", value)
+    value = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", value)
+    value = value.replace("`", "")
+    return value.strip()
+
+
 def build_ast(req: RenderRequest) -> Dict[str, Any]:
     blocks: List[Dict[str, Any]] = []
     if req.include_document_title:
@@ -295,13 +305,26 @@ def build_ast(req: RenderRequest) -> Dict[str, Any]:
                 "version": section.version,
             }
         )
+        first_body_block = True
         for paragraph in re.split(r"\n\s*\n", section.body or ""):
             paragraph = paragraph.strip()
             if paragraph:
+                lines = paragraph.splitlines()
+                if first_body_block and lines:
+                    candidate = re.sub(r"^#{1,6}\s*", "", lines[0]).strip()
+                    if candidate.casefold().rstrip(":") == section.title.strip().casefold().rstrip(":"):
+                        lines = lines[1:]
+                first_body_block = False
+                paragraph = "\n".join(lines).strip()
+                if not paragraph:
+                    continue
+                heading_match = re.fullmatch(r"#{1,6}\s+(.+)", paragraph)
+                block_type = "subheading" if heading_match else "paragraph"
+                text = markdown_to_text(heading_match.group(1) if heading_match else paragraph)
                 blocks.append(
                     {
-                        "type": "paragraph",
-                        "text": paragraph,
+                        "type": block_type,
+                        "text": text,
                         "section_key": section.section_key,
                         "version": section.version,
                     }
@@ -342,6 +365,8 @@ def html_from_ast(ast: Dict[str, Any], profile: Dict[str, Any]) -> str:
             blocks.append(f'<h2 class="doc-title">{text}</h2>')
         elif block["type"] == "heading":
             blocks.append(f"<h1>{text}</h1>")
+        elif block["type"] == "subheading":
+            blocks.append(f"<h2>{text}</h2>")
         elif block["type"] == "paragraph":
             blocks.append(f"<p>{text}</p>")
 
@@ -361,6 +386,7 @@ body {{ font-family: \"{profile['body_font']}\", sans-serif; font-size: {profile
 .logo {{ max-height: .42in; max-width: 1.7in; object-fit: contain; }}
 .doc-title {{ font-family: \"{profile['heading_font']}\", sans-serif; font-size: {profile['document_title_size_pt']}pt; margin: 0 0 16px; }}
 h1 {{ font-family: \"{profile['heading_font']}\", sans-serif; font-size: {profile['heading_size_pt']}pt; margin: 14px 0 10px; border-bottom: 2px solid {profile['primary_color']}; padding-bottom: 6px; }}
+h2 {{ font-family: \"{profile['heading_font']}\", sans-serif; font-size: {max(11.0, profile['heading_size_pt'] - 2)}pt; margin: 10px 0 6px; }}
 p {{ margin: 0 0 {profile['paragraph_spacing_pt']}pt; white-space: pre-wrap; }}
 @media screen {{
   body {{ background: #e7e7e7; padding: 16px; }}
@@ -478,6 +504,8 @@ def docx_from_ast(ast: Dict[str, Any], profile: Dict[str, Any], path: Path) -> N
             doc.add_heading(block["text"], 0)
         elif block["type"] == "heading":
             doc.add_heading(block["text"], 1)
+        elif block["type"] == "subheading":
+            doc.add_heading(block["text"], 2)
         elif block["type"] == "paragraph":
             paragraph = doc.add_paragraph(block["text"])
             paragraph.paragraph_format.line_spacing = profile["line_height"]
@@ -521,7 +549,18 @@ def measure(req: RenderRequest):
     for section in req.sections:
         words = len((section.body or "").split())
         total_words += words
-        by_section[section.section_key or section.title] = {"words": words}
+        section_req = RenderRequest(
+            project_id=req.project_id,
+            title=section.title,
+            sponsor=req.sponsor,
+            organization_name=req.organization_name,
+            sections=[section],
+            include_document_title=False,
+            design_profile=profile,
+        )
+        section_pdf = HTML(string=html_from_ast(build_ast(section_req), profile), base_url=str(project_dir(req.project_id))).write_pdf()
+        key = section.section_key or re.sub(r"[^a-z0-9]+", "_", section.title.lower()).strip("_")
+        by_section[key] = {"words": words, "pages": len(PdfReader(io.BytesIO(section_pdf)).pages)}
     return {"page_count": len(reader.pages), "word_count": total_words, "sections": by_section, "design_profile": profile}
 
 @app.post("/package")
@@ -530,49 +569,60 @@ def package(req: PackageRequest):
     output = OUTPUT_ROOT / req.project_id / "final"
     output.mkdir(parents=True, exist_ok=True)
     package_path = output / f"{safe(req.title)}_snapshot_{req.snapshot_id}_submission_package.zip"
+    temporary_path = package_path.with_suffix(".zip.tmp")
     manifest = dict(req.manifest)
     manifest.update({"project_id": req.project_id, "snapshot_id": req.snapshot_id, "generated_paths": req.generated_paths})
-    with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for raw in req.generated_paths:
-            path = Path(raw)
-            try:
-                resolved = path.resolve()
-                if OUTPUT_ROOT.resolve() not in resolved.parents or not path.is_file():
+    temporary_path.unlink(missing_ok=True)
+    try:
+        with zipfile.ZipFile(temporary_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            packaged_proposals = []
+            for raw in req.generated_paths:
+                path = Path(raw)
+                try:
+                    resolved = path.resolve()
+                    if OUTPUT_ROOT.resolve() not in resolved.parents or not path.is_file():
+                        continue
+                except Exception:
                     continue
-            except Exception:
-                continue
-            z.write(path, arcname=f"proposal/{path.name}")
-        # Package only artifacts registered in the immutable snapshot manifest.
-        # Files merely present in the shared submission directory are intentionally excluded.
-        submission = (root / "submission").resolve()
-        registered = manifest.get("submission_artifacts") or []
-        packaged_artifacts = []
-        for item in registered:
-            if not isinstance(item, dict):
-                continue
-            raw_path = item.get("path")
-            if not raw_path:
-                continue
-            try:
-                path = Path(raw_path).resolve()
-                if submission != path.parent and submission not in path.parents:
-                    raise HTTPException(400, "registered artifact is outside the project submission directory")
-                if not path.is_file():
-                    raise HTTPException(400, f"registered artifact is missing: {path.name}")
-            except HTTPException:
-                raise
-            except Exception as exc:
-                raise HTTPException(400, f"invalid registered artifact path: {exc}")
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            expected = str(item.get("sha256") or "").lower()
-            if not expected or digest != expected:
-                raise HTTPException(409, f"registered artifact checksum changed: {path.name}")
-            slot = safe(str(item.get("slot") or "attachments"))
-            filename = safe(str(item.get("filename") or path.name))
-            z.write(path, arcname=f"attachments/{slot}/{filename}")
-            packaged_artifacts.append({**item, "packaged_sha256": digest})
-        manifest["packaged_artifacts"] = packaged_artifacts
-        z.writestr("submission_manifest.json", json.dumps(manifest, indent=2))
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                z.write(path, arcname=f"proposal/{path.name}")
+                packaged_proposals.append({"filename": path.name, "sha256": digest})
+            # Package only artifacts registered in the immutable snapshot manifest.
+            # Files merely present in the shared submission directory are intentionally excluded.
+            submission = (root / "submission").resolve()
+            registered = manifest.get("submission_artifacts") or []
+            packaged_artifacts = []
+            for item in registered:
+                if not isinstance(item, dict):
+                    continue
+                raw_path = item.get("path")
+                if not raw_path:
+                    continue
+                try:
+                    path = Path(raw_path).resolve()
+                    if submission != path.parent and submission not in path.parents:
+                        raise HTTPException(400, "registered artifact is outside the project submission directory")
+                    if not path.is_file():
+                        raise HTTPException(400, f"registered artifact is missing: {path.name}")
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    raise HTTPException(400, f"invalid registered artifact path: {exc}")
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                expected = str(item.get("sha256") or "").lower()
+                if not expected or digest != expected:
+                    raise HTTPException(409, f"registered artifact checksum changed: {path.name}")
+                slot = safe(str(item.get("slot") or "attachments"))
+                filename = safe(str(item.get("filename") or path.name))
+                z.write(path, arcname=f"attachments/{slot}/{filename}")
+                packaged_artifacts.append({**item, "packaged_sha256": digest})
+            manifest["packaged_proposals"] = packaged_proposals
+            manifest["packaged_artifacts"] = packaged_artifacts
+            z.writestr("submission_manifest.json", json.dumps(manifest, indent=2))
+        temporary_path.replace(package_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
     return {"path": str(package_path)}
 
 @app.post("/render")

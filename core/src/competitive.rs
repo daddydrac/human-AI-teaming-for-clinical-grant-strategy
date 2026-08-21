@@ -376,7 +376,7 @@ PROJECT CONTEXT:
         let rows=v.get("results").and_then(Value::as_array).cloned().unwrap_or_default();
         let mut out=Vec::new();
         for r in rows {
-            let org=r.pointer("/organization/org_name").and_then(Value::as_str).or_else(||r.pointer("/organization/name").and_then(Value::as_str)).unwrap_or("").trim();
+            let org=r.pointer("/organization/org_name").and_then(Value::as_str).or_else(||r.pointer("/organization/name").and_then(Value::as_str)).unwrap_or("").trim().to_string();
             if org.is_empty(){continue;}
             let title=r.get("project_title").and_then(Value::as_str).unwrap_or("NIH-funded project").to_string();
             let abstract_text=r.get("abstract_text").and_then(Value::as_str).unwrap_or("").to_string();
@@ -384,8 +384,8 @@ PROJECT CONTEXT:
             let url=r.get("project_detail_url").and_then(Value::as_str).map(ToOwned::to_owned);
             let year=r.get("fiscal_year").and_then(Value::as_i64).map(|x|x as i32);
             let amount=r.get("total_cost").and_then(Value::as_f64).or_else(||r.get("total_cost").and_then(Value::as_i64).map(|x|x as f64));
-            let key=self.organization_key(org); if key.is_empty(){continue;}
-            out.push(make_asset(&key,org,"nih_reporter","grant",&external,&title,&abstract_text,url,year,amount,Some(spec.dimension_id.clone()),r));
+            let key=self.organization_key(&org); if key.is_empty(){continue;}
+            out.push(make_asset(&key,&org,"nih_reporter","grant",&external,&title,&abstract_text,url,year,amount,Some(spec.dimension_id.clone()),r));
         }
         Ok(out)
     }

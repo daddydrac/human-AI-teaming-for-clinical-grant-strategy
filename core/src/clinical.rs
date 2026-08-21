@@ -377,7 +377,7 @@ fn contextual_numbers(text:&str,terms:&[&str],window:usize)->Vec<i64>{
         if terms.iter().any(|term|tok.starts_with(term)) {
             let lo=i.saturating_sub(window); let hi=(i+window+1).min(tokens.len());
             for x in &tokens[lo..hi] {
-                let clean=x.replace(',',''); if let Ok(v)=clean.parse::<i64>() { out.push(v); }
+                let clean=x.replace(',',""); if let Ok(v)=clean.parse::<i64>() { out.push(v); }
             }
         }
     }
@@ -401,6 +401,6 @@ fn inv_norm(p:f64)->f64{
 mod tests{
     use super::*;
     #[test] fn recruitment_math(){let p=RecruitmentPlan{available_patients_per_site_month:Some(14.0),eligibility_rate_pct:Some(100.0),biomarker_positive_rate_pct:Some(35.0),consent_rate_pct:Some(70.0),target_enrollment:Some(180),accrual_months:Some(24.0),sites:Some(1)};let x=assess_recruitment(&p);assert!((x.expected_enrollments_per_month.unwrap()-3.43).abs()<0.01);assert_eq!(x.feasible_within_planned_window,Some(false));}
-    #[test] fn two_proportion_sample_size(){let p=StatisticsPlan{test_type:"two_proportions".into(),alpha:Some(.05),power:Some(.8),control_rate:Some(.25),treatment_rate:Some(.40),attrition_pct:Some(10.0),..Default::default()};let x=sample_size(&p).unwrap();assert!(x["adjusted_total_n"].as_u64().unwrap()>x["raw_total_n"].as_u64().unwrap());}
+    #[test] fn two_proportion_sample_size(){let p=StatisticsPlan{test_type:"two_proportions".into(),alpha:Some(0.05),power:Some(0.8),control_rate:Some(0.25),treatment_rate:Some(0.40),attrition_pct:Some(10.0),..Default::default()};let x=sample_size(&p).unwrap();assert!(x["adjusted_total_n"].as_u64().unwrap()>x["raw_total_n"].as_u64().unwrap());}
     #[test] fn sweep_parallel(){let mut s=ClinicalStudy::default();s.recruitment=RecruitmentPlan{available_patients_per_site_month:Some(10.0),eligibility_rate_pct:Some(80.0),biomarker_positive_rate_pct:Some(50.0),consent_rate_pct:Some(70.0),target_enrollment:Some(100),accrual_months:Some(24.0),sites:Some(1)};let x=scenario_sweep(&s,&ScenarioSweepInput{sites:vec![1,2],consent_rates_pct:vec![60.0,80.0],biomarker_positive_rates_pct:vec![40.0,60.0]},100).unwrap();assert_eq!(x["combinations"].as_u64(),Some(8));}
 }

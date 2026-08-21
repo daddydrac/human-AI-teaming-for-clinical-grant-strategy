@@ -159,7 +159,7 @@ async fn create_project(State(s):State<AppState>,Json(req):Json<CreateProject>)-
     if req.title.trim().is_empty(){return Err(ApiError::bad_request("working title is required"));}
     let id=Uuid::new_v4().to_string();
     s.store.create_project(&id,req.title.trim(),req.sponsor.as_deref(),req.mechanism.as_deref(),&req.sections)?;
-    std::fs::create_dir_all(s.workspace.join("projects").join(&id))?;
+    std::fs::create_dir_all(s.workspace.join("projects").join(&id)).map_err(anyhow::Error::from)?;
     Ok(Json(ProjectCreated{id,title:req.title}))
 }
 async fn get_project(State(s):State<AppState>,Path(id):Path<String>)->Result<Json<serde_json::Value>,ApiError>{
@@ -259,7 +259,9 @@ async fn maybe_auto_refresh_competitive(s:&AppState,id:&str)->Result<(),ApiError
     if stage < Stage::Science { return Ok(()); }
     if s.store.clinical_study_typed(id)?.is_none() { return Ok(()); }
     if !s.store.interview_generated(id)? || s.store.interview_open_count(id)? > 0 { return Ok(()); }
-    let _=ensure_competitive_fresh(s,id,false).await?;
+    if let Err(e)=ensure_competitive_fresh(s,id,false).await {
+        warn!(project_id=%id,error=%e.message,"competitive auto-refresh failed; continuing with stale state and keeping export fail-closed");
+    }
     Ok(())
 }
 
@@ -488,7 +490,7 @@ async fn compile_compliance_profile(State(s):State<AppState>,Path(id):Path<Strin
     if ctx.trim().is_empty(){return Err(ApiError::conflict("upload, fetch, or paste a funding opportunity before compiling sponsor submission rules"));}
     let project=s.store.project_json(&id)?;
     let prompt=format!(r#"Compile the funding opportunity into deterministic sponsor/submission rules. Return STRICT JSON only with this exact shape:
-{{"profile":{{"sponsor":null,"mechanism":null,"submission_system":null,"deadline_iso":null,"rules":[{{"rule_id":"C-001","category":"format|section|attachment|deadline|budget|eligibility|submission|administrative","rule_type":"required_section|max_words|min_words|required_attachment|allowed_extensions|min_font_size_pt|min_margin_in|max_pages|deadline|required_letter_count|manual_requirement|submission_system|max_budget|project_period_max_months","scope":"proposal|section|artifact|project","target":"specific target such as Specific Aims or letters_of_support","severity":"hard|warning|info","mandatory":true,"numeric_value":null,"text_value":null,"list_value":[],"source_excerpt":"short exact wording copied from source","source_locator":"page/heading/section if visible","notes":"brief normalization explanation"}}]}}}}
+{{"profile":{{"sponsor":null,"mechanism":null,"submission_system":null,"deadline_iso":null,"rules":[{{"rule_id":"C-001","category":"format|section|attachment|deadline|budget|eligibility|submission|administrative","rule_type":"required_section|required_form|max_words|min_words|required_attachment|allowed_extensions|min_font_size_pt|min_margin_in|max_pages|deadline|required_letter_count|manual_requirement|submission_system|max_budget|project_period_max_months","scope":"proposal|section|artifact|project","target":"specific target such as Specific Aims or letters_of_support","severity":"hard|warning|info","mandatory":true,"numeric_value":null,"text_value":null,"list_value":[],"source_excerpt":"short exact wording copied from source","source_locator":"page/heading/section if visible","notes":"brief normalization explanation"}}]}}}}
 Rules:
 - Extract only sponsor requirements explicitly supported by the funding-opportunity source. Never invent a rule.
 - Split compound instructions into atomic rules.
@@ -496,6 +498,7 @@ Rules:
 - Normalize dates to YYYY-MM-DD only when the date is explicit and unambiguous; otherwise create a manual_requirement preserving the source wording.
 - Normalize numeric limits into numeric_value. For file extensions, put lowercase extensions without dots in list_value.
 - Use required_section for explicitly required narrative sections; required_attachment for explicitly required package attachments; max_pages/max_words/min_font_size_pt/min_margin_in where explicit.
+- Use required_form, never required_section, for structured portal forms such as SF424, budgets, Senior/Key Person Profiles, performance sites, and other Grants.gov form components. Structured forms must not become AI-drafted narrative sections.
 - Rules that cannot be deterministically proven from the current application model must still be preserved as manual_requirement rather than dropped.
 - Every rule MUST include a non-empty source_excerpt copied from the opportunity.
 

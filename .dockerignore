@@ -1,0 +1,15 @@
+.git
+.github
+.env
+.runtime.env
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.venv
+core/target
+exports
+backups
+benchmarks
+releases
+workspace
+.DS_Store

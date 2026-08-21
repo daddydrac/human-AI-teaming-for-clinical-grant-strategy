@@ -18,7 +18,7 @@ impl MmapMatrixWriter {
         if data.len()%self.cols!=0 {bail!("batch does not contain whole rows");} let batch_rows=data.len()/self.cols; if start_row+batch_rows>self.rows {bail!("batch exceeds matrix rows");}
         let mut tmp=data.to_vec(); hpc::normalize_rows(&mut tmp,batch_rows,self.cols); let byte_start=HEADER+(start_row*self.cols*4); let byte_len=tmp.len()*4; let src=unsafe{std::slice::from_raw_parts(tmp.as_ptr() as *const u8,byte_len)}; self.mmap[byte_start..byte_start+byte_len].copy_from_slice(src); Ok(())
     }
-    pub fn finish(mut self)->Result<()> { self.mmap.flush()?; Ok(()) }
+    pub fn finish(self)->Result<()> { self.mmap.flush()?; Ok(()) }
 }
 
 pub struct MmapMatrix { mmap: Mmap, pub rows: usize, pub cols: usize }

@@ -66,7 +66,7 @@ fn norm(v: &str) -> String {
 pub fn validate_profile(profile: &ComplianceProfile) -> Result<()> {
     if profile.rules.is_empty() { bail!("compliance profile contains no rules"); }
     let allowed = [
-        "required_section", "max_words", "min_words", "required_attachment",
+        "required_section", "required_form", "max_words", "min_words", "required_attachment",
         "allowed_extensions", "min_font_size_pt", "min_margin_in", "max_pages",
         "deadline", "required_letter_count", "manual_requirement", "submission_system",
         "max_budget", "project_period_max_months",
@@ -119,7 +119,11 @@ pub fn evaluate(
 
     for rule in &profile.rules {
         let resolution=resolutions.get(&rule.rule_id);
-        let manually_satisfied=resolution.map(|x|matches!(x.0.as_str(),"satisfied"|"not_applicable"|"waived")).unwrap_or(false);
+        // Human resolutions are for rules that are inherently non-deterministic.
+        // Never let a stale checkbox suppress checks we can recompute from the
+        // approved document, rendered measurements, or registered artifacts.
+        let manual_rule=matches!(rule.rule_type.as_str(),"manual_requirement"|"max_budget");
+        let manually_satisfied=manual_rule && resolution.map(|x|matches!(x.0.as_str(),"satisfied"|"not_applicable"|"waived")).unwrap_or(false);
         let mut status="pass".to_string(); let mut detail=String::new(); let mut observed=Value::Null;
         if manually_satisfied {
             detail=format!("Human resolution: {}{}",resolution.unwrap().0,if resolution.unwrap().1.is_empty(){""}else{" — "});
@@ -137,12 +141,12 @@ pub fn evaluate(
                     observed=json!({"words":count,"limit":expected});
                     let ok=if rule.rule_type=="max_words"{count<=expected}else{count>=expected}; if !ok {status="fail".into();detail=format!("Observed {count} words; sponsor rule requires {} {expected} words.",if rule.rule_type=="max_words"{"at most"}else{"at least"});}
                 },
-                "required_attachment" => {
+                "required_attachment"|"required_form" => {
                     let target=norm(&rule.target); let ok=artifacts.iter().any(|(s,n,_)|s==&target||n.contains(&target.replace('_'," "))||n.contains(&target)); observed=json!({"registered":ok}); if !ok{status="fail".into();detail="Required submission artifact is not registered.".into();}
                 },
                 "allowed_extensions" => {
                     let target=norm(&rule.target); let allowed=rule.list_value.iter().map(|x|x.trim().trim_start_matches('.').to_ascii_lowercase()).collect::<Vec<_>>();
-                    let matching=artifacts.iter().filter(|(s,_,_)|target.is_empty()||s==&target).collect::<Vec<_>>(); let bad=matching.iter().filter(|(_,_,e)|!allowed.iter().any(|a|a==*e)).map(|(_,n,_)|(*n).clone()).collect::<Vec<_>>(); observed=json!({"matching":matching.len(),"invalid":bad}); if !bad.is_empty(){status="fail".into();detail="One or more registered submission artifacts use a disallowed extension.".into();}
+                    let matching=artifacts.iter().filter(|(s,_,_)|target.is_empty()||s==&target).collect::<Vec<_>>(); let bad=matching.iter().filter(|(_,_,e)|!allowed.iter().any(|a|a.as_str()==e.as_str())).map(|(_,n,_)|(*n).clone()).collect::<Vec<_>>(); observed=json!({"matching":matching.len(),"invalid":bad}); if !bad.is_empty(){status="fail".into();detail="One or more registered submission artifacts use a disallowed extension.".into();}
                 },
                 "min_font_size_pt" => {
                     let min=rule.numeric_value.unwrap_or(0.0); let actual=num(&facts.design_profile,"body_size_pt").unwrap_or(0.0); observed=json!({"body_size_pt":actual,"minimum":min}); if actual<min{status="fail".into();detail=format!("Body font is {actual} pt; minimum is {min} pt.");}
@@ -151,7 +155,14 @@ pub fn evaluate(
                     let min=rule.numeric_value.unwrap_or(0.0); let keys=["margin_top_in","margin_right_in","margin_bottom_in","margin_left_in"]; let vals=keys.iter().map(|k|num(&facts.design_profile,k).unwrap_or(0.0)).collect::<Vec<_>>(); observed=json!({"margins_in":vals,"minimum":min}); if vals.iter().any(|v|*v<min){status="fail".into();detail=format!("At least one configured margin is smaller than {min} inches.");}
                 },
                 "max_pages" => {
-                    let limit=rule.numeric_value.unwrap_or(0.0); let pages=facts.measurements.as_ref().and_then(|m|m.get("page_count")).and_then(Value::as_f64); observed=json!({"page_count":pages,"limit":limit}); match pages {Some(p) if p<=limit=>{},Some(p)=>{status="fail".into();detail=format!("Rendered proposal is {p} pages; maximum is {limit}.");},None=>{status="deferred".into();detail="Final rendered page measurement is required before export.".into();}}
+                    let limit=rule.numeric_value.unwrap_or(0.0);
+                    let target=norm(&rule.target);
+                    let pages=if target.is_empty()||target=="document"||target=="full_document"||target=="proposal" {
+                        facts.measurements.as_ref().and_then(|m|m.get("page_count")).and_then(Value::as_f64)
+                    } else {
+                        facts.measurements.as_ref().and_then(|m|m.get("sections")).and_then(|s|s.get(&target)).and_then(|s|s.get("pages")).and_then(Value::as_f64)
+                    };
+                    observed=json!({"page_count":pages,"limit":limit,"target":target}); match pages {Some(p) if p<=limit=>{},Some(p)=>{status="fail".into();detail=format!("Rendered target '{}' is {p} pages; maximum is {limit}.",rule.target);},None=>{status="deferred".into();detail=format!("Rendered page measurement for '{}' is required before export.",rule.target);}}
                 },
                 "deadline" => {
                     let value=rule.text_value.as_deref().or(profile.deadline_iso.as_deref()).unwrap_or(""); let parsed=parse_ymd(value); observed=json!({"deadline":value}); if let Some(d)=parsed {if today_ymd()>d{status="fail".into();detail="Sponsor deadline has passed in UTC date terms.".into();}} else {status="deferred".into();detail="Deadline could not be normalized to YYYY-MM-DD; human confirmation is required.".into();}

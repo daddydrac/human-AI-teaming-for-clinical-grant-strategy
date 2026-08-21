@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cblas.h>
 #include <omp.h>
+#include <queue>
 #include <vector>
 #include <utility>
 
@@ -44,24 +45,32 @@ void hpc_topk_indices(const float* scores, std::size_t n, std::size_t k, std::ui
     // Parallel block-local top-k candidates, followed by deterministic merge.
     const int threads = omp_get_max_threads();
     const std::size_t local_k = std::min(k, n);
+    if (local_k == 0) return;
     std::vector<std::vector<std::pair<float,std::uint32_t>>> locals(threads);
     #pragma omp parallel
     {
         int tid = omp_get_thread_num();
         auto& v = locals[tid];
         v.reserve(local_k);
+        // `better` makes the priority queue expose the worst retained candidate,
+        // keeping per-thread memory bounded by k instead of the full index size.
+        auto better = [](const auto& a, const auto& b) {
+            return a.first != b.first ? a.first > b.first : a.second < b.second;
+        };
+        std::priority_queue<std::pair<float,std::uint32_t>,
+                            std::vector<std::pair<float,std::uint32_t>>,
+                            decltype(better)> heap(better);
         #pragma omp for nowait schedule(static)
         for (std::size_t i=0; i<n; ++i) {
-            v.emplace_back(scores[i], static_cast<std::uint32_t>(i));
+            const auto candidate=std::make_pair(scores[i],static_cast<std::uint32_t>(i));
+            if (heap.size()<local_k) heap.push(candidate);
+            else if (better(candidate,heap.top())) { heap.pop(); heap.push(candidate); }
         }
-        if (v.size() > local_k) {
-            std::nth_element(v.begin(), v.begin()+local_k, v.end(), [](auto&a, auto&b){return a.first>b.first;});
-            v.resize(local_k);
-        }
+        while (!heap.empty()) { v.push_back(heap.top()); heap.pop(); }
     }
     std::vector<std::pair<float,std::uint32_t>> merged;
     for (auto& v : locals) merged.insert(merged.end(), v.begin(), v.end());
-    std::sort(merged.begin(), merged.end(), [](auto&a, auto&b){return a.first>b.first;});
+    std::sort(merged.begin(), merged.end(), [](const auto& a,const auto& b){return a.first!=b.first?a.first>b.first:a.second<b.second;});
     for (std::size_t i=0; i<local_k; ++i) out[i] = merged[i].second;
 }
 

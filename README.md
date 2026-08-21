@@ -1,6 +1,6 @@
-# Clincial Grant Workbench
+# Clinical Grant Workbench
 
-Clincial Grant Workbench is a local, human-in-the-loop application for developing sponsor-ready grant proposals. It turns a funding opportunity and supporting project materials into structured requirements, evidence, clinical-study design, competitive intelligence, reviewed grant sections, and a final DOCX/PDF submission package. The app runs as a Gradio UI backed by containerized Rust and Python services; supported Apple Silicon Macs can use local MLX inference, while other Macs use Claude with local CPU embeddings.
+Clinical Grant Workbench is a local, human-in-the-loop application for developing sponsor-ready grant proposals. It turns a funding opportunity and supporting project materials into structured requirements, evidence, clinical-study design, competitive intelligence, reviewed grant sections, and a final DOCX/PDF submission package. The app runs as a Gradio UI backed by containerized Rust and Python services; supported Apple Silicon Macs can use local MLX inference, while other Macs use Claude with local CPU embeddings.
 
 ## UI workflow
 
@@ -26,12 +26,12 @@ Clincial Grant Workbench is a local, human-in-the-loop application for developin
 ### Install and run
 
 ```bash
-cp .env.example .env
+cp env.m4Mac.txt .env
 ```
 
 Edit `.env` before starting:
 
-- Set `ANTHROPIC_API_KEY` when required by the Docker CPU profile, or when you want Claude escalation in hybrid mode.
+- Set `ANTHROPIC_API_KEY`; the M4 hybrid profile requires both OLMo and Claude.
 - Optionally set `BRAVE_SEARCH_API_KEY` for online evidence and patent/technology research.
 - Optionally set `OPENALEX_API_KEY` for publication discovery.
 - Adjust `ORGANIZATION_NAME`, `GRANT_SECTIONS`, and `GRANT_EXPORT_HOME` as needed.
@@ -1128,5 +1128,4 @@ Controls BM25 term-frequency saturation.
 ---
 
 ## `BM25_B`
-
 

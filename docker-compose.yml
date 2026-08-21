@@ -47,8 +47,10 @@ services:
       GRANT_BUILD_VERSION: ${GRANT_BUILD_VERSION:-0.8.0}
       GRANT_BUILD_REVISION: ${GRANT_BUILD_REVISION:-development}
       MODEL_ROUTING_MODE: ${MODEL_ROUTING_MODE:-hybrid}
+      REQUIRE_CLAUDE_IN_HYBRID: ${REQUIRE_CLAUDE_IN_HYBRID:-false}
       OLMO_URL: ${OLMO_URL:-http://host.docker.internal:8000/v1/chat/completions}
       OLMO_MODEL: ${OLMO_API_MODEL:-grant-olmo}
+      OLMO_MAX_TOKENS: ${OLMO_MAX_TOKENS:-4096}
       EMBEDDING_URL: ${EMBEDDING_URL:-http://host.docker.internal:8000/v1/embeddings}
       EMBEDDING_MODEL: ${EMBEDDING_API_MODEL:-grant-embedding}
       EMBEDDING_DOCUMENT_PREFIX: "${EMBEDDING_DOCUMENT_PREFIX:-}"
@@ -62,14 +64,17 @@ services:
       CONTEXT_MAX_CHARS: ${CONTEXT_MAX_CHARS:-48000}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-4-5}
+      CLAUDE_MAX_TOKENS: ${CLAUDE_MAX_TOKENS:-6000}
       BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
       BRAVE_SEARCH_ENDPOINT: ${BRAVE_SEARCH_ENDPOINT:-https://api.search.brave.com/res/v1/web/search}
       RESEARCH_MAX_CONCURRENCY: ${RESEARCH_MAX_CONCURRENCY:-8}
       RESEARCH_HTTP_TIMEOUT_SECONDS: ${RESEARCH_HTTP_TIMEOUT_SECONDS:-30}
       RESEARCH_MAX_BODY_BYTES: ${RESEARCH_MAX_BODY_BYTES:-8388608}
+      RESEARCH_USER_AGENT: ${RESEARCH_USER_AGENT:-ClinicalGrantWorkbench/0.8.0}
+      CLINICAL_SCENARIO_MAX_COMBINATIONS: ${CLINICAL_SCENARIO_MAX_COMBINATIONS:-10000}
       MODEL_HTTP_TIMEOUT_SECONDS: ${MODEL_HTTP_TIMEOUT_SECONDS:-300}
       EMBEDDING_HEALTH_TTL_SECONDS: ${EMBEDDING_HEALTH_TTL_SECONDS:-600}
-      CLAUDE_TASK_KINDS: ${CLAUDE_TASK_KINDS:-competitive_positioning,complex_scientific_synthesis}
+      CLAUDE_TASK_KINDS: ${CLAUDE_TASK_KINDS:-requirement_decomposition,sponsor_compliance_compilation,investigator_interview,research_planning,evidence_validation,competitor_profile,competitive_positioning,complex_scientific_synthesis}
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
       OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-1}
       RAYON_NUM_THREADS: ${RAYON_NUM_THREADS:-4}

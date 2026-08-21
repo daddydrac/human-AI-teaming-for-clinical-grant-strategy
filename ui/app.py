@@ -681,10 +681,10 @@ def run_hpc_diagnostics():
              f"mmap score {float(data.get('mmap_score_ms') or 0):.1f} ms.")
     return data,summary
 
-def export(project,fmt,title):
+def export(project,fmt,_title):
     refresh_compliance_measurements(project)
     snap=api("POST",f"/api/projects/{project}/export-snapshot");meta=snap["project"];sections=snap["sections"];fmts=["docx","pdf"] if fmt=="BOTH" else [fmt.lower()];paths=[]
-    final_title=title or meta.get("title") or "Grant Application"
+    final_title=meta.get("title") or "Grant Application"
     for f in fmts:
         payload={"project_id":project,"snapshot_id":snap["snapshot_id"],"format":f,"title":final_title,"sponsor":meta.get("sponsor"),"organization_name":ORGANIZATION_NAME,"sections":[{"section_key":x.get("section_key"),"title":x["title"],"body":x["body"],"version":x.get("version")} for x in sections],"include_document_title":True,"design_profile":snap.get("design_profile")}
         paths.append(renderer_api("/render",payload,timeout=240)["path"])
@@ -693,7 +693,7 @@ def export(project,fmt,title):
     return paths,f"Created from immutable export snapshot {snap['snapshot_id']} ({snap['sha256'][:16]}…). Sponsor-compliant package: {package}"
 
 with gr.Blocks(title="Grant Workbench") as demo:
-    gr.Markdown(f"# {ORGANIZATION_NAME} Grant Workbench\nLocal Apple-MLX drafting + Claude escalation + enforced human approval · Build {GRANT_BUILD_VERSION}")
+    gr.Markdown(f"# {ORGANIZATION_NAME} Grant Workbench\nLocal OLMo/Apple-MLX drafting + Claude research and high-value synthesis + enforced human approval · Build {GRANT_BUILD_VERSION}")
     project_id=gr.State("");interview_questions=gr.State([]);current_question=gr.State(None);current_version=gr.State(None);baseline_body=gr.State("");current_section_key=gr.State("");current_competitive_update_event=gr.State(None)
     with gr.Row():
         recent=gr.Dropdown(label="Open existing project",choices=[]);refresh_projects_btn=gr.Button("Refresh Projects");open_project_btn=gr.Button("Open Project",variant="secondary")
@@ -797,6 +797,7 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
             gr.Markdown("#### Study arms")
             arms_table=gr.Dataframe(headers=ARM_HEADERS,datatype=["str","str","str","bool"],row_count=(3,"dynamic"),column_count=(4,"fixed"),interactive=True)
             gr.Markdown("#### Endpoints")
+            gr.Markdown("Analysis family values: binary — `chi_square`, `fisher_exact`, `logistic_regression`, `two_proportions`; continuous — `t_test`, `anova`, `linear_regression`, `mixed_model`; count — `poisson`, `negative_binomial`; time-to-event — `log_rank`, `cox`, `cox_regression`; ordinal — `ordinal_logistic`, `wilcoxon`.")
             endpoints_table=gr.Dataframe(headers=ENDPOINT_HEADERS,datatype=["str","str","str","bool","str"],row_count=(3,"dynamic"),column_count=(5,"fixed"),interactive=True)
             gr.Markdown("#### Timeline")
             timeline_table=gr.Dataframe(headers=TIMELINE_HEADERS,datatype=["str","str","number","number","str"],row_count=(4,"dynamic"),column_count=(5,"fixed"),interactive=True)

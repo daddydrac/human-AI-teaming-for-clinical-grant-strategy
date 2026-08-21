@@ -20,6 +20,10 @@ if [[ "$GRANT_RUNTIME_PROFILE" == "docker_cpu" ]]; then
   [[ -n "${ANTHROPIC_API_KEY:-}" ]] || { echo "ANTHROPIC_API_KEY is required in docker_cpu mode." >&2; exit 5; }
 else
   command -v uv >/dev/null 2>&1 || { echo "uv is required for native Apple MLX mode." >&2; exit 6; }
+  if [[ "${REQUIRE_CLAUDE_IN_HYBRID:-false}" == "true" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo "ANTHROPIC_API_KEY is required because this M4 profile is configured to use both OLMo and Claude." >&2
+    exit 8
+  fi
 fi
 if [[ -z "${OPENALEX_API_KEY:-}" ]]; then
   echo "WARNING: OPENALEX_API_KEY is not configured; Phase 6 publication discovery will be skipped." >&2

@@ -435,7 +435,7 @@ impl Store {
         "#,params![project,key],|r|{
             let delta_raw=r.get::<_,String>(8)?;
             let reason_raw=r.get::<_,String>(9)?;
-            Ok(json!({"id":r.get::<_,i64>(0)?,"event_id":r.get::<_,i64>(1)?,"base_version":r.get::<_,i64>(2)?,"proposed_version":r.get::<_,i64>(3)?,"status":r.get::<_,String>(4)?,"from_run_id":r.get::<_,Option<i64>>(6)?,"to_run_id":r.get::<_,i64>(6)?,"summary":r.get::<_,String>(7)?,"delta":serde_json::from_str::<Value>(&delta_raw).unwrap_or(json!({})),"refresh_reason":serde_json::from_str::<Value>(&reason_raw).unwrap_or(json!([])),"created_at":r.get::<_,String>(10)?,"base_body":r.get::<_,String>(11)?,"proposed_body":r.get::<_,String>(12)?}))
+            Ok(json!({"id":r.get::<_,i64>(0)?,"event_id":r.get::<_,i64>(1)?,"base_version":r.get::<_,i64>(2)?,"proposed_version":r.get::<_,i64>(3)?,"status":r.get::<_,String>(4)?,"from_run_id":r.get::<_,Option<i64>>(5)?,"to_run_id":r.get::<_,i64>(6)?,"summary":r.get::<_,String>(7)?,"delta":serde_json::from_str::<Value>(&delta_raw).unwrap_or(json!({})),"refresh_reason":serde_json::from_str::<Value>(&reason_raw).unwrap_or(json!([])),"created_at":r.get::<_,String>(10)?,"base_body":r.get::<_,String>(11)?,"proposed_body":r.get::<_,String>(12)?}))
         }).optional()?;
         Ok(json!({"section_key":key,"exists":true,"title":title,"position":position,"required":required,"latest":latest,"approved":approved,"competitive_update":competitive_update}))
     }
@@ -651,7 +651,9 @@ impl Store {
         let clinical_present=clinical.get("exists").and_then(Value::as_bool).unwrap_or(false);
         let clinical_errors=clinical.get("errors").and_then(Value::as_array).map(|x|x.len()).unwrap_or(0);
         let cross_section_conflicts=clinical.get("cross_section_consistency").and_then(|x|x.get("count")).and_then(Value::as_u64).unwrap_or(0);
-        let clinical_consistent=clinical_present && clinical_errors==0 && cross_section_conflicts==0;
+        let blocking_cross_section_conflicts=clinical.get("cross_section_consistency").and_then(|x|x.get("conflicts")).and_then(Value::as_array)
+            .map(|rows|rows.iter().filter(|x|x.get("severity").and_then(Value::as_str)==Some("error")).count() as u64).unwrap_or(0);
+        let clinical_consistent=clinical_present && clinical_errors==0 && blocking_cross_section_conflicts==0;
         let competitive=self.competitive_latest_json(project)?;
         let competitive_present=competitive.get("exists").and_then(Value::as_bool).unwrap_or(false);
         let competitive_fresh=competitive_present && competitive.get("fresh").and_then(Value::as_bool).unwrap_or(false) && competitive.get("status").and_then(Value::as_str)==Some("complete");
@@ -661,7 +663,7 @@ impl Store {
         let compliance_ready=compliance.get("ready").and_then(Value::as_bool).unwrap_or(false);
         let compliance_hard_failures=compliance.get("hard_failures").and_then(Value::as_u64).unwrap_or(1);
         let ready=requirements && interview_generated && open==0 && sections && design_profile_present && clinical_consistent && competitive_fresh && competitive_updates_pending==0 && competitive_refresh_processing==0 && compliance_ready && stage>=Stage::Review;
-        Ok(json!({"ready":ready,"stage":stage.as_str(),"requirements_approved":requirements,"interview_generated":interview_generated,"open_interview_questions":open,"required_sections_approved":sections,"design_profile_present":design_profile_present,"clinical_study_present":clinical_present,"clinical_errors":clinical_errors,"cross_section_conflicts":cross_section_conflicts,"clinical_consistent":clinical_consistent,"competitive_intelligence_present":competitive_present,"competitive_intelligence_fresh":competitive_fresh,"competitive_run_id":competitive.get("run_id").cloned().unwrap_or(Value::Null),"competitive_text_updates_pending":competitive_updates_pending,"competitive_refresh_processing_pending":competitive_refresh_processing,"sponsor_compliance_ready":compliance_ready,"sponsor_compliance_hard_failures":compliance_hard_failures,"sponsor_compliance":compliance}))
+        Ok(json!({"ready":ready,"stage":stage.as_str(),"requirements_approved":requirements,"interview_generated":interview_generated,"open_interview_questions":open,"required_sections_approved":sections,"design_profile_present":design_profile_present,"clinical_study_present":clinical_present,"clinical_errors":clinical_errors,"cross_section_conflicts":cross_section_conflicts,"blocking_cross_section_conflicts":blocking_cross_section_conflicts,"clinical_consistent":clinical_consistent,"competitive_intelligence_present":competitive_present,"competitive_intelligence_fresh":competitive_fresh,"competitive_run_id":competitive.get("run_id").cloned().unwrap_or(Value::Null),"competitive_text_updates_pending":competitive_updates_pending,"competitive_refresh_processing_pending":competitive_refresh_processing,"sponsor_compliance_ready":compliance_ready,"sponsor_compliance_hard_failures":compliance_hard_failures,"sponsor_compliance":compliance}))
     }
 
     pub fn create_export_snapshot(&self,project:&str)->Result<Value>{
@@ -991,7 +993,8 @@ impl Store {
 
     pub fn register_submission_artifact(&self,project:&str,slot:&str,filename:&str,path:&str,sha:&str,extension:&str)->Result<Value>{
         if slot.trim().is_empty()||filename.trim().is_empty()||sha.trim().is_empty(){bail!("submission artifact slot, filename, and sha256 are required");}
-        let expected_root=std::path::PathBuf::from(format!("/workspace/projects/{project}/submission"));
+        let workspace=self.path.parent().context("grant database has no workspace parent")?;
+        let expected_root=workspace.join("projects").join(project).join("submission");
         let expected_root=expected_root.canonicalize().unwrap_or(expected_root);
         let artifact=std::path::PathBuf::from(path);
         let resolved=artifact.canonicalize().with_context(||format!("submission artifact does not exist: {path}"))?;

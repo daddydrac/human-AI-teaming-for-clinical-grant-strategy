@@ -1,0 +1,16 @@
+.env
+.runtime.env
+core/target/
+core/Cargo.lock.tmp
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+exports/
+backups/
+benchmarks/
+releases/
+workspace/
+*.db
+*.sqlite
+.DS_Store

@@ -2,7 +2,13 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
-[[ -f .env ]] || cp .env.example .env
+if [[ ! -f .env ]]; then
+  TEMPLATE=.env.example
+  if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" && -f env.m4Mac.txt ]]; then TEMPLATE=env.m4Mac.txt; fi
+  cp "$TEMPLATE" .env
+  echo "Created .env from $TEMPLATE. Review credentials and rerun ./start.sh."
+  exit 2
+fi
 set -a
 source .env
 set +a
