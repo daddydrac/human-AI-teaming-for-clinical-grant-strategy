@@ -86,7 +86,9 @@ def extract_docx(path):
 def extract_file(value):
     p=Path(file_path(value));ext=p.suffix.lower()
     if ext==".pdf":
-        reader=PdfReader(str(p));text="\n\n".join((page.extract_text() or "").strip() for page in reader.pages).strip()
+        # Form-feed is an immutable page boundary in the stored source buffer.
+        # Rust uses it to derive source_page while copying exact source spans.
+        reader=PdfReader(str(p));text="\n\f\n".join((page.extract_text() or "").strip() for page in reader.pages).strip()
         if len(text)<40:raise gr.Error(f"{p.name} has no usable text layer. Please upload a searchable/OCR-processed PDF rather than allowing silent requirement loss.")
         return text
     if ext==".docx":
@@ -227,7 +229,9 @@ def create_project(title,sponsor,mechanism,source,source_url,source_text,support
     if (source_url or "").strip():
         f=api("POST",f"/api/projects/{pid}/documents/fetch-url",json={"url":source_url.strip(),"kind":"funding_url"},timeout=120);count+=int(f.get("added",False))
     if (source_text or "").strip():
-        count+=int(push_doc(pid,"Pasted funding opportunity","funding_paste",source_text.strip()))
+        # Preserve the pasted characters. Trimming here would make later byte
+        # offsets refer to a transformed string rather than the user's source.
+        count+=int(push_doc(pid,"Pasted funding opportunity","funding_paste",source_text))
     for f in supporting or []:
         p=Path(file_path(f));count+=int(push_doc(pid,p.name,"supporting",extract_file(f)))
     assets=copy_brand_assets(pid,brand);profile=build_design_profile(pid,sponsor,assets)
@@ -316,7 +320,9 @@ def _opt_float(v):
 
 def _opt_int(v):
     x=_opt_float(v)
-    return None if x is None else int(x)
+    if x is None:return None
+    if not x.is_integer():raise gr.Error("Integer inputs cannot contain a fractional value.")
+    return int(x)
 
 def _lines(v):return [x.strip() for x in (v or "").splitlines() if x.strip()]
 def _csv(v):return [x.strip() for x in _cell(v).split(",") if x.strip()]
@@ -523,20 +529,23 @@ def load_section(project,project_title,section_title):
     return version,body,section_preview(project,project_title,section_title,body,key,version,update),status,body,key,(update or {}).get("event_id"),competitive_update_banner(update,version)
 
 
-COMPLIANCE_HEADERS=["Rule ID","Category","Type","Scope","Target","Severity","Mandatory","Numeric value","Text value","List value","Source excerpt","Source locator","Notes"]
+COMPLIANCE_HEADERS=["Rule ID","Category","Type","Scope","Target","Severity","Mandatory","Numeric value","Text value","List value","Source hint","Document hint","Page hint","Notes"]
 
 def compliance_rule_rows(profile):
     rows=[]
     for r in (profile or {}).get("rules") or []:
-        rows.append([r.get("rule_id"),r.get("category"),r.get("rule_type"),r.get("scope"),r.get("target"),r.get("severity"),r.get("mandatory"),r.get("numeric_value"),r.get("text_value"),", ".join(r.get("list_value") or []),r.get("source_excerpt"),r.get("source_locator"),r.get("notes")])
+        rows.append([r.get("rule_id"),r.get("category"),r.get("rule_type"),r.get("scope"),r.get("target"),r.get("severity"),r.get("mandatory"),r.get("numeric_value"),r.get("text_value"),", ".join(r.get("list_value") or []),r.get("source_hint"),r.get("source_document_hint"),r.get("source_page_hint"),r.get("notes")])
     return rows
+
+def compliance_provenance_rows(profile):
+    return [[r.get("rule_id"),r.get("source_status"),r.get("source_document_id"),r.get("source_page"),r.get("source_start_offset"),r.get("source_end_offset"),r.get("source_excerpt")] for r in (profile or {}).get("rules") or []]
 
 def build_compliance_profile(sponsor,mechanism,submission_system,deadline,table):
     rules=[]
     for r in _records(table,COMPLIANCE_HEADERS):
         rid=_cell(r.get("Rule ID"))
         if not rid:continue
-        rules.append({"rule_id":rid,"category":_cell(r.get("Category")),"rule_type":_cell(r.get("Type")),"scope":_cell(r.get("Scope")),"target":_cell(r.get("Target")),"severity":_cell(r.get("Severity")) or "hard","mandatory":_truth(r.get("Mandatory")),"numeric_value":_opt_float(r.get("Numeric value")),"text_value":(_cell(r.get("Text value")) or None),"list_value":_csv(r.get("List value")),"source_excerpt":_cell(r.get("Source excerpt")),"source_locator":_cell(r.get("Source locator")),"notes":_cell(r.get("Notes"))})
+        rules.append({"rule_id":rid,"category":_cell(r.get("Category")),"rule_type":_cell(r.get("Type")),"scope":_cell(r.get("Scope")),"target":_cell(r.get("Target")),"severity":_cell(r.get("Severity")) or "hard","mandatory":_truth(r.get("Mandatory")),"numeric_value":_opt_float(r.get("Numeric value")),"text_value":(_cell(r.get("Text value")) or None),"list_value":_csv(r.get("List value")),"source_hint":_cell(r.get("Source hint")),"source_document_hint":(_cell(r.get("Document hint")) or None),"source_page_hint":_opt_int(r.get("Page hint")),"notes":_cell(r.get("Notes"))})
     return {"sponsor":_cell(sponsor) or None,"mechanism":_cell(mechanism) or None,"submission_system":_cell(submission_system) or None,"deadline_iso":_cell(deadline) or None,"rules":rules}
 
 def compliance_finding_rows(a):
@@ -551,22 +560,24 @@ def load_compliance(project):
     artifacts=api("GET",f"/api/projects/{project}/submission-artifacts")
     status=(f"Compliance profile v{d.get('version')} · {'approved' if d.get('approved') else 'awaiting human approval'} · {'fresh' if d.get('fresh') else 'STALE — recompile from the current opportunity source'}. "
             f"Hard failures: {assessment.get('hard_failures',0)}.")
-    return profile,source.get("text") or "",profile.get("sponsor") or "",profile.get("mechanism") or "",profile.get("submission_system") or "",profile.get("deadline_iso") or "",compliance_rule_rows(profile),compliance_finding_rows(assessment),assessment,[[x.get("slot"),x.get("filename"),x.get("extension"),x.get("sha256")] for x in artifacts],status
+    return profile,source.get("text") or "",profile.get("sponsor") or "",profile.get("mechanism") or "",profile.get("submission_system") or "",profile.get("deadline_iso") or "",compliance_rule_rows(profile),compliance_provenance_rows(profile),compliance_finding_rows(assessment),assessment,[[x.get("slot"),x.get("filename"),x.get("extension"),x.get("sha256")] for x in artifacts],status
 
 def compile_compliance(project):
     d=api("POST",f"/api/projects/{project}/compliance/compile",timeout=900);profile=d.get("profile") or {};a=api("GET",f"/api/projects/{project}/compliance/assessment");source=api("GET",f"/api/projects/{project}/opportunity-source")
     sections=api("GET",f"/api/projects/{project}/sections");choices=[x.get("title") for x in sections if x.get("title")]
-    return profile,source.get("text") or "",profile.get("sponsor") or "",profile.get("mechanism") or "",profile.get("submission_system") or "",profile.get("deadline_iso") or "",compliance_rule_rows(profile),compliance_finding_rows(a),a,f"Recompiled {len(profile.get('rules') or [])} sponsor rules from the current funding-opportunity source. Human approval is required.",gr.update(choices=choices)
+    missing=sum(1 for r in profile.get("rules") or [] if r.get("source_status")!="located")
+    return profile,source.get("text") or "",profile.get("sponsor") or "",profile.get("mechanism") or "",profile.get("submission_system") or "",profile.get("deadline_iso") or "",compliance_rule_rows(profile),compliance_provenance_rows(profile),compliance_finding_rows(a),a,f"Recompiled {len(profile.get('rules') or [])} sponsor rules; {missing} require source-location review. Human approval is required.",gr.update(choices=choices)
 
 def save_compliance(project,sponsor,mechanism,submission_system,deadline,table):
     profile=build_compliance_profile(sponsor,mechanism,submission_system,deadline,table)
     d=api("POST",f"/api/projects/{project}/compliance",json={"profile":profile},timeout=300);a=api("GET",f"/api/projects/{project}/compliance/assessment")
     sections=api("GET",f"/api/projects/{project}/sections");choices=[x.get("title") for x in sections if x.get("title")]
-    return d.get("profile") or profile,compliance_rule_rows(d.get("profile") or profile),compliance_finding_rows(a),a,f"Saved human-reviewed compliance profile v{d.get('version')}. Approval is still required.",gr.update(choices=choices)
+    saved=d.get("profile") or profile
+    return saved,compliance_rule_rows(saved),compliance_provenance_rows(saved),compliance_finding_rows(a),a,f"Saved human-reviewed compliance profile v{d.get('version')}. Approval is still required.",gr.update(choices=choices)
 
 def approve_compliance(project):
     d=api("POST",f"/api/projects/{project}/compliance/approve");a=api("GET",f"/api/projects/{project}/compliance/assessment")
-    return compliance_finding_rows(a),a,f"✓ Human approved sponsor compliance profile v{d.get('version')}. Deterministic hard-rule failures remaining: {a.get('hard_failures',0)}."
+    return compliance_provenance_rows(d.get("profile") or {}),compliance_finding_rows(a),a,f"✓ Human approved sponsor compliance profile v{d.get('version')}. Deterministic hard-rule failures remaining: {a.get('hard_failures',0)}."
 
 def resolve_compliance(project,rule_id,status,notes,resolved_by):
     if not (rule_id or "").strip():raise gr.Error("Enter the Rule ID to resolve.")
@@ -827,14 +838,15 @@ The approved funding opportunity is compiled into atomic submission rules. You c
                 approve_compliance_btn=gr.Button("✓ Approve Compliance Profile",variant="primary")
                 measure_compliance_btn=gr.Button("Run Rendered Preflight")
             compliance_profile_state=gr.State({})
-            opportunity_source_preview=gr.Textbox(label="Normalized funding-opportunity source used for deterministic rule compilation",lines=18,interactive=False)
+            opportunity_source_preview=gr.Textbox(label="Authoritative stored funding-opportunity source used for deterministic rule compilation",lines=18,interactive=False)
             with gr.Row():
                 compliance_sponsor=gr.Textbox(label="Sponsor")
                 compliance_mechanism=gr.Textbox(label="Mechanism")
                 submission_system=gr.Textbox(label="Submission system / portal")
                 compliance_deadline=gr.Textbox(label="Deadline (YYYY-MM-DD)")
-            compliance_rules=gr.Dataframe(headers=COMPLIANCE_HEADERS,row_count=(8,"dynamic"),column_count=(13,"fixed"),interactive=True,label="Parsed deterministic submission rules · editable before approval")
+            compliance_rules=gr.Dataframe(headers=COMPLIANCE_HEADERS,row_count=(8,"dynamic"),column_count=(14,"fixed"),interactive=True,label="Rule meaning and source hints · editable before approval")
             save_compliance_btn=gr.Button("Save Rule Corrections")
+            compliance_provenance=gr.Dataframe(headers=["Rule ID","Source status","Document ID","Page","Start byte","End byte","Exact source excerpt"],interactive=False,label="Deterministically copied provenance · never authored or edited by an LLM")
             compliance_findings=gr.Dataframe(headers=["Rule ID","Severity","Mandatory","Status","Type","Target","Detail","Source excerpt"],interactive=False,label="Deterministic compliance assessment")
             compliance_json=gr.JSON(label="Compliance assessment")
             gr.Markdown("#### Resolve a rule that requires authoritative human confirmation")
@@ -892,10 +904,10 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
     generate_comp_profile_btn.click(generate_competitive_profile,[project_id],[competitive_profile_json,competitive_status])
     load_competitive_btn.click(load_competitive,[project_id],[competitive_profile_json,competitor_table,asset_table,provider_status_json,competitive_strategy,competitive_raw,competitive_status,agentic_global_notice])
     run_competitive_btn.click(run_competitive_intelligence,[project_id],[competitor_table,asset_table,provider_status_json,competitive_strategy,competitive_raw,competitive_status,agentic_global_notice])
-    load_compliance_btn.click(load_compliance,[project_id],[compliance_profile_state,opportunity_source_preview,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules,compliance_findings,compliance_json,artifact_table,compliance_status])
-    compile_compliance_btn.click(compile_compliance,[project_id],[compliance_profile_state,opportunity_source_preview,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules,compliance_findings,compliance_json,compliance_status,section])
-    save_compliance_btn.click(save_compliance,[project_id,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules],[compliance_profile_state,compliance_rules,compliance_findings,compliance_json,compliance_status,section])
-    approve_compliance_btn.click(approve_compliance,[project_id],[compliance_findings,compliance_json,compliance_status])
+    load_compliance_btn.click(load_compliance,[project_id],[compliance_profile_state,opportunity_source_preview,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules,compliance_provenance,compliance_findings,compliance_json,artifact_table,compliance_status])
+    compile_compliance_btn.click(compile_compliance,[project_id],[compliance_profile_state,opportunity_source_preview,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules,compliance_provenance,compliance_findings,compliance_json,compliance_status,section])
+    save_compliance_btn.click(save_compliance,[project_id,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules],[compliance_profile_state,compliance_rules,compliance_provenance,compliance_findings,compliance_json,compliance_status,section])
+    approve_compliance_btn.click(approve_compliance,[project_id],[compliance_provenance,compliance_findings,compliance_json,compliance_status])
     resolve_compliance_btn.click(resolve_compliance,[project_id,compliance_rule_id,compliance_resolution,compliance_resolution_notes,compliance_resolved_by],[compliance_findings,compliance_json,compliance_status])
     register_artifact_btn.click(register_submission_artifacts,[project_id,artifact_slot,artifact_files],[artifact_table,compliance_findings,compliance_json,compliance_status])
     measure_compliance_btn.click(measure_compliance,[project_id],[compliance_findings,compliance_json,compliance_status])

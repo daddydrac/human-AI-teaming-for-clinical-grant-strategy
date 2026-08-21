@@ -32,11 +32,12 @@ mod clinical;
 mod competitive;
 mod competitive_updates;
 mod compliance;
+mod source_locator;
 
 use domain::{EvidenceValidationEnvelope, InterviewEnvelope, ResearchPlanEnvelope, RequirementsEnvelope};
 use clinical::{ClinicalStudy, ScenarioSweepInput, StatisticsPlan};
 use competitive::CompetitiveEngine;
-use compliance::{ComplianceEnvelope, ComplianceProfile};
+use compliance::ComplianceProfileDraft;
 use embedding::EmbeddingClient;
 use json_extract::parse_json_from_model;
 use models::{ModelRouter, ModelTask};
@@ -69,7 +70,7 @@ struct AppState {
 #[derive(Deserialize)] struct ResearchInput { max_queries:Option<usize>, results_per_query:Option<usize> }
 #[derive(Deserialize)] struct RetrieveInput { query:String, k:Option<usize> }
 #[derive(Deserialize)] struct DesignProfileInput { profile:serde_json::Value }
-#[derive(Deserialize)] struct ComplianceProfileInput { profile:ComplianceProfile }
+#[derive(Deserialize)] struct ComplianceProfileInput { profile:ComplianceProfileDraft }
 #[derive(Deserialize)] struct ComplianceResolutionInput { rule_id:String, status:String, notes:Option<String>, resolved_by:Option<String> }
 #[derive(Deserialize)] struct ComplianceMeasurementsInput { measurements:serde_json::Value }
 #[derive(Deserialize)] struct SubmissionArtifactInput { slot:String, filename:String, path:String, sha256:String, extension:String }
@@ -151,7 +152,8 @@ async fn health()->Json<Health>{Json(Health{status:"ok",version:env!("CARGO_PKG_
 async fn ready(State(s):State<AppState>)->Result<Json<serde_json::Value>,ApiError>{
     let model=s.router.health().await.map_err(|e|ApiError::unavailable(format!("model backend not ready: {e}")))?;
     let embedding=s.embedding.health().await.map_err(|e|ApiError::unavailable(format!("embedding model not ready: {e}")))?;
-    Ok(Json(serde_json::json!({"status":"ready","version":env!("CARGO_PKG_VERSION"),"model":model,"embedding":embedding,"hpc_threads":hpc::max_threads()})))
+    let ingestion=s.research.ingestion_health().await.map_err(|e|ApiError::unavailable(format!("document ingestion not ready: {e}")))?;
+    Ok(Json(serde_json::json!({"status":"ready","version":env!("CARGO_PKG_VERSION"),"model":model,"embedding":embedding,"ingestion":ingestion,"hpc_threads":hpc::max_threads()})))
 }
 
 async fn list_projects(State(s):State<AppState>)->Result<Json<serde_json::Value>,ApiError>{Ok(Json(s.store.list_projects_json()?))}
@@ -486,11 +488,17 @@ async fn persist_document(s:&AppState,id:&str,name:&str,kind:&str,text:&str)->Re
 
 async fn get_compliance_profile(State(s):State<AppState>,Path(id):Path<String>)->Result<Json<serde_json::Value>,ApiError>{Ok(Json(s.store.compliance_profile_json(&id)?))}
 async fn compile_compliance_profile(State(s):State<AppState>,Path(id):Path<String>)->Result<Json<serde_json::Value>,ApiError>{
-    let ctx=s.store.opportunity_context(&id,180_000)?;
-    if ctx.trim().is_empty(){return Err(ApiError::conflict("upload, fetch, or paste a funding opportunity before compiling sponsor submission rules"));}
+    let documents=s.store.opportunity_documents(&id)?;
+    if documents.is_empty(){return Err(ApiError::conflict("upload, fetch, or paste a funding opportunity before compiling sponsor submission rules"));}
+    let mut remaining=180_000usize;let mut source_packet=String::new();
+    for doc in &documents {
+        if remaining==0{break;}
+        let text=doc.text.chars().take(remaining).collect::<String>();remaining=remaining.saturating_sub(text.chars().count());
+        source_packet.push_str(&format!("\n--- SOURCE DOCUMENT ID: {} | KIND: {} | NAME: {} ---\n{}\n",doc.id,doc.kind,doc.name,text));
+    }
     let project=s.store.project_json(&id)?;
     let prompt=format!(r#"Compile the funding opportunity into deterministic sponsor/submission rules. Return STRICT JSON only with this exact shape:
-{{"profile":{{"sponsor":null,"mechanism":null,"submission_system":null,"deadline_iso":null,"rules":[{{"rule_id":"C-001","category":"format|section|attachment|deadline|budget|eligibility|submission|administrative","rule_type":"required_section|required_form|max_words|min_words|required_attachment|allowed_extensions|min_font_size_pt|min_margin_in|max_pages|deadline|required_letter_count|manual_requirement|submission_system|max_budget|project_period_max_months","scope":"proposal|section|artifact|project","target":"specific target such as Specific Aims or letters_of_support","severity":"hard|warning|info","mandatory":true,"numeric_value":null,"text_value":null,"list_value":[],"source_excerpt":"short exact wording copied from source","source_locator":"page/heading/section if visible","notes":"brief normalization explanation"}}]}}}}
+{{"profile":{{"sponsor":null,"mechanism":null,"submission_system":null,"deadline_iso":null,"rules":[{{"rule_id":"C-001","category":"format|section|attachment|deadline|budget|eligibility|submission|administrative","rule_type":"required_section|required_form|max_words|min_words|required_attachment|allowed_extensions|min_font_size_pt|min_margin_in|max_pages|deadline|required_letter_count|manual_requirement|submission_system|max_budget|project_period_max_months","scope":"proposal|section|artifact|project","target":"specific target such as Specific Aims or letters_of_support","severity":"hard|warning|info","mandatory":true,"numeric_value":null,"text_value":null,"list_value":[],"source_hint":"short semantic description used to locate the source passage","source_document_hint":"document ID or name if known, otherwise null","source_page_hint":null,"notes":"brief normalization explanation"}}]}}}}
 Rules:
 - Extract only sponsor requirements explicitly supported by the funding-opportunity source. Never invent a rule.
 - Split compound instructions into atomic rules.
@@ -500,27 +508,27 @@ Rules:
 - Use required_section for explicitly required narrative sections; required_attachment for explicitly required package attachments; max_pages/max_words/min_font_size_pt/min_margin_in where explicit.
 - Use required_form, never required_section, for structured portal forms such as SF424, budgets, Senior/Key Person Profiles, performance sites, and other Grants.gov form components. Structured forms must not become AI-drafted narrative sections.
 - Rules that cannot be deterministically proven from the current application model must still be preserved as manual_requirement rather than dropped.
-- Every rule MUST include a non-empty source_excerpt copied from the opportunity.
+- Every rule MUST include a concise, non-empty source_hint that identifies where deterministic code should search.
+- NEVER return source_excerpt, a quotation, source_locator, source offsets, source_document_id, source_page, or source_status. The application—not the model—locates and copies exact source characters.
+- source_document_hint and source_page_hint are approximate hints only; source_document_hint must be a JSON string (for example "42" or a document name), and both must be null when uncertain.
 
 PROJECT METADATA:
 {}
 
-FUNDING OPPORTUNITY SOURCE:
-{}"#,serde_json::to_string_pretty(&project).unwrap_or_default(),ctx);
+FUNDING OPPORTUNITY SOURCE DOCUMENTS:
+{}"#,serde_json::to_string_pretty(&project).unwrap_or_default(),source_packet);
     let out=s.router.generate(ModelTask{kind:"sponsor_compliance_compilation".into(),prompt,high_value:false}).await?;
-    let parsed:ComplianceEnvelope=parse_json_from_model(&out.text)?;
-    crate::compliance::validate_profile(&parsed.profile).map_err(|e|ApiError::bad_gateway(format!("invalid compiled compliance profile: {e}")))?;
-    crate::compliance::validate_source_excerpts(&parsed.profile,&ctx)
-        .map_err(|e|ApiError::bad_gateway(format!("compliance compiler source verification failed: {e}")))?;
-    let saved=s.store.save_compliance_profile(&id,&parsed.profile,&out.model)?;
+    let profile=source_locator::compile_model_output(&out.text,&documents).map_err(|e|ApiError::bad_gateway(format!("invalid compiled compliance profile: {e}")))?;
+    let saved=s.store.save_compliance_profile(&id,&profile,&out.model)?;
     s.store.save_analysis(&id,"sponsor_compliance_raw",&out.text)?;
     Ok(Json(saved))
 }
 async fn save_compliance_profile(State(s):State<AppState>,Path(id):Path<String>,Json(req):Json<ComplianceProfileInput>)->Result<Json<serde_json::Value>,ApiError>{
-    crate::compliance::validate_profile(&req.profile).map_err(|e|ApiError::bad_request(e.to_string()))?;
-    let ctx=s.store.opportunity_context(&id,usize::MAX)?;
-    crate::compliance::validate_source_excerpts(&req.profile,&ctx).map_err(|e|ApiError::bad_request(e.to_string()))?;
-    Ok(Json(s.store.save_compliance_profile(&id,&req.profile,"human_reviewed_rules")?))
+    let documents=s.store.opportunity_documents(&id)?;
+    let profile=source_locator::locate_profile(req.profile,&documents);
+    crate::compliance::validate_profile(&profile).map_err(|e|ApiError::bad_request(e.to_string()))?;
+    source_locator::validate_exact_sources(&profile,&documents).map_err(|e|ApiError::bad_request(e.to_string()))?;
+    Ok(Json(s.store.save_compliance_profile(&id,&profile,"human_reviewed_rules")?))
 }
 async fn approve_compliance_profile(State(s):State<AppState>,Path(id):Path<String>)->Result<Json<serde_json::Value>,ApiError>{Ok(Json(s.store.approve_compliance_profile(&id)?))}
 async fn resolve_compliance_rule(State(s):State<AppState>,Path(id):Path<String>,Json(req):Json<ComplianceResolutionInput>)->Result<Json<serde_json::Value>,ApiError>{Ok(Json(s.store.resolve_compliance_rule(&id,&req.rule_id,&req.status,req.notes.as_deref().unwrap_or(""),req.resolved_by.as_deref())?))}
@@ -532,11 +540,12 @@ async fn get_submission_artifacts(State(s):State<AppState>,Path(id):Path<String>
 async fn add_document(State(s):State<AppState>,Path(id):Path<String>,Json(req):Json<DocumentInput>)->Result<Json<serde_json::Value>,ApiError>{Ok(Json(persist_document(&s,&id,&req.name,&req.kind,&req.text).await?))}
 async fn get_opportunity_source(State(s):State<AppState>,Path(id):Path<String>)->Result<Json<serde_json::Value>,ApiError>{
     let text=s.store.opportunity_context(&id,300_000)?;let fingerprint=s.store.opportunity_source_fingerprint(&id)?;
-    Ok(Json(serde_json::json!({"text":text,"fingerprint":fingerprint})))
+    let documents=s.store.opportunity_documents(&id)?.into_iter().map(|d|serde_json::json!({"id":d.id,"name":d.name,"kind":d.kind,"text":d.text})).collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({"text":text,"documents":documents,"fingerprint":fingerprint})))
 }
 
 async fn fetch_url_document(State(s):State<AppState>,Path(id):Path<String>,Json(req):Json<FetchUrlInput>)->Result<Json<serde_json::Value>,ApiError>{
-    let src=s.research.fetch(&req.url,req.name.as_deref()).await.map_err(|e|ApiError::bad_request(format!("secure URL fetch failed: {e}")))?;
+    let src=s.research.fetch_rendered(&req.url,req.name.as_deref()).await.map_err(|e|ApiError::bad_request(format!("browser URL ingestion failed: {e}")))?;
     let name=req.name.unwrap_or_else(||src.title.clone()); let kind=req.kind.unwrap_or_else(||"funding_url".into());
     Ok(Json(persist_document(&s,&id,&name,&kind,&src.text).await?))
 }

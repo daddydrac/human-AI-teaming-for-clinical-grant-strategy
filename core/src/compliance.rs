@@ -4,6 +4,41 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
+pub const SOURCE_NOT_LOCATED: &str = "SOURCE NOT LOCATED";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComplianceRuleDraft {
+    pub rule_id: String,
+    pub category: String,
+    pub rule_type: String,
+    #[serde(default)] pub scope: String,
+    #[serde(default)] pub target: String,
+    #[serde(default)] pub severity: String,
+    #[serde(default)] pub mandatory: bool,
+    #[serde(default)] pub numeric_value: Option<f64>,
+    #[serde(default)] pub text_value: Option<String>,
+    #[serde(default)] pub list_value: Vec<String>,
+    #[serde(default)] pub source_hint: String,
+    #[serde(default)] pub source_document_hint: Option<String>,
+    #[serde(default)] pub source_page_hint: Option<u32>,
+    #[serde(default)] pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComplianceProfileDraft {
+    #[serde(default)] pub sponsor: Option<String>,
+    #[serde(default)] pub mechanism: Option<String>,
+    #[serde(default)] pub submission_system: Option<String>,
+    #[serde(default)] pub deadline_iso: Option<String>,
+    #[serde(default)] pub rules: Vec<ComplianceRuleDraft>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComplianceDraftEnvelope { pub profile: ComplianceProfileDraft }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComplianceRule {
     pub rule_id: String,
@@ -24,9 +59,25 @@ pub struct ComplianceRule {
     #[serde(default)]
     pub list_value: Vec<String>,
     #[serde(default)]
+    pub source_hint: String,
+    #[serde(default)]
+    pub source_document_hint: Option<String>,
+    #[serde(default)]
+    pub source_page_hint: Option<u32>,
+    #[serde(default)]
     pub source_excerpt: String,
     #[serde(default)]
     pub source_locator: String,
+    #[serde(default)]
+    pub source_start_offset: Option<usize>,
+    #[serde(default)]
+    pub source_end_offset: Option<usize>,
+    #[serde(default)]
+    pub source_document_id: Option<i64>,
+    #[serde(default)]
+    pub source_page: Option<u32>,
+    #[serde(default)]
+    pub source_status: String,
     #[serde(default)]
     pub notes: String,
 }
@@ -43,11 +94,6 @@ pub struct ComplianceProfile {
     pub deadline_iso: Option<String>,
     #[serde(default)]
     pub rules: Vec<ComplianceRule>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComplianceEnvelope {
-    pub profile: ComplianceProfile,
 }
 
 #[derive(Debug, Clone)]
@@ -77,19 +123,17 @@ pub fn validate_profile(profile: &ComplianceProfile) -> Result<()> {
         if !ids.insert(r.rule_id.clone()) { bail!("duplicate compliance rule ID {}", r.rule_id); }
         if !allowed.contains(&r.rule_type.as_str()) { bail!("unsupported compliance rule type {}", r.rule_type); }
         if !matches!(r.severity.as_str(), "hard"|"warning"|"info") { bail!("invalid compliance severity {}", r.severity); }
-        if r.source_excerpt.trim().is_empty() { bail!("rule {} is missing source_excerpt", r.rule_id); }
-    }
-    Ok(())
-}
-
-
-pub fn validate_source_excerpts(profile: &ComplianceProfile, source: &str) -> Result<()> {
-    let normalized_source = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized_source.trim().is_empty() { bail!("funding opportunity source is empty"); }
-    for rule in &profile.rules {
-        let excerpt = rule.source_excerpt.split_whitespace().collect::<Vec<_>>().join(" ");
-        if excerpt.is_empty() || !normalized_source.contains(&excerpt) {
-            bail!("rule {} source_excerpt cannot be verified verbatim in the funding opportunity", rule.rule_id);
+        if r.source_hint.trim().is_empty() { bail!("rule {} is missing source_hint", r.rule_id); }
+        match r.source_status.as_str() {
+            "located" => {
+                if r.source_excerpt.is_empty() || r.source_excerpt==SOURCE_NOT_LOCATED { bail!("rule {} has invalid located source_excerpt",r.rule_id); }
+                let (Some(start),Some(end),Some(_))=(r.source_start_offset,r.source_end_offset,r.source_document_id) else {bail!("rule {} is missing located source offsets/document",r.rule_id);};
+                if start>=end {bail!("rule {} has invalid source offsets",r.rule_id);}
+            },
+            "not_located" => {
+                if r.source_excerpt!=SOURCE_NOT_LOCATED || r.source_start_offset.is_some() || r.source_end_offset.is_some() || r.source_document_id.is_some() || r.source_page.is_some() {bail!("rule {} has invalid not-located provenance",r.rule_id);}
+            },
+            _=>bail!("rule {} has invalid source_status",r.rule_id),
         }
     }
     Ok(())
@@ -125,7 +169,11 @@ pub fn evaluate(
         let manual_rule=matches!(rule.rule_type.as_str(),"manual_requirement"|"max_budget");
         let manually_satisfied=manual_rule && resolution.map(|x|matches!(x.0.as_str(),"satisfied"|"not_applicable"|"waived")).unwrap_or(false);
         let mut status="pass".to_string(); let mut detail=String::new(); let mut observed=Value::Null;
-        if manually_satisfied {
+        if rule.source_status!="located" {
+            status="deferred".into();
+            detail=format!("{} — edit the source hint and save to retry deterministic location against the original funding-opportunity text.",SOURCE_NOT_LOCATED);
+            observed=json!({"source_status":rule.source_status,"source_hint":rule.source_hint});
+        } else if manually_satisfied {
             detail=format!("Human resolution: {}{}",resolution.unwrap().0,if resolution.unwrap().1.is_empty(){""}else{" — "});
             if !resolution.unwrap().1.is_empty(){detail.push_str(&resolution.unwrap().1);}
         } else {
@@ -186,7 +234,7 @@ pub fn evaluate(
             }
         }
         if status=="pass"{passed+=1;} else if status=="deferred"{deferred+=1;if rule.severity=="hard"&&rule.mandatory{hard_failures+=1;}} else if rule.severity=="hard"&&rule.mandatory{hard_failures+=1;} else {warnings+=1;}
-        findings.push(json!({"rule_id":rule.rule_id,"category":rule.category,"rule_type":rule.rule_type,"target":rule.target,"severity":rule.severity,"mandatory":rule.mandatory,"status":status,"detail":detail,"observed":observed,"source_excerpt":rule.source_excerpt,"source_locator":rule.source_locator,"resolution":resolution.map(|x|json!({"status":x.0,"notes":x.1})).unwrap_or(Value::Null)}));
+        findings.push(json!({"rule_id":rule.rule_id,"category":rule.category,"rule_type":rule.rule_type,"target":rule.target,"severity":rule.severity,"mandatory":rule.mandatory,"status":status,"detail":detail,"observed":observed,"source_hint":rule.source_hint,"source_excerpt":rule.source_excerpt,"source_locator":rule.source_locator,"source_start_offset":rule.source_start_offset,"source_end_offset":rule.source_end_offset,"source_document_id":rule.source_document_id,"source_page":rule.source_page,"source_status":rule.source_status,"resolution":resolution.map(|x|json!({"status":x.0,"notes":x.1})).unwrap_or(Value::Null)}));
     }
     json!({"ready":hard_failures==0,"hard_failures":hard_failures,"warnings":warnings,"deferred":deferred,"passed":passed,"total":profile.rules.len(),"findings":findings})
 }
@@ -194,15 +242,23 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_draft_schema_rejects_generated_source_excerpt(){
+        let raw=r#"{"profile":{"rules":[{"rule_id":"C-001","category":"format","rule_type":"max_pages","target":"Research Strategy","severity":"hard","mandatory":true,"numeric_value":12,"source_hint":"Research Strategy page limitation","source_excerpt":"invented quote"}]}}"#;
+        let error=serde_json::from_str::<ComplianceDraftEnvelope>(raw).unwrap_err();
+        assert!(error.to_string().contains("source_excerpt"));
+    }
+
     fn rule(id:&str,rule_type:&str,target:&str,numeric_value:Option<f64>)->ComplianceRule {
-        ComplianceRule{rule_id:id.into(),category:"format".into(),rule_type:rule_type.into(),scope:"section".into(),target:target.into(),severity:"hard".into(),mandatory:true,numeric_value,text_value:None,list_value:vec![],source_excerpt:"explicit sponsor rule".into(),source_locator:"p1".into(),notes:String::new()}
+        ComplianceRule{rule_id:id.into(),category:"format".into(),rule_type:rule_type.into(),scope:"section".into(),target:target.into(),severity:"hard".into(),mandatory:true,numeric_value,text_value:None,list_value:vec![],source_hint:"explicit sponsor rule".into(),source_document_hint:None,source_page_hint:None,source_excerpt:"explicit sponsor rule".into(),source_locator:"document 1, bytes 0..21".into(),source_start_offset:Some(0),source_end_offset:Some(21),source_document_id:Some(1),source_page:None,source_status:"located".into(),notes:String::new()}
     }
 
     #[test]
     fn required_section_and_words_are_deterministic(){
         let p=ComplianceProfile{sponsor:None,mechanism:None,submission_system:None,deadline_iso:None,rules:vec![
-            ComplianceRule{rule_id:"C1".into(),category:"section".into(),rule_type:"required_section".into(),scope:"proposal".into(),target:"specific_aims".into(),severity:"hard".into(),mandatory:true,numeric_value:None,text_value:None,list_value:vec![],source_excerpt:"Specific Aims required".into(),source_locator:"p1".into(),notes:String::new()},
-            ComplianceRule{rule_id:"C2".into(),category:"format".into(),rule_type:"max_words".into(),scope:"section".into(),target:"specific_aims".into(),severity:"hard".into(),mandatory:true,numeric_value:Some(3.0),text_value:None,list_value:vec![],source_excerpt:"3 words".into(),source_locator:"p1".into(),notes:String::new()}
+            rule("C1","required_section","specific_aims",None),
+            rule("C2","max_words","specific_aims",Some(3.0))
         ]};
         let f=ComplianceFacts{approved_sections:vec![("specific_aims".into(),"Specific Aims".into(),"one two three".into())],artifacts:vec![],design_profile:json!({}),measurements:None,project_period_months:None};
         assert!(evaluate(&p,&f,&HashMap::new()).get("ready").unwrap().as_bool().unwrap());

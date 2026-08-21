@@ -14,6 +14,8 @@ Clinical Grant Workbench is a local, human-in-the-loop application for developin
 - **8 · Final Export:** Preview the approved grant, pass all readiness gates, and export a DOCX, PDF, or both with the sponsor-compliant submission package.
 - **9 · System & Diagnostics:** Inspect non-secret runtime/build information and run the local HPC benchmark.
 
+Public opportunity URLs are rendered in Chromium and converted to Markdown before storage; pasted text is stored without trimming. In both cases that stored per-document text is the authoritative citation buffer. Claude returns only rule meaning and source hints. Rust locates a passage and copies its exact UTF-8 byte slice into provenance fields, or records `SOURCE NOT LOCATED` and requires human review—model-generated excerpts are not accepted.
+
 ## Quick start
 
 ### Prerequisites
@@ -1128,4 +1130,3 @@ Controls BM25 term-frequency saturation.
 ---
 
 ## `BM25_B`
-

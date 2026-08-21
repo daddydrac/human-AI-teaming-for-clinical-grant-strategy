@@ -10,6 +10,7 @@ use crate::competitive::{CompetitiveConfig, CompetitiveProfile, CompetitiveRunOu
 use crate::competitive_updates::CompetitiveDelta;
 use crate::compliance::{ComplianceFacts, ComplianceProfile, evaluate as evaluate_compliance};
 use crate::research::FetchedSource;
+use crate::source_locator::SourceDocument;
 use crate::workflow::Stage;
 
 pub struct Store { path: PathBuf }
@@ -280,6 +281,43 @@ impl Store {
           UNIQUE(project_id,version), FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_compliance_history ON compliance_profile_history(project_id,version DESC);
+        CREATE TABLE IF NOT EXISTS compliance_rule_sources(
+          project_id TEXT NOT NULL, profile_version INTEGER NOT NULL, rule_id TEXT NOT NULL,
+          source_status TEXT NOT NULL CHECK(source_status IN ('located','not_located')),
+          source_hint TEXT NOT NULL, source_document_id INTEGER, source_start_offset INTEGER,
+          source_end_offset INTEGER, source_page INTEGER, source_excerpt TEXT NOT NULL,
+          PRIMARY KEY(project_id,profile_version,rule_id),
+          CHECK(
+            (source_status='located' AND source_document_id IS NOT NULL AND source_start_offset IS NOT NULL
+              AND source_end_offset IS NOT NULL AND source_start_offset>=0 AND source_end_offset>source_start_offset
+              AND source_excerpt<>'SOURCE NOT LOCATED')
+            OR
+            (source_status='not_located' AND source_document_id IS NULL AND source_start_offset IS NULL
+              AND source_end_offset IS NULL AND source_page IS NULL AND source_excerpt='SOURCE NOT LOCATED')
+          ),
+          FOREIGN KEY(project_id,profile_version) REFERENCES compliance_profile_history(project_id,version) ON DELETE CASCADE,
+          FOREIGN KEY(source_document_id) REFERENCES documents(id) ON DELETE RESTRICT
+        );
+        CREATE TRIGGER IF NOT EXISTS compliance_rule_source_exact_insert
+        BEFORE INSERT ON compliance_rule_sources
+        WHEN NEW.source_status='located' AND NOT EXISTS(
+          SELECT 1 FROM documents d
+          WHERE d.id=NEW.source_document_id AND d.project_id=NEW.project_id
+            AND CAST(substr(CAST(d.text AS BLOB),NEW.source_start_offset+1,NEW.source_end_offset-NEW.source_start_offset) AS TEXT)=NEW.source_excerpt
+        )
+        BEGIN SELECT RAISE(ABORT,'compliance source excerpt is not the exact document byte slice'); END;
+        CREATE TRIGGER IF NOT EXISTS compliance_rule_source_exact_update
+        BEFORE UPDATE ON compliance_rule_sources
+        WHEN NEW.source_status='located' AND NOT EXISTS(
+          SELECT 1 FROM documents d
+          WHERE d.id=NEW.source_document_id AND d.project_id=NEW.project_id
+            AND CAST(substr(CAST(d.text AS BLOB),NEW.source_start_offset+1,NEW.source_end_offset-NEW.source_start_offset) AS TEXT)=NEW.source_excerpt
+        )
+        BEGIN SELECT RAISE(ABORT,'compliance source excerpt is not the exact document byte slice'); END;
+        CREATE TRIGGER IF NOT EXISTS compliance_source_document_immutable
+        BEFORE UPDATE OF text ON documents
+        WHEN EXISTS(SELECT 1 FROM compliance_rule_sources s WHERE s.source_document_id=OLD.id AND s.source_status='located')
+        BEGIN SELECT RAISE(ABORT,'document text is immutable while exact compliance provenance references it'); END;
         CREATE TABLE IF NOT EXISTS compliance_resolutions(
           id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, rule_id TEXT NOT NULL,
           status TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '', resolved_by TEXT,
@@ -300,7 +338,7 @@ impl Store {
         CREATE INDEX IF NOT EXISTS idx_submission_artifacts_project ON submission_artifacts(project_id,slot,id);
         "#)?;
         Self::migrate(&conn)?;
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(9)",[])?;
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(10)",[])?;
         Ok(Self { path: path_buf })
     }
 
@@ -903,6 +941,16 @@ impl Store {
         Ok(out)
     }
 
+    /// Return each funding-opportunity document as its own immutable source
+    /// buffer. Provenance offsets are always relative to one of these buffers,
+    /// never to the display-only concatenation produced by opportunity_context.
+    pub fn opportunity_documents(&self,project:&str)->Result<Vec<SourceDocument>>{
+        let c=self.conn()?;
+        let mut st=c.prepare("SELECT id,name,kind,text FROM documents WHERE project_id=?1 AND kind LIKE 'funding_%' ORDER BY id")?;
+        let rows=st.query_map([project],|r|Ok(SourceDocument{id:r.get(0)?,name:r.get(1)?,kind:r.get(2)?,text:r.get(3)?}))?;
+        let mut out=Vec::new();for row in rows{out.push(row?);}Ok(out)
+    }
+
     pub fn opportunity_source_fingerprint(&self,project:&str)->Result<String>{
         use sha2::{Digest,Sha256}; let c=self.conn()?; let mut h=Sha256::new();h.update(project.as_bytes());
         let mut st=c.prepare("SELECT name,kind,sha256 FROM documents WHERE project_id=?1 AND kind LIKE 'funding_%' ORDER BY id")?;
@@ -945,8 +993,8 @@ impl Store {
 
     pub fn save_compliance_profile(&self,project:&str,profile:&ComplianceProfile,model:&str)->Result<Value>{
         crate::compliance::validate_profile(profile)?;
-        let opportunity=self.opportunity_context(project,usize::MAX)?;
-        crate::compliance::validate_source_excerpts(profile,&opportunity)?;
+        let documents=self.opportunity_documents(project)?;
+        crate::source_locator::validate_exact_sources(profile,&documents)?;
         let source_fp=self.opportunity_source_fingerprint(project)?;let raw=serde_json::to_string(profile)?;let sha=sha256_hex(raw.as_bytes());
         let mut c=self.conn()?;let tx=c.transaction()?;
         let version:i64=tx.query_row("SELECT COALESCE(version,0)+1 FROM compliance_profiles WHERE project_id=?1",[project],|r|r.get(0)).optional()?.unwrap_or(1);
@@ -954,6 +1002,10 @@ impl Store {
         tx.execute(r#"INSERT INTO compliance_profiles(project_id,version,source_fingerprint,profile_json,content_sha256,model,approved,updated_at)
           VALUES(?1,?2,?3,?4,?5,?6,0,CURRENT_TIMESTAMP)
           ON CONFLICT(project_id) DO UPDATE SET version=excluded.version,source_fingerprint=excluded.source_fingerprint,profile_json=excluded.profile_json,content_sha256=excluded.content_sha256,model=excluded.model,approved=0,updated_at=CURRENT_TIMESTAMP"#,params![project,version,source_fp,raw,sha,model])?;
+        for rule in &profile.rules {
+            tx.execute(r#"INSERT INTO compliance_rule_sources(project_id,profile_version,rule_id,source_status,source_hint,source_document_id,source_start_offset,source_end_offset,source_page,source_excerpt)
+              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"#,params![project,version,rule.rule_id,rule.source_status,rule.source_hint,rule.source_document_id,rule.source_start_offset.map(|v|v as i64),rule.source_end_offset.map(|v|v as i64),rule.source_page.map(i64::from),rule.source_excerpt])?;
+        }
         tx.execute("DELETE FROM compliance_resolutions WHERE project_id=?1",[project])?;
         Self::sync_compliance_required_sections_tx(&tx,project,profile)?;
         Self::touch_project_conn(&tx,project)?;tx.commit()?;
@@ -964,6 +1016,10 @@ impl Store {
         let current=self.compliance_profile_json(project)?;
         if !current.get("exists").and_then(Value::as_bool).unwrap_or(false){bail!("compile the sponsor compliance profile before approval");}
         if !current.get("fresh").and_then(Value::as_bool).unwrap_or(false){bail!("compliance profile is stale because the funding opportunity source changed; recompile it before approval");}
+        let profile=self.compliance_profile_typed(project)?.context("compile the sponsor compliance profile before approval")?;
+        let unresolved=profile.rules.iter().filter(|r|r.source_status!="located").map(|r|r.rule_id.as_str()).collect::<Vec<_>>();
+        if !unresolved.is_empty(){bail!("exact source text was not located for rule(s) {}; correct their source hints and save again before approval",unresolved.join(", "));}
+        crate::source_locator::validate_exact_sources(&profile,&self.opportunity_documents(project)?)?;
         let c=self.conn()?;c.execute("UPDATE compliance_profiles SET approved=1,updated_at=CURRENT_TIMESTAMP WHERE project_id=?1",[project])?;
         let version=current.get("version").and_then(Value::as_i64).unwrap_or(0);c.execute("UPDATE compliance_profile_history SET approved=1 WHERE project_id=?1 AND version=?2",params![project,version])?;Self::touch_project_conn(&c,project)?;
         self.compliance_profile_json(project)
@@ -1112,6 +1168,25 @@ mod phase6_storage_tests {
         let mut p=std::env::temp_dir();
         p.push(format!("grant-core-{name}-{}-{}.db",std::process::id(),uuid::Uuid::new_v4()));
         p
+    }
+
+    #[test]
+    fn database_enforces_exact_compliance_source_bytes() -> Result<()> {
+        let path=temp_db("compliance-source-trigger");
+        let store=Store::open(&path)?;
+        let project="project-source-trigger";
+        store.create_project(project,"Test",None,None,&[])?;
+        let source="Préface\nThe Research Strategy may not exceed 12 pages.";
+        let(document_id,_)=store.add_document(project,"Pasted funding opportunity","funding_paste",source,"source-sha")?;
+        let start=source.find("The Research").unwrap();let end=source.len();
+        let c=store.conn()?;
+        c.execute("INSERT INTO compliance_profile_history(project_id,version,source_fingerprint,profile_json,content_sha256,model,approved) VALUES(?1,1,'fp','{}','sha','test',0)",[project])?;
+        c.execute(r#"INSERT INTO compliance_rule_sources(project_id,profile_version,rule_id,source_status,source_hint,source_document_id,source_start_offset,source_end_offset,source_page,source_excerpt)
+          VALUES(?1,1,'C-001','located','Research Strategy page limitation',?2,?3,?4,NULL,?5)"#,params![project,document_id,start as i64,end as i64,&source[start..end]])?;
+        let error=c.execute(r#"INSERT INTO compliance_rule_sources(project_id,profile_version,rule_id,source_status,source_hint,source_document_id,source_start_offset,source_end_offset,source_page,source_excerpt)
+          VALUES(?1,1,'C-002','located','Research Strategy page limitation',?2,?3,?4,NULL,'The Research Strategy must not exceed twelve pages.')"#,params![project,document_id,start as i64,end as i64]).unwrap_err();
+        assert!(error.to_string().contains("exact document byte slice"));
+        drop(c);let _=std::fs::remove_file(path);Ok(())
     }
 
     #[test]

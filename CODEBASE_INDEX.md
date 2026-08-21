@@ -2,7 +2,7 @@
 
 ## System shape
 
-The product is a nine-tab Gradio workbench backed by a Rust API, a Python document renderer, and an OpenAI-compatible embedding/generation service. Docker keeps application state in `grant-data`; final DOCX/PDF files are bind-mounted to `exports/`. On this M4 profile, native MLX serves OLMo and embeddings, while Claude plans research, validates retrieved evidence, compiles requirements/compliance, and performs selected high-value synthesis.
+The product is a nine-tab Gradio workbench backed by a Rust API, a Playwright HTML-ingestion service, a Python document renderer, and OpenAI-compatible embedding/generation services. Docker keeps application state in `grant-data`; final DOCX/PDF files are bind-mounted to `exports/`. On this M4 profile, native MLX serves OLMo and embeddings, while Claude plans research, validates retrieved evidence, classifies compliance rule meaning, and performs selected high-value synthesis. Rust alone locates and copies exact compliance source excerpts.
 
 The backend workflow state is: `intake → documents → requirements → interview → research → science → strategy → writing → review → export`. Every final document is built from an immutable approved-section snapshot. Sponsor compliance and readiness gates run before export.
 
@@ -10,7 +10,7 @@ The backend workflow state is: `intake → documents → requirements → interv
 
 | UI step | User outcome | Backend support |
 |---|---|---|
-| 1. Intake & Requirements | Create a project; upload, fetch, or paste an opportunity; approve extracted requirements | Secure fetch and ingestion, chunking, requirement/compliance compilation, SQLite persistence, workflow gates |
+| 1. Intake & Requirements | Create a project; upload, fetch, or paste an opportunity; approve extracted requirements | Browser-rendered URL-to-Markdown ingestion, byte-preserved paste ingestion, chunking, requirement/compliance compilation, SQLite persistence, workflow gates |
 | 2. Investigator Interview | Resolve missing facts with confidence and provenance | Claude question generation, typed answer storage, unresolved-question gate |
 | 3. Research & Evidence | Find external evidence and test retrieval | Claude research plan, bounded Brave/web fetching, Claude evidence validation, embeddings, lexical/vector/graph retrieval |
 | 4. Clinical Study Design | Define aims, arms, endpoints, statistics, recruitment, timeline, and resources | Typed validation, sample-size/recruitment calculations, scenario sweeps, cross-section consistency checks |
@@ -31,6 +31,7 @@ The backend workflow state is: `intake → documents → requirements → interv
 - `Dockerfile.renderer` — renderer/WeasyPrint image.
 - `Dockerfile.ui` — Gradio UI image.
 - `Dockerfile.embedding-cpu` — low-memory CPU embedding fallback.
+- `Dockerfile.ingestion` — pinned Playwright/Chromium HTML-to-Markdown ingestion image.
 - `.dockerignore` — excludes secrets, runtime data, and build output from Docker contexts.
 - `.gitignore` — excludes credentials, generated data, caches, and artifacts.
 - `install.sh` — validates macOS prerequisites, selects the M4 template, configures runtime, and validates the stack.
@@ -64,6 +65,7 @@ The backend workflow state is: `intake → documents → requirements → interv
 - `core/src/json_extract.rs` — strict JSON extraction from model responses.
 - `core/src/clinical.rs` — typed study validation, statistics, recruitment, scenarios, timeline, and consistency analysis.
 - `core/src/compliance.rs` — deterministic sponsor-rule validation and evaluation.
+- `core/src/source_locator.rs` — parallel deterministic passage matching, normalized offset projection, exact source-buffer copying, and provenance validation.
 - `core/src/competitive.rs` — public competitive-data collection, normalization, scoring, and strategy generation.
 - `core/src/competitive_updates.rs` — material-change detection and protected section-update proposals.
 
@@ -75,6 +77,8 @@ The backend workflow state is: `intake → documents → requirements → interv
 - `renderer/requirements.txt` — pinned document-rendering dependencies.
 - `embedding_cpu/app.py` — OpenAI-compatible FastEmbed fallback service.
 - `embedding_cpu/requirements.txt` — pinned CPU embedding dependencies.
+- `ingestion/app.py` — browser-rendered public URL extraction into an authoritative Markdown source buffer.
+- `ingestion/requirements.txt` — pinned Playwright, FastAPI, and Markdown conversion dependencies.
 - `hpc/hpc_kernels.cpp` — OpenMP normalization/fusion/top-K and OpenBLAS matrix scoring.
 
 ### Product configuration

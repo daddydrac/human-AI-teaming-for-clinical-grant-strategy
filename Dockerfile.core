@@ -14,6 +14,9 @@ WORKDIR /src/core
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git \
     if [ -f Cargo.lock ]; then cargo build --release --locked; else cargo generate-lockfile && cargo build --release --locked; fi
 
+FROM build AS test
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git cargo test --release --locked
+
 FROM debian:bookworm-slim
 ARG APP_VERSION
 LABEL org.opencontainers.image.title="Research Clinic Grant Agent" org.opencontainers.image.version="${APP_VERSION}"

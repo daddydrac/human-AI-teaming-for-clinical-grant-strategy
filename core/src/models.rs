@@ -4,7 +4,24 @@ use serde_json::json;
 use std::{collections::HashSet, time::Duration};
 
 pub struct ModelTask { pub kind:String, pub prompt:String, pub high_value:bool }
+#[derive(Debug, Clone)]
 pub struct ModelOutput { pub model:String, pub text:String }
+
+fn parse_olmo_wire_response(v:&serde_json::Value,model:&str,max_tokens:usize)->Result<ModelOutput>{
+    if v.pointer("/choices/0/finish_reason").and_then(|x|x.as_str())==Some("length") {
+        anyhow::bail!("local OLMo response reached OLMO_MAX_TOKENS={max_tokens}; increase the limit or reduce the source/context size and retry");
+    }
+    let text=v.pointer("/choices/0/message/content").and_then(|x|x.as_str()).context("missing local model response")?.to_string();
+    Ok(ModelOutput{model:model.to_string(),text})
+}
+
+fn parse_claude_wire_response(v:&serde_json::Value,model:&str,max_tokens:usize)->Result<ModelOutput>{
+    if v.get("stop_reason").and_then(|x|x.as_str())==Some("max_tokens") {
+        anyhow::bail!("Claude response reached CLAUDE_MAX_TOKENS={max_tokens}; increase the limit and retry");
+    }
+    let text=v.get("content").and_then(|x|x.as_array()).and_then(|a|a.iter().find_map(|x|x.get("text").and_then(|t|t.as_str()))).context("missing Claude response")?.to_string();
+    Ok(ModelOutput{model:model.to_string(),text})
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoutingMode { Hybrid, ClaudeOnly, LocalOnly }
@@ -80,11 +97,7 @@ impl ModelRouter {
         let max_tokens=std::env::var("OLMO_MAX_TOKENS").ok().and_then(|x|x.parse().ok()).unwrap_or(4096usize);
         let r=self.client.post(&self.olmo_url).json(&json!({"model":self.olmo_model,"messages":[{"role":"system","content":"You are a rigorous enterprise oncology grant-writing system. Obey output schemas exactly. Never invent evidence, citations, approvals, clinical results, or institutional capabilities. Explicitly preserve uncertainty."},{"role":"user","content":t.prompt}],"temperature":0.1,"max_tokens":max_tokens})).send().await?.error_for_status()?;
         let v:serde_json::Value=r.json().await?;
-        if v.pointer("/choices/0/finish_reason").and_then(|x|x.as_str())==Some("length") {
-            anyhow::bail!("local OLMo response reached OLMO_MAX_TOKENS={max_tokens}; increase the limit or reduce the source/context size and retry");
-        }
-        let text=v.pointer("/choices/0/message/content").and_then(|x|x.as_str()).context("missing local model response")?.to_string();
-        Ok(ModelOutput{model:self.olmo_model.clone(),text})
+        parse_olmo_wire_response(&v,&self.olmo_model,max_tokens)
     }
     async fn claude(&self,t:ModelTask)->Result<ModelOutput>{
         let key=self.anthropic_key.as_ref().context("ANTHROPIC_API_KEY missing")?;
@@ -94,10 +107,49 @@ impl ModelRouter {
             .json(&json!({"model":self.claude_model,"max_tokens":max_tokens,"temperature":0.1,"system":"You are the senior scientific grant strategist. Never fabricate evidence or citations. Preserve uncertainty and distinguish facts, investigator estimates, assumptions, and unknowns. When strict JSON is requested, return strict JSON only.","messages":[{"role":"user","content":t.prompt}]}))
             .send().await?.error_for_status()?;
         let v:serde_json::Value=r.json().await?;
-        if v.get("stop_reason").and_then(|x|x.as_str())==Some("max_tokens") {
-            anyhow::bail!("Claude response reached CLAUDE_MAX_TOKENS={max_tokens}; increase the limit and retry");
-        }
-        let text=v.get("content").and_then(|x|x.as_array()).and_then(|a|a.iter().find_map(|x|x.get("text").and_then(|t|t.as_str()))).context("missing Claude response")?.to_string();
-        Ok(ModelOutput{model:self.claude_model.clone(),text})
+        parse_claude_wire_response(&v,&self.claude_model,max_tokens)
+    }
+}
+
+#[cfg(test)]
+mod contract_mock_tests {
+    use super::*;
+    use crate::source_locator::{compile_model_output,SourceDocument};
+
+    fn compliance_contract()->String{
+        serde_json::json!({"profile":{"sponsor":"Example Sponsor","mechanism":"R01","submission_system":"Portal","deadline_iso":"2030-10-15","rules":[
+          {"rule_id":"C-001","category":"format","rule_type":"max_pages","scope":"section","target":"Research Strategy","severity":"hard","mandatory":true,"numeric_value":12.0,"text_value":null,"list_value":[],"source_hint":"Research Strategy page limitation","source_document_hint":"Pasted funding opportunity","source_page_hint":null,"notes":""},
+          {"rule_id":"C-002","category":"format","rule_type":"min_font_size_pt","scope":"proposal","target":"application text","severity":"hard","mandatory":true,"numeric_value":11.0,"text_value":null,"list_value":[],"source_hint":"application text font size 11 points","source_document_hint":"Pasted funding opportunity","source_page_hint":null,"notes":""}
+        ]}}).to_string()
+    }
+
+    fn source()->Vec<SourceDocument>{vec![SourceDocument{id:17,name:"Pasted funding opportunity".into(),kind:"funding_paste".into(),text:"Formatting\nThe Research Strategy may not exceed 12 pages.\nApplication text must use a font size of 11 points or larger.".into()}]}
+
+    #[test]
+    fn claude_and_olmo_mocks_use_real_wire_and_domain_contracts(){
+        let contract=compliance_contract();
+        let claude=json!({"id":"msg_mock","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":contract}],"stop_reason":"end_turn"});
+        let olmo=json!({"id":"chatcmpl-mock","object":"chat.completion","model":"grant-olmo","choices":[{"index":0,"message":{"role":"assistant","content":compliance_contract()},"finish_reason":"stop"}]});
+        let claude_output=parse_claude_wire_response(&claude,"claude-sonnet-4-5",16000).unwrap();
+        let olmo_output=parse_olmo_wire_response(&olmo,"grant-olmo",16000).unwrap();
+        let documents=source();
+        let claude_profile=compile_model_output(&claude_output.text,&documents).unwrap();
+        let olmo_profile=compile_model_output(&olmo_output.text,&documents).unwrap();
+        assert_eq!(claude_profile.rules.len(),2);assert_eq!(olmo_profile.rules.len(),2);
+        for profile in [&claude_profile,&olmo_profile] {for rule in &profile.rules {
+            assert_eq!(rule.source_status,"located");
+            let document=&documents[0];let exact=&document.text[rule.source_start_offset.unwrap()..rule.source_end_offset.unwrap()];
+            assert_eq!(rule.source_excerpt,exact);assert_eq!(rule.source_document_id,Some(17));
+        }}
+        assert_eq!(claude_profile.rules[0].numeric_value,Some(12.0));
+        assert_eq!(olmo_profile.rules[1].numeric_value,Some(11.0));
+    }
+
+    #[test]
+    fn provider_faithful_mock_rejects_wrong_contract_types(){
+        let bad_contract=r#"{"profile":{"rules":[{"rule_id":"C-001","category":"format","rule_type":"max_pages","target":"Research Strategy","severity":"hard","mandatory":true,"numeric_value":"twelve","source_hint":"Research Strategy page limitation"}]}}"#;
+        let wire=json!({"choices":[{"message":{"content":bad_contract},"finish_reason":"stop"}]});
+        let output=parse_olmo_wire_response(&wire,"grant-olmo",16000).unwrap();
+        assert!(compile_model_output(&output.text,&source()).is_err());
     }
 }

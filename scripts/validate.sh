@@ -6,14 +6,18 @@ python3 - "$ROOT" <<'PYSYNTAX'
 from pathlib import Path
 import sys
 root=Path(sys.argv[1])
-for rel in ('ui/app.py','renderer/app.py','embedding_cpu/app.py','scripts/generate_sbom.py','scripts/generate_release_manifest.py'):
+for rel in ('ui/app.py','renderer/app.py','embedding_cpu/app.py','ingestion/app.py','scripts/generate_sbom.py','scripts/generate_release_manifest.py'):
     p=root/rel
     compile(p.read_text(),str(p),'exec')
 print('Python syntax validation passed.')
 PYSYNTAX
 ( set -a; source "$ROOT/.env.example"; set +a; test -n "$ORGANIZATION_NAME"; test -n "$GRANT_SECTIONS"; test -n "$COMPETITIVE_UPDATE_LABEL" )
 bash -n "$ROOT/start.sh" "$ROOT/stop.sh" "$ROOT/scripts/configure_runtime.sh" "$ROOT/scripts/tune_mac.sh" "$ROOT/scripts/start_mlx.sh" "$ROOT/scripts/smoke_test.sh" "$ROOT/scripts/preflight.sh"
-g++ -std=c++17 -O3 -fopenmp -fsyntax-only "$ROOT/hpc/hpc_kernels.cpp"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  echo "Native OpenMP/OpenBLAS syntax check runs in the pinned Linux builder on macOS."
+else
+  g++ -std=c++17 -O3 -fopenmp -fsyntax-only "$ROOT/hpc/hpc_kernels.cpp"
+fi
 
 grep -q 'memmap2' "$ROOT/core/Cargo.toml"
 grep -q '#pragma omp parallel' "$ROOT/hpc/hpc_kernels.cpp"
@@ -126,6 +130,9 @@ grep -q 'required_section' "$ROOT/core/src/compliance.rs"
 grep -q 'max_pages' "$ROOT/core/src/compliance.rs"
 grep -q 'compliance_context' "$ROOT/core/src/context_compiler.rs"
 grep -q 'funding_paste' "$ROOT/ui/app.py"
+grep -q 'playwright' "$ROOT/ingestion/requirements.txt"
+grep -q 'fetch_rendered' "$ROOT/core/src/research.rs"
+grep -q 'SOURCE NOT LOCATED' "$ROOT/core/src/source_locator.rs"
 grep -q 'Paste the grant opportunity' "$ROOT/ui/app.py"
 grep -q 'Sponsor Compliance & Submission' "$ROOT/ui/app.py"
 grep -q '@app.post("/measure")' "$ROOT/renderer/app.py"
@@ -140,9 +147,10 @@ root=Path(sys.argv[1])
 spec=importlib.util.spec_from_file_location('grant_ui_phase7',root/'ui'/'app.py')
 ui=importlib.util.module_from_spec(spec);spec.loader.exec_module(ui)
 profile=ui.build_compliance_profile('Sponsor','Mechanism','Portal','2030-01-01',[[
-    'C-001','section','required_section','proposal','specific_aims','hard',True,None,None,'','Specific Aims required','p.1',''
+    'C-001','section','required_section','proposal','specific_aims','hard',True,None,None,'','Specific Aims requirement','Pasted funding opportunity',None,''
 ]])
 assert profile['rules'][0]['rule_type']=='required_section' and profile['rules'][0]['mandatory'] is True
+assert 'source_excerpt' not in profile['rules'][0] and profile['rules'][0]['source_hint']=='Specific Aims requirement'
 assert ui.COMPETITIVE_UI_POLL_SECONDS==14400
 spec=importlib.util.spec_from_file_location('grant_renderer_phase7',root/'renderer'/'app.py')
 r=importlib.util.module_from_spec(spec);spec.loader.exec_module(r)
@@ -171,17 +179,14 @@ assert runtime['OMP_NUM_THREADS']==runtime['RAYON_NUM_THREADS']
 assert float(runtime['CORE_CPU_LIMIT'])>=int(runtime['OMP_NUM_THREADS'])
 PYM4
 
-if command -v cargo >/dev/null 2>&1 && [[ -f "$ROOT/core/Cargo.lock" ]]; then
+if command -v docker >/dev/null 2>&1; then
+  (cd "$ROOT" && docker compose config >/dev/null && docker compose --profile cpu-embedding config >/dev/null && docker build --target test -f Dockerfile.core . && docker compose build)
+elif command -v cargo >/dev/null 2>&1 && [[ -f "$ROOT/core/Cargo.lock" ]]; then
   (cd "$ROOT/core" && cargo test --release --locked)
 elif command -v cargo >/dev/null 2>&1; then
   echo "cargo is available but core/Cargo.lock is absent; locked Rust tests are deferred until the release lock is generated."
 else
-  echo "cargo unavailable in this environment; Rust compilation deferred to Docker/target Mac."
-fi
-if command -v docker >/dev/null 2>&1; then
-  (cd "$ROOT" && docker compose config >/dev/null && docker compose --profile cpu-embedding config >/dev/null && docker compose build)
-else
-  echo "docker unavailable in this environment; container build deferred to target Mac."
+  echo "Docker and Cargo are unavailable; Rust compilation is deferred to the target environment."
 fi
 echo "Validation completed."
 
@@ -217,6 +222,9 @@ for name in ('core','ui','renderer','embedding-cpu'):
     assert svc['cap_drop']==['ALL']
     assert svc['security_opt']==['no-new-privileges:true']
     assert str(svc['ports'][0]).startswith('127.0.0.1:')
+ingestion=compose['services']['ingestion']
+assert ingestion['read_only'] is True and ingestion['cap_drop']==['ALL']
+assert 'ports' not in ingestion
 # UI construction and non-secret diagnostics functions.
 spec=importlib.util.spec_from_file_location('phase8_ui',root/'ui'/'app.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 assert hasattr(m,'system_diagnostics') and hasattr(m,'run_hpc_diagnostics') and m.GRANT_BUILD_VERSION=='0.8.0'
