@@ -28,6 +28,10 @@ parking_lot = "=0.12.4"
 time = { version = "=0.3.41", features = ["formatting"] }
 html2text = "=0.14.2"
 futures = "=0.3.31"
+argon2 = "=0.5.3"
+base64 = "=0.22.1"
+rand = "=0.8.5"
+lettre = { version = "=0.11.18", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 
 [build-dependencies]
 cc = "=1.2.37"

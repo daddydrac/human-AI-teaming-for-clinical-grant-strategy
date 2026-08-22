@@ -51,6 +51,10 @@ pub struct ResearchQueryDraft {
     pub requirement_id: String,
     pub query: String,
     #[serde(default)]
+    pub aim_ids: Vec<String>,
+    #[serde(default)]
+    pub criterion_ids: Vec<String>,
+    #[serde(default)]
     pub preferred_domains: Vec<String>,
     #[serde(default)]
     pub rationale: String,

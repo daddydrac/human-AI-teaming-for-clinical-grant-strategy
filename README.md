@@ -764,6 +764,15 @@ Intel Mac / low-memory Mac
 docker_cpu
 ```
 
+An explicit private/local profile is also available for the 8 GB Apple-Silicon
+case:
+
+```text
+M2 8 GB + env.m2Mac.8gb.txt
+        ↓
+apple_ollama + qwen3:1.7b + CPU embeddings
+```
+
 Manual overrides are available:
 
 ```bash
@@ -774,6 +783,12 @@ or:
 
 ```bash
 GRANT_RUNTIME_PROFILE=docker_cpu
+```
+
+or:
+
+```bash
+GRANT_RUNTIME_PROFILE=apple_ollama
 ```
 
 Only override automatic selection for troubleshooting or controlled deployments.
@@ -788,7 +803,7 @@ MODEL_ROUTING_MODE=hybrid
 
 ### What it does
 
-Controls how generation is routed between local OLMo and Claude.
+Controls how generation is routed between the configured local model and Claude.
 
 ### Recommended
 
@@ -801,7 +816,7 @@ Effective behavior:
 ```text
 Apple Silicon
 ─────────────
-OLMo locally
+OLMo 3 or Qwen 3 locally
 +
 Claude escalation
 
@@ -811,6 +826,14 @@ Claude generation
 +
 local HPC retrieval
 ```
+
+Supported values are `hybrid`, `claude_only`, and `local_only`. The repository
+ships three machine-oriented templates:
+
+- `env.m4Mac.txt`: MLX OLMo 3 + Claude.
+- `env.m4Mac.qwen3.txt`: MLX Qwen 3 8B + Claude.
+- `env.m2Mac.8gb.txt`: Ollama Qwen 3 1.7B, local-only by default with an
+  documented hybrid toggle.
 
 ---
 

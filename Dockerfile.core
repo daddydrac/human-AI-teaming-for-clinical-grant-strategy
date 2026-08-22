@@ -7,21 +7,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends g++ libgomp1 li
 WORKDIR /src
 COPY core ./core
 COPY hpc ./hpc
+COPY config ./config
 WORKDIR /src/core
 # A checked-in Cargo.lock is preferred. On a fresh source tree the first controlled build
 # resolves exact direct pins and generates the lock, which scripts/freeze_rust_dependencies.sh
 # can persist before a release artifact is created.
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git \
-    if [ -f Cargo.lock ]; then cargo build --release --locked; else cargo generate-lockfile && cargo build --release --locked; fi
+    --mount=type=cache,target=/src/core/target \
+    if [ -f Cargo.lock ]; then cargo build --release --locked; else cargo generate-lockfile && cargo build --release --locked; fi \
+    && cp target/release/grant-core /tmp/grant-core
 
 FROM build AS test
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git cargo test --release --locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/core/target cargo test --release --locked
 
 FROM debian:bookworm-slim
 ARG APP_VERSION
 LABEL org.opencontainers.image.title="Research Clinic Grant Agent" org.opencontainers.image.version="${APP_VERSION}"
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 libopenblas0-pthread ca-certificates curl tar gzip && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/core/target/release/grant-core /usr/local/bin/grant-core
+COPY --from=build /tmp/grant-core /usr/local/bin/grant-core
 COPY config /app/config
 ENV RUST_LOG=info GRANT_WORKSPACE=/workspace OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1
 EXPOSE 8080

@@ -4,7 +4,14 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 if [[ ! -f .env ]]; then
   TEMPLATE=.env.example
-  if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" && -f env.m4Mac.txt ]]; then TEMPLATE=env.m4Mac.txt; fi
+  if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+    MEM_BYTES="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+    if [[ "$MEM_BYTES" -le 9663676416 && -f env.m2Mac.8gb.txt ]]; then
+      TEMPLATE=env.m2Mac.8gb.txt
+    elif [[ -f env.m4Mac.txt ]]; then
+      TEMPLATE=env.m4Mac.txt
+    fi
+  fi
   cp "$TEMPLATE" .env
   echo "Created .env from $TEMPLATE. Review credentials and rerun ./start.sh."
   exit 2
@@ -12,6 +19,14 @@ fi
 set -a
 source .env
 set +a
+if [[ "${AUTH_MODE:-internal_accounts}" == "internal_accounts" && -z "${INITIAL_ADMIN_SETUP_TOKEN:-}" ]]; then
+  command -v openssl >/dev/null 2>&1 || { echo "ERROR: openssl is required to generate the one-time administrator setup token." >&2; exit 3; }
+  INITIAL_ADMIN_SETUP_TOKEN="$(openssl rand -hex 32)"
+  export INITIAL_ADMIN_SETUP_TOKEN
+  printf '\nINITIAL_ADMIN_SETUP_TOKEN=%s\n' "$INITIAL_ADMIN_SETUP_TOKEN" >> .env
+  echo "Generated the one-time initial administrator setup token and saved it in .env."
+  echo "Enter this token on the first-start setup screen: $INITIAL_ADMIN_SETUP_TOKEN"
+fi
 mkdir -p "${GRANT_EXPORT_HOME:-./exports}"
 
 ./scripts/configure_runtime.sh .runtime.env
@@ -31,6 +46,8 @@ if [[ "$GRANT_RUNTIME_PROFILE" == "docker_cpu" ]]; then
     echo "Set ANTHROPIC_API_KEY in .env. Local OLMo 7B is intentionally disabled on this hardware profile." >&2
     exit 4
   fi
+elif [[ "$GRANT_RUNTIME_PROFILE" == "apple_ollama" ]]; then
+  "$ROOT/scripts/start_ollama.sh"
 else
   LOG_DIR="$HOME/Library/Logs/GrantWriter"
   RUNTIME_DIR="$HOME/Library/Application Support/GrantWriter/mlx-runtime"

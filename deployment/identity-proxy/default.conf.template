@@ -1,0 +1,22 @@
+server {
+    listen 8080;
+    server_tokens off;
+    client_max_body_size 100m;
+
+    location / {
+        proxy_pass http://ui:7860;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Always overwrite these values. Client-provided identity headers never
+        # reach the UI or API.
+        proxy_set_header X-Grantspace-User-Id $http_x_auth_request_user;
+        proxy_set_header X-Grantspace-User-Email $http_x_auth_request_email;
+        proxy_set_header X-Grantspace-User-Name $http_x_auth_request_preferred_username;
+        proxy_set_header X-Grantspace-Organization-Id ${SHARED_ORGANIZATION_ID};
+    }
+}

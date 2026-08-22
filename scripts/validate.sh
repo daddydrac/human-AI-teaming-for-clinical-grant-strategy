@@ -39,7 +39,7 @@ grep -q 'grant-data:/workspace' "$ROOT/docker-compose.yml"
 grep -q 'GRANT_EXPORT_HOME' "$ROOT/docker-compose.yml"
 grep -q 'context_compiler::compile' "$ROOT/core/src/main.rs"
 grep -q 'validate_public_destination' "$ROOT/core/src/research.rs"
-grep -q 'site:{d}.* OR ' "$ROOT/core/src/research.rs"
+grep -q '\.join(" OR ")' "$ROOT/core/src/research.rs"
 grep -q 'supporting_excerpt' "$ROOT/core/src/main.rs"
 grep -q 'interview_questions' "$ROOT/core/src/storage.rs"
 grep -q 'approved-sections' "$ROOT/core/src/main.rs"
@@ -101,6 +101,14 @@ assert x['updates']['candidate_score_delta'] >= 0
 assert isinstance(x['updates']['section_refresh_high_value'], bool)
 PYCFG
 
+PYTHON_RUNTIME_IMPORTS_READY=0
+if python3 -c 'import docx, fastapi, gradio, requests' >/dev/null 2>&1; then
+  PYTHON_RUNTIME_IMPORTS_READY=1
+else
+  echo "Host Python runtime dependencies are not installed; import-level UI/renderer checks will run in their container builds."
+fi
+
+if [[ "$PYTHON_RUNTIME_IMPORTS_READY" == "1" ]]; then
 python3 - "$ROOT" <<'PYUPDATE'
 import importlib.util,sys
 from pathlib import Path
@@ -119,6 +127,7 @@ section=ui.competitive_update_banner({'status':'pending','summary':'New competit
 assert 'including edits you made' in section and 'protected' in section,section
 print('Phase 6 auto-update UI/diff validation passed.')
 PYUPDATE
+fi
 grep -q 'preview_approved_grant' "$ROOT/ui/app.py"
 ! grep -q 'claim_lineage' "$ROOT/core/src/main.rs"
 
@@ -132,7 +141,7 @@ grep -q 'compliance_context' "$ROOT/core/src/context_compiler.rs"
 grep -q 'funding_paste' "$ROOT/ui/app.py"
 grep -q 'playwright' "$ROOT/ingestion/requirements.txt"
 grep -q 'fetch_rendered' "$ROOT/core/src/research.rs"
-grep -q 'SOURCE NOT LOCATED' "$ROOT/core/src/source_locator.rs"
+grep -q 'SOURCE_NOT_LOCATED' "$ROOT/core/src/source_locator.rs"
 grep -q 'Paste the grant opportunity' "$ROOT/ui/app.py"
 grep -q 'Sponsor Compliance & Submission' "$ROOT/ui/app.py"
 grep -q '@app.post("/measure")' "$ROOT/renderer/app.py"
@@ -140,6 +149,7 @@ grep -q '@app.post("/package")' "$ROOT/renderer/app.py"
 grep -q '^COMPETITIVE_REFRESH_TTL_SECONDS=14400$' "$ROOT/.env.example"
 grep -q '^COMPETITIVE_BACKGROUND_REFRESH_SECONDS=14400$' "$ROOT/.env.example"
 grep -q '^COMPETITIVE_UI_POLL_SECONDS=14400$' "$ROOT/.env.example"
+if [[ "$PYTHON_RUNTIME_IMPORTS_READY" == "1" ]]; then
 python3 - "$ROOT" <<'PYPH7'
 import importlib.util,sys
 from pathlib import Path
@@ -157,27 +167,48 @@ r=importlib.util.module_from_spec(spec);spec.loader.exec_module(r)
 assert hasattr(r,'measure') and hasattr(r,'package')
 print('Phase 7 compliance/intake/renderer validation passed.')
 PYPH7
+fi
 
-TMP="$(mktemp)"; TMP_M4="$(mktemp)"; trap 'rm -f "$TMP" "$TMP_M4"' EXIT
+TMP="$(mktemp)"; TMP_M4="$(mktemp)"; TMP_M2="$(mktemp)"; trap 'rm -f "$TMP" "$TMP_M4" "$TMP_M2"' EXIT
 GRANT_RUNTIME_PROFILE=docker_cpu "$ROOT/scripts/configure_runtime.sh" "$TMP" >/dev/null
 grep -q '^COMPOSE_PROFILES=cpu-embedding$' "$TMP"
 grep -q '^MODEL_ROUTING_MODE=claude_only$' "$TMP"
 grep -q '^EMBEDDING_URL=http://embedding-cpu:8010/v1/embeddings$' "$TMP"
 grep -q '^OMP_NUM_THREADS=' "$TMP"
 GRANT_RUNTIME_PROFILE=apple_mlx "$ROOT/scripts/configure_runtime.sh" "$TMP_M4" >/dev/null
-python3 - "$ROOT/env.m4Mac.txt" "$TMP_M4" <<'PYM4'
+python3 - "$ROOT/env.m4Mac.txt" "$ROOT/env.m4Mac.qwen3.txt" "$TMP_M4" <<'PYM4'
 import sys
 def values(path):
     return dict(line.strip().split('=',1) for line in open(path) if '=' in line and not line.lstrip().startswith('#'))
-template,runtime=map(values,sys.argv[1:])
+template,qwen,runtime=map(values,sys.argv[1:])
 assert template['GRANT_RUNTIME_PROFILE']=='apple_mlx'
 assert template['MODEL_ROUTING_MODE']=='hybrid'
 assert template['REQUIRE_CLAUDE_IN_HYBRID']=='true'
 assert template['OMP_NUM_THREADS']==template['RAYON_NUM_THREADS']=='8'
 assert float(template['CORE_CPU_LIMIT'])>=int(template['OMP_NUM_THREADS'])
+assert qwen['GRANT_RUNTIME_PROFILE']=='apple_mlx'
+assert qwen['MODEL_ROUTING_MODE']=='hybrid'
+assert qwen['REQUIRE_CLAUDE_IN_HYBRID']=='true'
+assert qwen['LOCAL_LLM_MODEL_REPO']=='mlx-community/Qwen3-8B-4bit'
 assert runtime['OMP_NUM_THREADS']==runtime['RAYON_NUM_THREADS']
 assert float(runtime['CORE_CPU_LIMIT'])>=int(runtime['OMP_NUM_THREADS'])
 PYM4
+GRANT_RUNTIME_PROFILE=apple_ollama MODEL_ROUTING_MODE=local_only LOCAL_LLM_API_MODEL=qwen3:1.7b "$ROOT/scripts/configure_runtime.sh" "$TMP_M2" >/dev/null
+python3 - "$ROOT/env.m2Mac.8gb.txt" "$TMP_M2" <<'PYM2'
+import sys
+def values(path):
+    return dict(line.strip().split('=',1) for line in open(path) if '=' in line and not line.lstrip().startswith('#'))
+template,runtime=map(values,sys.argv[1:])
+assert template['GRANT_RUNTIME_PROFILE']=='apple_ollama'
+assert template['MODEL_ROUTING_MODE']=='local_only'
+assert template['LOCAL_LLM_API_MODEL']=='qwen3:1.7b'
+assert template['OLLAMA_CONTEXT_LENGTH']=='4096'
+assert runtime['COMPOSE_PROFILES']=='cpu-embedding'
+assert runtime['LOCAL_LLM_PROVIDER']=='ollama'
+assert runtime['LOCAL_LLM_API_MODEL']=='qwen3:1.7b'
+assert int(runtime['CONTEXT_MAX_CHARS'])<=8000
+assert int(runtime['OMP_NUM_THREADS'])<=2
+PYM2
 
 if command -v docker >/dev/null 2>&1; then
   (cd "$ROOT" && docker compose config >/dev/null && docker compose --profile cpu-embedding config >/dev/null && docker build --target test -f Dockerfile.core . && docker compose build)
@@ -199,7 +230,7 @@ grep -q 'no-new-privileges:true' "$ROOT/docker-compose.yml"
 grep -q 'cap_drop:' "$ROOT/docker-compose.yml"
 grep -q 'restart: unless-stopped' "$ROOT/docker-compose.yml"
 grep -q 'max-size: "10m"' "$ROOT/docker-compose.yml"
-for file in install.sh scripts/security_scan.sh scripts/benchmark.sh scripts/backup.sh scripts/restore.sh scripts/audit_dependencies.sh scripts/doctor.sh scripts/build_release.sh scripts/sign_release.sh scripts/release_acceptance.sh; do
+for file in install.sh scripts/start_ollama.sh scripts/security_scan.sh scripts/benchmark.sh scripts/backup.sh scripts/restore.sh scripts/audit_dependencies.sh scripts/doctor.sh scripts/build_release.sh scripts/sign_release.sh scripts/release_acceptance.sh; do
   test -x "$ROOT/$file"
   bash -n "$ROOT/$file"
 done
@@ -210,9 +241,10 @@ grep -q 'cargo-audit' "$ROOT/scripts/audit_dependencies.sh"
 grep -q 'Grant Writer doctor' "$ROOT/scripts/doctor.sh"
 grep -q 'type=cache,target=/usr/local/cargo/registry' "$ROOT/Dockerfile.core"
 grep -q 'type=cache,target=/root/.cache/pip' "$ROOT/Dockerfile.ui"
-python3 - "$ROOT" <<'PYPH8'
+python3 - "$ROOT" "$PYTHON_RUNTIME_IMPORTS_READY" <<'PYPH8'
 import importlib.util,json,pathlib,sys,tomllib,yaml,tempfile
 root=pathlib.Path(sys.argv[1])
+runtime_imports_ready=sys.argv[2]=='1'
 with open(root/'core'/'Cargo.toml','rb') as f:cargo=tomllib.load(f)
 assert cargo['package']['version']=='0.8.0'
 compose=yaml.safe_load((root/'docker-compose.yml').read_text())
@@ -225,9 +257,11 @@ for name in ('core','ui','renderer','embedding-cpu'):
 ingestion=compose['services']['ingestion']
 assert ingestion['read_only'] is True and ingestion['cap_drop']==['ALL']
 assert 'ports' not in ingestion
-# UI construction and non-secret diagnostics functions.
-spec=importlib.util.spec_from_file_location('phase8_ui',root/'ui'/'app.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
-assert hasattr(m,'system_diagnostics') and hasattr(m,'run_hpc_diagnostics') and m.GRANT_BUILD_VERSION=='0.8.0'
+# UI construction is exercised here when host dependencies exist; otherwise the
+# successful UI container build above is the import/runtime dependency check.
+if runtime_imports_ready:
+    spec=importlib.util.spec_from_file_location('phase8_ui',root/'ui'/'app.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+    assert hasattr(m,'system_diagnostics') and hasattr(m,'run_hpc_diagnostics') and m.GRANT_BUILD_VERSION=='0.8.0'
 # SBOM/manifest generators must run without external services.
 with tempfile.TemporaryDirectory() as td:
     td=pathlib.Path(td)

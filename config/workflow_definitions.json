@@ -1,0 +1,220 @@
+{
+  "schema_version": 1,
+  "definition_version": 1,
+  "default_preset_key": "lean_research_v1",
+  "legacy_preset_key": "legacy_full_workbench_v1",
+  "review_module_key": "review_simulator",
+  "model_routing_modes": ["hybrid", "claude_only", "local_only"],
+  "reviewer_archetypes": [
+    {"key":"scientific_mission","title":"Scientific importance and mission","description":"Assesses importance, innovation, expected impact, and sponsor mission alignment.","criterion_terms":["importance","significance","innovation","impact","mission","scientific merit"],"grant_types":[],"always_include":true},
+    {"key":"methods_feasibility","title":"Methods, rigor, and feasibility","description":"Assesses approach, rigor, reproducibility, design validity, milestones, and feasibility.","criterion_terms":["approach","rigor","method","feasibility","design","reproducibility","milestone"],"grant_types":[],"always_include":true},
+    {"key":"clinical_statistics","title":"Clinical and statistical design","description":"Assesses clinical endpoints, estimands, sample size, recruitment, safety, and analysis.","criterion_terms":["clinical","statistic","sample size","endpoint","recruitment","safety","trial","estimand"],"grant_types":["clinical_trial"],"always_include":false},
+    {"key":"team_resources","title":"Investigators, team, and resources","description":"Assesses expertise, environment, facilities, governance, and team readiness.","criterion_terms":["investigator","expertise","team","environment","resource","facilit","personnel"],"grant_types":[],"always_include":false},
+    {"key":"implementation_community","title":"Implementation and community impact","description":"Assesses adoption, dissemination, equity, stakeholder engagement, and community benefit.","criterion_terms":["implementation","community","dissemination","adoption","equity","stakeholder","translation"],"grant_types":["implementation"],"always_include":false},
+    {"key":"administrative_compliance","title":"Research administration and compliance","description":"Assesses submission completeness, eligibility, budget, attachments, and administrative risk.","criterion_terms":["compliance","eligibility","budget","attachment","administrative","submission"],"grant_types":[],"always_include":false},
+    {"key":"program_portfolio","title":"Program mission and portfolio","description":"Assesses strategic fit and programmatic contribution without predicting funding decisions.","criterion_terms":["programmatic","portfolio","strategy","priority","mission","responsive"],"grant_types":["rfi_response","center_program","foundation"],"always_include":false}
+  ],
+  "gate_tokens": ["proposal_draft"],
+  "core_steps": [
+    {
+      "key": "solicitation",
+      "title": "Analyze the grant ask",
+      "description": "Create and approve the authoritative solicitation profile, requirements, rubric, deadlines, attachments, and unresolved human questions.",
+      "placement": "ordered",
+      "output": "Approved solicitation profile",
+      "artifact_type": "solicitation_profile",
+      "ui_surface": "solicitation",
+      "completion_evaluator": "solicitation_approved",
+      "prerequisites": []
+    },
+    {
+      "key": "framework",
+      "title": "Approve research framework",
+      "description": "Map sponsor requirements and review criteria to the proposal argument, evidence needs, ownership, and section architecture.",
+      "placement": "ordered",
+      "output": "Mapped proposal architecture",
+      "artifact_type": "research_framework",
+      "ui_surface": "framework",
+      "completion_evaluator": "artifact_approved",
+      "prerequisites": ["solicitation"]
+    },
+    {
+      "key": "aims",
+      "title": "Lock key aims",
+      "description": "Capture structured objectives, hypotheses, aims, rationale, approach, outcomes, impact, innovation, assumptions, and evidence links.",
+      "placement": "ordered",
+      "output": "Versioned scientific aims",
+      "artifact_type": "aim_set",
+      "ui_surface": "aims",
+      "completion_evaluator": "artifact_approved",
+      "prerequisites": ["framework"]
+    },
+    {
+      "key": "literature",
+      "title": "Complete literature research",
+      "description": "Run and approve a reproducible evidence search derived from the solicitation, approved framework, aims, and recorded gaps.",
+      "placement": "ordered",
+      "output": "Evidence manifest and citations",
+      "artifact_type": "literature_manifest",
+      "ui_surface": "literature",
+      "completion_evaluator": "artifact_approved",
+      "prerequisites": ["aims"]
+    },
+    {
+      "key": "proposal",
+      "title": "Draft, review and export",
+      "description": "Draft from exact approved inputs, complete human review, approve exact section versions, and export a reproducible snapshot.",
+      "placement": "ordered",
+      "output": "Approved final proposal",
+      "artifact_type": "proposal_snapshot",
+      "ui_surface": "proposal",
+      "completion_evaluator": "required_sections_approved",
+      "prerequisites": ["literature"]
+    }
+  ],
+  "optional_modules": [
+    {
+      "key": "opportunity_fit",
+      "title": "Opportunity and funder fit",
+      "description": "Transparent fit and mismatch analysis for a defensible go/no-go decision without claiming award probability.",
+      "placement": "before_solicitation",
+      "output": "Fit, mismatch, and go/no-go record",
+      "artifact_type": "opportunity_fit",
+      "ui_surface": "opportunity_fit",
+      "completion_evaluator": "artifact_approved",
+      "gate_default": false,
+      "prerequisites": [],
+      "runtime_implication": "Uses solicitation and public funder context; public-source connectors may make network requests."
+    },
+    {
+      "key": "investigator_interview",
+      "title": "Structured investigator interview",
+      "description": "Resolve missing scientific inputs with typed, attributed answers and provenance.",
+      "placement": "between_framework_and_aims",
+      "output": "Resolved investigator information gaps",
+      "artifact_type": "investigator_interview",
+      "ui_surface": "interview",
+      "completion_evaluator": "investigator_interview_complete",
+      "gate_default": true,
+      "prerequisites": ["framework"],
+      "runtime_implication": "Model-assisted question generation; answers remain human-authored project records."
+    },
+    {
+      "key": "clinical_design",
+      "title": "Clinical design and statistics",
+      "description": "Typed study design, estimands, endpoints, power assumptions, recruitment feasibility, and consistency checks.",
+      "placement": "after_aims",
+      "output": "Approved clinical and statistical design",
+      "artifact_type": "clinical_design",
+      "ui_surface": "clinical",
+      "completion_evaluator": "clinical_design_ready",
+      "gate_default": true,
+      "prerequisites": ["aims"],
+      "runtime_implication": "Runs deterministic statistical and feasibility calculations in addition to model assistance."
+    },
+    {
+      "key": "institutional_memory",
+      "title": "Institutional memory",
+      "description": "Reuse only approved capabilities, bios, facilities, snippets, prior proposal material, and institutional evidence with origin and review dates.",
+      "placement": "cross_cutting",
+      "output": "Approved reusable institutional library",
+      "artifact_type": "institutional_memory",
+      "ui_surface": "institutional_memory",
+      "completion_evaluator": "artifact_approved",
+      "gate_default": false,
+      "prerequisites": [],
+      "runtime_implication": "Adds indexed institutional files and approved reusable content to project retrieval."
+    },
+    {
+      "key": "competitive_intelligence",
+      "title": "Competitive applicant intelligence",
+      "description": "Evidence-backed differentiation using public grant, publication, trial, intellectual-property, and technology sources.",
+      "placement": "after_literature",
+      "output": "Differentiation strategy and monitored public evidence",
+      "artifact_type": "competitive_intelligence",
+      "ui_surface": "competitive",
+      "completion_evaluator": "competitive_intelligence_ready",
+      "gate_default": false,
+      "prerequisites": ["literature"],
+      "runtime_implication": "Uses configured public research connectors and may trigger scheduled refreshes."
+    },
+    {
+      "key": "sponsor_compliance",
+      "title": "Sponsor compliance and submission",
+      "description": "Versioned sponsor rules, exact provenance, attachment checklist, deterministic measurements, and final preflight.",
+      "placement": "cross_cutting",
+      "output": "Approved rules and passing submission preflight",
+      "artifact_type": "sponsor_compliance",
+      "ui_surface": "compliance",
+      "completion_evaluator": "sponsor_compliance_ready",
+      "gate_default": true,
+      "prerequisites": ["solicitation"],
+      "runtime_implication": "Runs model-assisted rule extraction followed by deterministic validation against exact source bytes."
+    },
+    {
+      "key": "review_simulator",
+      "title": "Review simulator and causal critique",
+      "description": "Independent synthetic role reviews, panel synthesis, causal analysis, disagreement mapping, and a revision backlog grounded in the solicitation.",
+      "placement": "after_draft",
+      "output": "Immutable simulated review run and causal findings",
+      "artifact_type": "review_simulation",
+      "ui_surface": "review_simulator",
+      "completion_evaluator": "artifact_approved",
+      "gate_default": false,
+      "prerequisites": ["proposal_draft"],
+      "runtime_implication": "High-compute, multi-pass model operation; hybrid deployments route configured review tasks to the disclosed cloud model."
+    },
+    {
+      "key": "team_collaboration",
+      "title": "Team collaboration and approvals",
+      "description": "Shared channels, section threads, comments, assignments, named approvals, presence, conflict handling, and auditable restoration.",
+      "placement": "cross_cutting",
+      "output": "Team discussion, assignment, and approval history",
+      "artifact_type": "collaboration_record",
+      "ui_surface": "collaboration",
+      "completion_evaluator": "collaboration_routing_complete",
+      "gate_default": false,
+      "prerequisites": [],
+      "runtime_implication": "Requires authenticated shared deployment for real multi-user use."
+    },
+    {
+      "key": "task_automation",
+      "title": "Deadline and task automation",
+      "description": "Derived internal deadlines, owners, dependencies, reminders, escalations, and project-health reporting.",
+      "placement": "cross_cutting",
+      "output": "Auditable project task plan",
+      "artifact_type": "task_plan",
+      "ui_surface": "tasks",
+      "completion_evaluator": "artifact_approved",
+      "gate_default": false,
+      "prerequisites": ["solicitation"],
+      "runtime_implication": "Adds scheduled project checks and notifications; external calendar or email delivery is not enabled by default."
+    },
+    {
+      "key": "advanced_workbench",
+      "title": "Full advanced workbench",
+      "description": "Expose the existing diagnostics, specialist controls, raw artifacts, and legacy operational views.",
+      "placement": "view",
+      "output": "Advanced specialist view",
+      "artifact_type": null,
+      "ui_surface": "advanced_workbench",
+      "completion_evaluator": "view_only",
+      "gate_default": false,
+      "prerequisites": [],
+      "runtime_implication": "Changes visible controls only and never adds completion prerequisites."
+    }
+  ],
+  "presets": [
+    {"key": "lean_research_v1", "title": "Lean research proposal", "enabled_modules": [], "required_modules": []},
+    {"key": "clinical_study_v1", "title": "Clinical study", "enabled_modules": ["investigator_interview", "clinical_design", "sponsor_compliance", "team_collaboration"], "required_modules": ["investigator_interview", "clinical_design", "sponsor_compliance"]},
+    {"key": "full_institutional_v1", "title": "Full institutional submission", "enabled_modules": ["opportunity_fit", "investigator_interview", "clinical_design", "institutional_memory", "competitive_intelligence", "sponsor_compliance", "review_simulator", "team_collaboration", "task_automation", "advanced_workbench"], "required_modules": ["investigator_interview", "clinical_design", "sponsor_compliance", "team_collaboration"]},
+    {"key": "rfi_strategy_v1", "title": "RFI or strategy response", "enabled_modules": ["opportunity_fit", "institutional_memory", "review_simulator", "team_collaboration", "task_automation"], "required_modules": []},
+    {"key": "legacy_full_workbench_v1", "title": "Legacy full workbench", "enabled_modules": ["opportunity_fit", "investigator_interview", "clinical_design", "institutional_memory", "competitive_intelligence", "sponsor_compliance", "review_simulator", "team_collaboration", "task_automation", "advanced_workbench"], "required_modules": ["investigator_interview", "clinical_design", "competitive_intelligence", "sponsor_compliance"]}
+  ],
+  "review_modes": [
+    {"key": "quick_red_team", "title": "Quick red-team"},
+    {"key": "full_panel", "title": "Full individual panel"},
+    {"key": "consensus_panel", "title": "Consensus panel"},
+    {"key": "consensus_causal", "title": "Consensus and causal-methods review"}
+  ]
+}

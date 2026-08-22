@@ -10,7 +10,9 @@ pub fn chunk_text(text: &str, target_words: usize, overlap_words: usize) -> Vec<
     let target = target_words.max(64);
     let overlap = overlap_words.min(target / 2);
     let words: Vec<&str> = text.split_whitespace().collect();
-    if words.is_empty() { return Vec::new(); }
+    if words.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut ordinal = 0usize;
@@ -36,7 +38,9 @@ pub fn chunk_text(text: &str, target_words: usize, overlap_words: usize) -> Vec<
             end_word: end,
         });
         ordinal += 1;
-        if end == words.len() { break; }
+        if end == words.len() {
+            break;
+        }
         start = end.saturating_sub(overlap);
     }
     out
@@ -46,8 +50,17 @@ pub fn chunk_text(text: &str, target_words: usize, overlap_words: usize) -> Vec<
 mod tests {
     use super::*;
     #[test]
-    fn overlaps_without_losing_tail(){
-        let text=(0..1000).map(|i|format!("w{i}")).collect::<Vec<_>>().join(" ");
-        let chunks=chunk_text(&text,100,20); assert!(chunks.len()>1); assert_eq!(chunks.first().unwrap().start_word,0); assert_eq!(chunks.last().unwrap().end_word,1000); for pair in chunks.windows(2){assert!(pair[1].start_word<pair[0].end_word);}
+    fn overlaps_without_losing_tail() {
+        let text = (0..1000)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let chunks = chunk_text(&text, 100, 20);
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.first().unwrap().start_word, 0);
+        assert_eq!(chunks.last().unwrap().end_word, 1000);
+        for pair in chunks.windows(2) {
+            assert!(pair[1].start_word < pair[0].end_word);
+        }
     }
 }

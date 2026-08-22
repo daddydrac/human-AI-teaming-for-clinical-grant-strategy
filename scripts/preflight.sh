@@ -18,12 +18,14 @@ if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "x86_64" ]]; then
 fi
 if [[ "$GRANT_RUNTIME_PROFILE" == "docker_cpu" ]]; then
   [[ -n "${ANTHROPIC_API_KEY:-}" ]] || { echo "ANTHROPIC_API_KEY is required in docker_cpu mode." >&2; exit 5; }
-else
+elif [[ "$GRANT_RUNTIME_PROFILE" == "apple_mlx" ]]; then
   command -v uv >/dev/null 2>&1 || { echo "uv is required for native Apple MLX mode." >&2; exit 6; }
-  if [[ "${REQUIRE_CLAUDE_IN_HYBRID:-false}" == "true" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
-    echo "ANTHROPIC_API_KEY is required because this M4 profile is configured to use both OLMo and Claude." >&2
-    exit 8
-  fi
+elif [[ "$GRANT_RUNTIME_PROFILE" == "apple_ollama" ]]; then
+  command -v ollama >/dev/null 2>&1 || { echo "Ollama is required for the apple_ollama profile." >&2; exit 6; }
+fi
+if [[ "${MODEL_ROUTING_MODE:-}" == "hybrid" && "${REQUIRE_CLAUDE_IN_HYBRID:-false}" == "true" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
+  echo "ANTHROPIC_API_KEY is required because this hybrid profile requires Claude escalation." >&2
+  exit 8
 fi
 if [[ -z "${OPENALEX_API_KEY:-}" ]]; then
   echo "WARNING: OPENALEX_API_KEY is not configured; Phase 6 publication discovery will be skipped." >&2

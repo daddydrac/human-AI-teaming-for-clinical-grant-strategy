@@ -76,8 +76,32 @@ services:
       GRANT_RUNTIME_PROFILE: ${GRANT_RUNTIME_PROFILE:-unknown}
       GRANT_BUILD_VERSION: ${GRANT_BUILD_VERSION:-0.8.0}
       GRANT_BUILD_REVISION: ${GRANT_BUILD_REVISION:-development}
+      AUTH_MODE: ${AUTH_MODE:-internal_accounts}
+      LOCAL_USER_ID: ${LOCAL_USER_ID:-local-admin}
+      LOCAL_USER_EMAIL: ${LOCAL_USER_EMAIL:-}
+      LOCAL_USER_DISPLAY_NAME: ${LOCAL_USER_DISPLAY_NAME:-Local administrator}
+      LOCAL_ORGANIZATION_ID: ${LOCAL_ORGANIZATION_ID:-local-organization}
+      INITIAL_ADMIN_SETUP_TOKEN: ${INITIAL_ADMIN_SETUP_TOKEN:-}
+      AUTH_SESSION_TTL_SECONDS: ${AUTH_SESSION_TTL_SECONDS:-43200}
+      PASSWORD_RESET_TTL_SECONDS: ${PASSWORD_RESET_TTL_SECONDS:-1800}
+      PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-14}
+      PASSWORD_MAX_LENGTH: ${PASSWORD_MAX_LENGTH:-256}
+      LOGIN_MAX_FAILURES: ${LOGIN_MAX_FAILURES:-5}
+      LOGIN_LOCK_SECONDS: ${LOGIN_LOCK_SECONDS:-900}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL:-http://127.0.0.1:7860}
       MODEL_ROUTING_MODE: ${MODEL_ROUTING_MODE:-hybrid}
       REQUIRE_CLAUDE_IN_HYBRID: ${REQUIRE_CLAUDE_IN_HYBRID:-false}
+      LOCAL_LLM_PROVIDER: ${LOCAL_LLM_PROVIDER:-mlx}
+      LOCAL_LLM_URL: ${LOCAL_LLM_URL:-${OLMO_URL:-http://host.docker.internal:8000/v1/chat/completions}}
+      LOCAL_LLM_MODEL: ${LOCAL_LLM_API_MODEL:-${OLMO_API_MODEL:-grant-olmo}}
+      LOCAL_LLM_MAX_TOKENS: ${LOCAL_LLM_MAX_TOKENS:-${OLMO_MAX_TOKENS:-4096}}
+      LOCAL_LLM_PROMPT_PREFIX: ${LOCAL_LLM_PROMPT_PREFIX:-}
+      # OLMO_* remains populated for backward compatibility with older releases.
       OLMO_URL: ${OLMO_URL:-http://host.docker.internal:8000/v1/chat/completions}
       OLMO_MODEL: ${OLMO_API_MODEL:-grant-olmo}
       OLMO_MAX_TOKENS: ${OLMO_MAX_TOKENS:-4096}
@@ -106,7 +130,7 @@ services:
       CLINICAL_SCENARIO_MAX_COMBINATIONS: ${CLINICAL_SCENARIO_MAX_COMBINATIONS:-10000}
       MODEL_HTTP_TIMEOUT_SECONDS: ${MODEL_HTTP_TIMEOUT_SECONDS:-300}
       EMBEDDING_HEALTH_TTL_SECONDS: ${EMBEDDING_HEALTH_TTL_SECONDS:-600}
-      CLAUDE_TASK_KINDS: ${CLAUDE_TASK_KINDS:-requirement_decomposition,sponsor_compliance_compilation,investigator_interview,research_planning,evidence_validation,competitor_profile,competitive_positioning,complex_scientific_synthesis}
+      CLAUDE_TASK_KINDS: ${CLAUDE_TASK_KINDS:-requirement_decomposition,sponsor_compliance_compilation,investigator_interview,research_planning,evidence_validation,competitor_profile,competitive_positioning,complex_scientific_synthesis,review_simulation,causal_analysis}
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
       OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-1}
       RAYON_NUM_THREADS: ${RAYON_NUM_THREADS:-4}
@@ -122,6 +146,7 @@ services:
       BM25_B: ${BM25_B:-0.75}
       ORGANIZATION_NAME: ${ORGANIZATION_NAME:-Organization}
       COMPETITIVE_CONFIG_PATH: ${COMPETITIVE_CONFIG_PATH:-/app/config/competitive_intelligence.json}
+      WORKFLOW_DEFINITIONS_PATH: ${WORKFLOW_DEFINITIONS_PATH:-/app/config/workflow_definitions.json}
       COMPETITIVE_HTTP_TIMEOUT_SECONDS: ${COMPETITIVE_HTTP_TIMEOUT_SECONDS:-45}
       COMPETITIVE_REFRESH_TTL_SECONDS: ${COMPETITIVE_REFRESH_TTL_SECONDS:-14400}
       COMPETITIVE_BACKGROUND_REFRESH_ENABLED: ${COMPETITIVE_BACKGROUND_REFRESH_ENABLED:-true}
@@ -203,6 +228,11 @@ services:
       UI_CONFIG_ROOT: /app/config
       ORGANIZATION_NAME: ${ORGANIZATION_NAME:-Organization}
       GRANT_BUILD_VERSION: ${GRANT_BUILD_VERSION:-0.8.0}
+      AUTH_MODE: ${AUTH_MODE:-internal_accounts}
+      AUTH_SESSION_TTL_SECONDS: ${AUTH_SESSION_TTL_SECONDS:-43200}
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL:-http://127.0.0.1:7860}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1}
       GRANT_SECTIONS: ${GRANT_SECTIONS:-}
       COMPETITIVE_UI_POLL_SECONDS: ${COMPETITIVE_UI_POLL_SECONDS:-14400}
       COMPETITIVE_UPDATE_LABEL: ${COMPETITIVE_UPDATE_LABEL:-Competitive Edge Auto-Update}

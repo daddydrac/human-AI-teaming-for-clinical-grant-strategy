@@ -1,7 +1,11 @@
-import hashlib, html, json, math, os, shutil, requests, gradio as gr
+import contextvars, hashlib, html, inspect, json, math, os, secrets, shutil, uuid, requests, gradio as gr
 from datetime import date
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import parse_qs
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from bs4 import BeautifulSoup
 from docx import Document as DocxDocument
@@ -19,6 +23,7 @@ CONFIG_ROOT=Path(os.getenv("UI_CONFIG_ROOT",str(Path(__file__).resolve().parents
 COMPETITIVE_UI_POLL_SECONDS=max(60,min(86400,int(os.getenv("COMPETITIVE_UI_POLL_SECONDS","14400"))))
 COMPETITIVE_UPDATE_LABEL=os.getenv("COMPETITIVE_UPDATE_LABEL","Competitive Edge Auto-Update").strip() or "Competitive Edge Auto-Update"
 GRANT_BUILD_VERSION=os.getenv("GRANT_BUILD_VERSION","0.8.0")
+REQUEST_IDENTITY_HEADERS=contextvars.ContextVar("request_identity_headers",default=None)
 
 
 def load_default_sections():
@@ -29,15 +34,92 @@ def load_default_sections():
 DEFAULT_SECTIONS=load_default_sections()
 
 CSS="""
-.gradio-container{max-width:1720px!important}
+:root{--gs-bg:#0d0b14;--gs-panel:#15121d;--gs-panel-2:#1b1724;--gs-border:#30293b;--gs-muted:#9a92a5;--gs-copy:#f7f3fb;--gs-purple:#a855f7;--gs-magenta:#d946ef;--gs-cyan:#55d9f2;--gs-green:#42d59c}
+.gradio-container{max-width:100%!important;background:var(--gs-bg)!important;color:var(--gs-copy)!important}
+.wizard-lightbox{position:fixed!important;inset:0!important;z-index:9999!important;background:radial-gradient(circle at 63% 15%,rgba(88,28,135,.14),transparent 34%),var(--gs-bg)!important;overflow:auto!important}
+.wizard-shell{min-height:100vh!important;display:grid!important;grid-template-columns:minmax(230px,16vw) 1fr!important;gap:0!important}
+.wizard-rail{height:100vh;position:sticky;top:0;border-right:1px solid var(--gs-border);padding:38px 24px;background:#100d17}
+.wizard-rail-label{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:#746c7e;margin-bottom:28px}
+.wizard-rail-step{display:grid;grid-template-columns:34px 1fr;gap:12px;align-items:center;padding:10px 4px;color:#716a7a}
+.wizard-rail-step .number{width:30px;height:30px;border:1px solid #393243;border-radius:50%;display:grid;place-items:center;font-size:12px}
+.wizard-rail-step.active{color:#fff}.wizard-rail-step.active .number{background:#7132a7;border-color:#a855f7;box-shadow:0 0 24px rgba(168,85,247,.28)}
+.wizard-rail-step.done .number{background:#17362d;border-color:#24463b;color:var(--gs-green)}
+.wizard-rail-step b{display:block;font-size:13px}.wizard-rail-step small{display:block;font-size:10px;color:#6d6575;margin-top:3px}
+.wizard-main{max-width:1480px!important;width:100%!important;margin:auto!important;padding:7vh 6vw 110px!important}
+.wizard-lightbox .gr-group,.wizard-lightbox .gr-group>.styler{background:transparent!important;border:0!important}
+.wizard-lightbox .block:not(.wizard-panel){background:transparent!important}
+.wizard-lightbox input,.wizard-lightbox textarea,.wizard-lightbox [role=listbox],.wizard-lightbox .wrap{background:#18141f!important;color:#f7f3fb!important;border-color:#3a3245!important}
+.wizard-lightbox label,.wizard-lightbox .label-wrap,.wizard-lightbox .prose{color:#f7f3fb!important}
+.wizard-lightbox .prose h1,.wizard-lightbox .prose h2,.wizard-lightbox .prose h3,.wizard-lightbox .prose p,.wizard-lightbox .prose strong{color:#f7f3fb!important}
+.wizard-lightbox button{background:#19151f!important;border-color:#3a3245!important;color:#f7f3fb!important}.wizard-lightbox button.primary{background:linear-gradient(100deg,#7c3aed,#d946ef)!important;border:0!important}
+.wizard-kicker{color:#bc6cf6;font-size:11px;letter-spacing:.2em;text-transform:uppercase;font-weight:700}
+.wizard-title h1,.wizard-title h2{font-family:Georgia,'Times New Roman',serif!important;font-weight:400!important;line-height:1.06!important;letter-spacing:-.035em!important;color:#fbf8ff!important}.wizard-title h1{font-size:clamp(42px,4.2vw,72px)!important}.wizard-title h2{font-size:clamp(36px,3.4vw,58px)!important}
+.wizard-title p{max-width:900px;color:var(--gs-muted);font-size:16px;line-height:1.7}
+.wizard-title,.wizard-title *{color:var(--gs-copy)!important}.wizard-title .accent{color:#c06cf4!important}
+.wizard-panel{background:rgba(22,18,29,.86)!important;border:1px solid var(--gs-border)!important;border-radius:18px!important;padding:22px!important}
+.wizard-hero{border-color:#573468!important;background:linear-gradient(145deg,rgba(168,85,247,.11),rgba(21,18,29,.96))!important;min-height:220px}
+.wizard-option-grid .wrap{gap:14px!important}
+.wizard-option-grid label{border:1px solid var(--gs-border)!important;border-radius:14px!important;background:var(--gs-panel)!important;padding:18px!important;min-height:72px;transition:.18s ease}.wizard-option-grid label:has(input:checked){border-color:#8e4db8!important;background:#23162d!important;box-shadow:inset 0 0 0 1px rgba(192,108,244,.25)}
+.core-flow{display:grid;grid-template-columns:1fr;gap:0;margin:24px 0;border:1px solid var(--gs-border);border-radius:18px;overflow:hidden;background:var(--gs-panel)}
+.core-step{display:grid;grid-template-columns:54px 1fr minmax(150px,240px);gap:16px;align-items:center;padding:20px 24px;border-bottom:1px solid var(--gs-border);min-height:98px}.core-step:last-child{border-bottom:0}.core-step .step-no{height:44px;width:44px;border:1px solid #56326c;border-radius:12px;display:grid;place-items:center;color:#c06cf4}.core-step b{display:block;color:#f5eff9;margin-bottom:5px}.core-step span,.core-step small{font-size:13px;color:var(--gs-muted)}.core-step .output{text-align:right;font-size:12px;color:#b2a8bc}
+.module-catalog{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:16px 0 24px}.module-card{border:1px solid var(--gs-border);border-radius:15px;padding:18px;background:var(--gs-panel);min-height:155px}.module-card.gated{border-left:3px solid #8f45bc}.module-card b{color:#f4eef8}.module-card .placement{color:#b25ee8;font-size:11px;margin:8px 0}.module-card p{color:var(--gs-muted);font-size:12px;line-height:1.55}.module-card small{color:#746c7e}
+.workflow-preview{border:1px solid var(--gs-border);border-radius:18px;background:var(--gs-panel);padding:20px}.workflow-preview-row{display:grid;grid-template-columns:38px 1fr auto;gap:14px;align-items:center;padding:14px 4px;border-bottom:1px solid #292332}.workflow-preview-row:last-child{border-bottom:0}.workflow-preview-row .n{height:34px;width:34px;border:1px solid #6a3a83;border-radius:9px;display:grid;place-items:center;color:#c06cf4}.workflow-preview-row small{color:var(--gs-muted)}
+.privacy-note{border:1px solid #24444d;border-radius:14px;padding:16px;background:rgba(25,92,105,.12);color:#bcecf3}
+.wizard-footer{position:fixed!important;z-index:10001;bottom:0;left:0;right:0;border-top:1px solid var(--gs-border);background:rgba(13,11,20,.96);backdrop-filter:blur(14px);padding:14px 28px!important}
+.wizard-footer button.primary{background:linear-gradient(100deg,#7c3aed,#d946ef)!important;border:0!important;color:white!important}
+.workspace-shell{background:var(--gs-bg)!important;min-height:100vh}.workspace-shell h1,.workspace-shell h2,.workspace-shell h3{color:#f7f3fb}
+.team-chat{max-height:520px;overflow:auto;border:1px solid var(--gs-border);border-radius:14px;padding:14px;background:var(--gs-panel)}.chat-message{background:var(--gs-panel-2);border:1px solid var(--gs-border);border-radius:12px;padding:10px 12px;margin:8px 0}.chat-meta{font-size:11px;color:var(--gs-muted);margin-bottom:4px}
 .page-frame{background:#e7e7e7;padding:24px;border-radius:14px;overflow:auto}
 .page-frame iframe{width:100%;min-height:11.2in;border:0;background:#e7e7e7}
-.status{font-size:12px;padding:8px 12px;border-radius:8px;background:#f5f5f5}
-.question-card{padding:18px;border:1px solid #ddd;border-radius:10px;background:white}
+.status{font-size:12px;padding:8px 12px;border-radius:8px;background:var(--gs-panel)}
+.question-card{padding:18px;border:1px solid var(--gs-border);border-radius:10px;background:var(--gs-panel)}
+@media(max-width:900px){.wizard-shell{grid-template-columns:1fr!important}.wizard-rail{height:auto;position:static;padding:12px;display:flex;overflow:auto}.wizard-rail-label,.wizard-rail-step b,.wizard-rail-step small{display:none}.wizard-rail-step{display:block}.wizard-main{padding:35px 20px 100px!important}.module-catalog{grid-template-columns:1fr}.core-step{grid-template-columns:48px 1fr}.core-step .output{display:none}}
 """
 
+def core_request_headers(method):
+    headers={}
+    if method.upper() not in {"GET","HEAD","OPTIONS"}:
+        headers["Idempotency-Key"]=str(uuid.uuid4())
+    auth_mode=os.getenv("AUTH_MODE","local_single_user")
+    if auth_mode=="trusted_headers":
+        identity=REQUEST_IDENTITY_HEADERS.get() or {}
+        headers.update(identity)
+        if "X-Grantspace-User-Id" not in headers or "X-Grantspace-Organization-Id" not in headers:
+            raise gr.Error("The authenticated gateway did not provide a stable user and organization identity for this browser session.")
+    elif auth_mode=="internal_accounts":
+        identity=REQUEST_IDENTITY_HEADERS.get() or {}
+        authorization=identity.get("Authorization")
+        if not authorization:raise gr.Error("Your login session is missing or expired. Sign in again.")
+        headers["Authorization"]=authorization
+    return headers
+
+def gateway_callback(function):
+    """Bind one Gradio callback to the identity headers on its own browser request."""
+    signature=inspect.signature(function)
+    request_parameter=inspect.Parameter("request",inspect.Parameter.POSITIONAL_OR_KEYWORD,default=None,annotation=gr.Request)
+    def wrapped(*args):
+        request=args[-1] if args and isinstance(args[-1],gr.Request) else None
+        call_args=args[:-1] if request is not None else args
+        identity={}
+        if request is not None:
+            incoming={str(key).lower():str(value).strip() for key,value in dict(request.headers).items()}
+            for header in ("x-grantspace-user-id","x-grantspace-organization-id","x-grantspace-user-email","x-grantspace-user-name"):
+                if incoming.get(header):identity["-".join(part.capitalize() for part in header.split("-"))]=incoming[header]
+            if os.getenv("AUTH_MODE","local_single_user")=="internal_accounts":
+                session_token=dict(getattr(request,"cookies",{}) or {}).get("grantspace_session")
+                if session_token:identity["Authorization"]=f"Bearer {session_token}"
+        token=REQUEST_IDENTITY_HEADERS.set(identity)
+        try:return function(*call_args)
+        finally:REQUEST_IDENTITY_HEADERS.reset(token)
+    wrapped.__name__=f"authenticated_{getattr(function,'__name__','callback')}"
+    wrapped.__signature__=signature.replace(parameters=[*signature.parameters.values(),request_parameter])
+    wrapped.__annotations__={**getattr(function,"__annotations__",{}),"request":gr.Request}
+    return wrapped
+
 def api(method,path,**kwargs):
-    r=requests.request(method,f"{CORE}{path}",timeout=kwargs.pop("timeout",300),**kwargs)
+    headers=core_request_headers(method)
+    headers.update(kwargs.pop("headers",{}) or {})
+    r=requests.request(method,f"{CORE}{path}",timeout=kwargs.pop("timeout",300),headers=headers,**kwargs)
     if not r.ok:
         try:detail=r.json().get("error",r.text)
         except Exception:detail=r.text
@@ -209,6 +291,442 @@ def slug(s):
         elif out and not last:out.append("_");last=True
     return "".join(out).strip("_")
 
+def load_workflow_registry():
+    """Load the same versioned registry used by the Rust gate evaluator."""
+    configured=Path(os.getenv("WORKFLOW_DEFINITIONS_PATH",str(CONFIG_ROOT/"workflow_definitions.json")))
+    candidates=[configured,CONFIG_ROOT/"workflow_definitions.json",Path("/app/config/workflow_definitions.json")]
+    for candidate in candidates:
+        try:
+            data=json.loads(candidate.read_text())
+            if len(data.get("core_steps") or [])!=5:raise ValueError("registry must contain five core steps")
+            return data
+        except FileNotFoundError:continue
+    raise RuntimeError("workflow_definitions.json is required; the UI will not invent a workflow")
+
+WORKFLOW_REGISTRY=load_workflow_registry()
+WORKFLOW_MODULES={item["key"]:item for item in WORKFLOW_REGISTRY["optional_modules"]}
+WORKFLOW_PRESETS={item["key"]:item for item in WORKFLOW_REGISTRY["presets"]}
+MODULE_CHOICES=[(item["title"],item["key"]) for item in WORKFLOW_REGISTRY["optional_modules"]]
+GATE_CHOICES=[(item["title"],item["key"]) for item in WORKFLOW_REGISTRY["optional_modules"] if item["completion_evaluator"]!="view_only"]
+PRESET_CHOICES=[(item["title"],item["key"]) for item in WORKFLOW_REGISTRY["presets"] if item["key"]!=WORKFLOW_REGISTRY["legacy_preset_key"]]
+REVIEW_MODE_CHOICES=[(item["title"],item["key"]) for item in WORKFLOW_REGISTRY["review_modes"]]
+REVIEWER_ARCHETYPE_ROWS=[[item["title"],item["description"]] for item in WORKFLOW_REGISTRY["reviewer_archetypes"]]
+
+def core_flow_html():
+    rows=[]
+    for index,step in enumerate(WORKFLOW_REGISTRY["core_steps"],1):
+        rows.append(
+            f'<div class="core-step"><div class="step-no">{index:02d}</div><div><b>{html.escape(step["title"])}</b>'
+            f'<span>{html.escape(step["description"])}</span></div><div class="output">OUTPUT<br><small>{html.escape(step["output"])}</small></div></div>'
+        )
+    return '<div class="core-flow">'+"".join(rows)+"</div>"
+
+def module_catalog_html():
+    cards=[]
+    for item in WORKFLOW_REGISTRY["optional_modules"]:
+        gated=item["completion_evaluator"]!="view_only" and item.get("gate_default",False)
+        gate="Default completion gate" if gated else "Advisory / configurable"
+        cards.append(
+            f'<article class="module-card {"gated" if gated else ""}"><b>{html.escape(item["title"])}</b>'
+            f'<div class="placement">{html.escape(item["placement"].replace("_"," ").upper())} · {gate}</div>'
+            f'<p>{html.escape(item["description"])}</p><small>Produces: {html.escape(item["output"])}<br>{html.escape(item["runtime_implication"])}</small></article>'
+        )
+    return '<div class="module-catalog">'+"".join(cards)+"</div>"
+
+WIZARD_STEPS=["Start","Grant ask","Core workflow","Optional modules","Review setup","Team & routing","Workflow preview"]
+
+def wizard_rail_html(active):
+    rows=[]
+    for index,title in enumerate(WIZARD_STEPS,1):
+        state="done" if index<active else ("active" if index==active else "")
+        marker="✓" if index<active else str(index)
+        subtitle="Required" if index<=4 else "Configuration"
+        rows.append(f'<div class="wizard-rail-step {state}"><span class="number">{marker}</span><span><b>{html.escape(title)}</b><small>{subtitle}</small></span></div>')
+    return '<nav class="wizard-rail"><div class="wizard-rail-label">Compose workflow</div>'+"".join(rows)+"</nav>"
+
+def wizard_page_updates(active):
+    return [gr.Column(visible=index==active) for index in range(1,8)]+[wizard_rail_html(active),f"{active} of 7"]
+
+def wizard_go(active):
+    return lambda: wizard_page_updates(active)
+
+def wizard_nav_js(active):
+    return f"""() => {{
+      for (let index = 1; index <= 7; index += 1) {{
+        const page = document.getElementById(`wizard-page-${{index}}`);
+        if (page) page.style.setProperty('display', index === {int(active)} ? 'flex' : 'none', 'important');
+      }}
+      return [];
+    }}"""
+
+def wizard_nav_from_progress_js():
+    return """() => {
+      const progress = document.getElementById('wizard-progress');
+      const match = progress && progress.textContent.match(/[1-7]/);
+      const active = match ? Number(match[0]) : 1;
+      for (let index = 1; index <= 7; index += 1) {
+        const page = document.getElementById(`wizard-page-${index}`);
+        if (page) page.style.setProperty('display', index === active ? 'flex' : 'none', 'important');
+      }
+      return [];
+    }"""
+
+def apply_workflow_preset(preset_key):
+    preset=WORKFLOW_PRESETS.get(preset_key)
+    if not preset:raise gr.Error("Choose a valid workflow preset.")
+    return list(preset["enabled_modules"]),list(preset["required_modules"])
+
+def reconcile_module_gates(selected,required):
+    selected=list(selected or [])
+    allowed={key for _,key in GATE_CHOICES if key in selected}
+    required=[key for key in (required or []) if key in allowed]
+    for key in selected:
+        item=WORKFLOW_MODULES[key]
+        if item.get("gate_default") and key in allowed and key not in required:required.append(key)
+    choices=[choice for choice in GATE_CHOICES if choice[1] in allowed]
+    return gr.update(choices=choices,value=required)
+
+def wizard_after_modules(selected):
+    active=5 if WORKFLOW_REGISTRY["review_module_key"] in (selected or []) else 6
+    return wizard_page_updates(active)
+
+def wizard_team_back(selected):
+    active=5 if WORKFLOW_REGISTRY["review_module_key"] in (selected or []) else 4
+    return wizard_page_updates(active)
+
+def validate_grant_ask_and_continue(title,source,source_url,source_text,deadline):
+    if not (title or "").strip():raise gr.Error("Working title is required.")
+    if not source and not (source_url or "").strip() and not (source_text or "").strip():
+        raise gr.Error("Upload, link, or paste the authoritative grant ask.")
+    if (deadline or "").strip():
+        try:date.fromisoformat(deadline.strip())
+        except ValueError:raise gr.Error("Sponsor deadline must use YYYY-MM-DD.")
+    return wizard_page_updates(3)
+
+def validate_team_and_preview(owner_id,title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows):
+    if not (owner_id or "").strip():raise gr.Error("Enter the stable authenticated project owner ID.")
+    return wizard_to_preview(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows)
+
+def authenticated_identity():
+    identity=api("GET","/api/me")
+    return identity.get("id") or "",f"Authenticated as **{identity.get('display_name')}** in organization `{identity.get('organization_id')}`. This stable identity will own edits and approvals."
+
+def account_rows():
+    payload=api("GET","/api/admin/users")
+    return [[item.get("id"),item.get("username"),item.get("email"),item.get("display_name"),item.get("system_role"),bool(item.get("must_change_password")),bool(item.get("active")),item.get("last_seen_at"),item.get("locked_until")] for item in payload.get("users",[])]
+
+def create_account(username,email,display_name,temporary_password):
+    result=api("POST","/api/admin/users",json={"username":username,"email":email,"display_name":display_name or None,"temporary_password":temporary_password})
+    delivery="Temporary-password email sent." if result.get("email_sent") else f"Account created, but email delivery failed: {result.get('delivery_error') or 'unknown SMTP error'}"
+    return account_rows(),f"**{result.get('user',{}).get('username')}** created. {delivery}",""
+
+def set_account_status(user_id,active):
+    if not (user_id or "").strip():raise gr.Error("Select or paste a user ID.")
+    api("POST",f"/api/admin/users/{user_id.strip()}/{'enable' if active else 'disable'}",json={})
+    return account_rows(),f"Account {'enabled' if active else 'disabled'}."
+
+def send_account_reset(user_id):
+    if not (user_id or "").strip():raise gr.Error("Select or paste a user ID.")
+    result=api("POST",f"/api/admin/users/{user_id.strip()}/password-reset",json={})
+    return f"Single-use reset link sent. It expires at {result.get('expires_at')}."
+
+def project_workflow_ui(project):
+    workflow=api("GET",f"/api/projects/{project}/workflow")
+    status=api("GET",f"/api/projects/{project}/workflow/status")
+    config=workflow.get("config") or workflow
+    enabled=set(config.get("enabled_modules") or [])
+    summary=(f"### Persisted project workflow\nDefinition **v{workflow.get('definition_version',config.get('definition_version'))}** · "
+             f"configuration **v{workflow.get('config_version','—')}** · {len(enabled)} optional capabilities · routing **{config.get('model_routing_mode') or 'deployment default'}**")
+    return (summary,status,
+            gr.update(visible="investigator_interview" in enabled),
+            gr.update(visible="clinical_design" in enabled),
+            gr.update(visible="competitive_intelligence" in enabled),
+            gr.update(visible="sponsor_compliance" in enabled),
+            gr.update(visible="review_simulator" in enabled),
+            gr.update(visible="advanced_workbench" in enabled))
+
+def workflow_preview_html(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows):
+    selected=set(selected or []);required=set(required or [])
+    rows=[];position=0
+    for step in WORKFLOW_REGISTRY["core_steps"]:
+        before=[m for m in WORKFLOW_REGISTRY["optional_modules"] if m["key"] in selected and m["placement"]=="before_"+step["key"]]
+        for module in before:
+            position+=1;rows.append((position,module["title"],module["output"],module["key"] in required))
+        position+=1;rows.append((position,step["title"],step["output"],True))
+        placement={"solicitation":"after_solicitation","framework":"between_framework_and_aims","aims":"after_aims","literature":"after_literature","proposal":"after_draft"}.get(step["key"])
+        for module in WORKFLOW_REGISTRY["optional_modules"]:
+            if module["key"] in selected and module["placement"]==placement:
+                position+=1;rows.append((position,module["title"],module["output"],module["key"] in required or (module["key"]==WORKFLOW_REGISTRY["review_module_key"] and review_required)))
+    body="".join(f'<div class="workflow-preview-row"><span class="n">{n}</span><span><b>{html.escape(name)}</b><br><small>{html.escape(output)}</small></span><small>{"Approval gate" if gated else "Advisory"}</small></div>' for n,name,output,gated in rows)
+    cross=[WORKFLOW_MODULES[key]["title"] for key in selected if WORKFLOW_MODULES[key]["placement"] in {"cross_cutting","view"}]
+    team_count=len(_records(team_rows,["Email","Role"]))
+    meta=f'<p><b>{html.escape(title or "Untitled grant")}</b> · {html.escape(sponsor or "Sponsor not entered")} {html.escape(mechanism or "")} · {html.escape(deadline or "No deadline entered")}</p>'
+    extras=f'<p><small>Cross-cutting capabilities: {html.escape(", ".join(sorted(cross)) or "None")} · Team invitations: {team_count} · Review: {html.escape(review_mode or "not selected")} · Routing: {html.escape(routing_mode or "deployment default")}</small></p>'
+    return '<div class="workflow-preview">'+meta+body+extras+'</div>'
+
+def build_workflow_config(preset_key,selected,required,grant_type,deadline,review_mode,review_required,routing_mode):
+    selected=list(dict.fromkeys(selected or []));required=list(dict.fromkeys(required or []))
+    review_key=WORKFLOW_REGISTRY["review_module_key"]
+    return {
+        "schema_version":WORKFLOW_REGISTRY["schema_version"],
+        "definition_version":WORKFLOW_REGISTRY["definition_version"],
+        "template":preset_key,
+        "enabled_modules":selected,
+        "required_modules":required,
+        "review_mode":review_mode if review_key in selected else None,
+        "review_required":bool(review_required and review_key in selected),
+        "grant_type":grant_type or None,
+        "target_deadline":deadline or None,
+        "model_routing_mode":routing_mode or None,
+        "local_model_provider":os.getenv("LOCAL_LLM_PROVIDER") or None,
+        "local_model":os.getenv("LOCAL_LLM_API_MODEL") or os.getenv("LOCAL_LLM_MODEL") or None,
+        "cloud_model":os.getenv("CLAUDE_MODEL") or None,
+        "cloud_task_kinds":[x.strip() for x in os.getenv("CLAUDE_TASK_KINDS",os.getenv("CLOUD_TASK_KINDS","")).split(",") if x.strip()],
+    }
+
+def artifact_editor_load(project,artifact_type):
+    if not project:raise gr.Error("Open a project first.")
+    data=api("GET",f"/api/projects/{project}/workflow/artifacts/{artifact_type}")
+    body=data.get("body")
+    text=json.dumps(body,indent=2,ensure_ascii=False) if body is not None else ""
+    version=data.get("version")
+    status=(f"Version **{version}** · {'approved' if data.get('approved') else 'awaiting human approval'} · SHA-256 `{str(data.get('sha256') or '')[:16]}…`"
+            if version else "No artifact exists yet.")
+    return text,version,status,data
+
+def parse_artifact_editor(text,artifact_type):
+    try:body=json.loads(text or "")
+    except json.JSONDecodeError as exc:raise gr.Error(f"{artifact_type} JSON is invalid at line {exc.lineno}, column {exc.colno}: {exc.msg}")
+    if not isinstance(body,dict):raise gr.Error(f"{artifact_type} must be a JSON object.")
+    return body
+
+def artifact_editor_save(project,artifact_type,text,actor,current_version):
+    if not (actor or "").strip():raise gr.Error("Authenticated actor ID is required.")
+    body=parse_artifact_editor(text,artifact_type)
+    data=api("POST",f"/api/projects/{project}/workflow/artifacts/{artifact_type}",json={"body":body,"source":"human_editor","author":actor.strip(),"expected_version":int(current_version) if current_version else None})
+    return json.dumps(data["body"],indent=2,ensure_ascii=False),data["version"],f"Saved {artifact_type} v{data['version']}; approval is still required.",data
+
+def mark_solicitation_facts_human_approved(body):
+    for collection in ("eligibility","requirements","deadlines","budget_rules","attachments","review_criteria"):
+        for item in body.get(collection) or []:
+            if not item.get("sources"):
+                raise gr.Error(f"{collection} item {item.get('id')} has no exact source provenance and cannot be approved.")
+            item["status"]="human_approved"
+    return body
+
+def artifact_editor_approve(project,artifact_type,text,actor,current_version):
+    if not (actor or "").strip():raise gr.Error("Authenticated approver ID is required.")
+    body=parse_artifact_editor(text,artifact_type)
+    if artifact_type=="solicitation_profile":body=mark_solicitation_facts_human_approved(body)
+    current=api("GET",f"/api/projects/{project}/workflow/artifacts/{artifact_type}")
+    if body!=current.get("body"):
+        current=api("POST",f"/api/projects/{project}/workflow/artifacts/{artifact_type}",json={"body":body,"source":"human_editor","author":actor.strip(),"expected_version":int(current_version) if current_version else None})
+    version=current.get("version")
+    if not version:raise gr.Error(f"No {artifact_type} version exists to approve.")
+    approved=api("POST",f"/api/projects/{project}/workflow/artifacts/{artifact_type}/approve",json={"version":int(version),"approver":actor.strip()})
+    workflow_status=api("GET",f"/api/projects/{project}/workflow/status")
+    return json.dumps(approved["body"],indent=2,ensure_ascii=False),approved["version"],f"✓ Approved exact {artifact_type} v{approved['version']}.",approved,workflow_status
+
+def artifact_editor_generate(project,artifact_type,actor):
+    if not (actor or "").strip():raise gr.Error("Authenticated actor ID is required.")
+    generated=api("POST",f"/api/projects/{project}/workflow/artifacts/{artifact_type}/generate",json={"actor":actor.strip(),"high_value":True},timeout=2400)
+    data=generated["artifact"]
+    return json.dumps(data["body"],indent=2,ensure_ascii=False),data["version"],f"Generated {artifact_type} v{data['version']} with `{generated['model']}` from approved {generated['upstream_artifact_type']} v{generated['upstream_version']}. Review and edit before approval.",data
+
+SOLICITATION_FACT_HEADERS=["Category","ID","Label","Value","Mandatory","Status","Provenance"]
+SOLICITATION_CRITERION_HEADERS=["ID","Title","Description","Scored","Scale","Status","Provenance"]
+FRAMEWORK_HEADERS=["Key","Title","Position","Requirement IDs","Criterion IDs","Narrative purpose","Key argument","Aim IDs","Evidence needs","Missing investigator inputs","Owner user ID","Approver user ID","Target words","Dependencies"]
+CORE_AIM_HEADERS=["ID","Title","Statement","Rationale","Approach summary","Expected outcome","Impact","Innovation","Classification","Dependencies","Supporting evidence IDs"]
+LITERATURE_QUERY_HEADERS=["ID","Query","Rationale","Aim IDs","Requirement IDs","Criterion IDs","Preferred domains"]
+EVIDENCE_NEED_HEADERS=["Evidence need ID","Disposition","Evidence IDs","Rationale"]
+
+def _split_values(value):
+    if value is None:return []
+    if isinstance(value,list):return [str(item).strip() for item in value if str(item).strip()]
+    return [item.strip() for item in str(value).replace("\n",",").split(",") if item.strip()]
+
+def _int_values(value):
+    try:return [int(item) for item in _split_values(value)]
+    except ValueError as exc:raise gr.Error(f"Expected comma-separated integer IDs: {exc}")
+
+def _display_value(value):
+    if isinstance(value,(dict,list)):return json.dumps(value,ensure_ascii=False)
+    if value is None:return ""
+    return str(value)
+
+def _parse_value(value):
+    text=str(value or "").strip()
+    if not text:return ""
+    try:return json.loads(text)
+    except json.JSONDecodeError:return text
+
+def _provenance_text(sources):
+    return " | ".join(f"doc {source.get('document_id')} · {source.get('locator')} · {source.get('excerpt','')[:120]}" for source in (sources or []))
+
+def _artifact_status(data):
+    version=data.get("version")
+    if not version:return "No artifact exists yet."
+    return f"Version **{version}** · {'approved' if data.get('approved') else 'awaiting human approval'} · SHA-256 `{str(data.get('sha256') or '')[:16]}…`"
+
+def _approval_message(data,label):
+    if data.get("approved"):return f"✓ Approved exact {label} v{data.get('version')}."
+    progress=data.get("approval_progress") or {}
+    return f"Approval recorded for {label} v{data.get('version')} ({progress.get('approvals',0)} of {progress.get('minimum_approvals','?')}); the artifact remains unapproved until the configured threshold is met."
+
+def load_solicitation_form(project):
+    data=api("GET",f"/api/projects/{project}/workflow/artifacts/solicitation_profile")
+    body=data.get("body") or {}
+    rows=[]
+    for category in ("eligibility","requirements","deadlines","budget_rules","attachments"):
+        for item in body.get(category) or []:
+            rows.append([category,item.get("id"),item.get("label"),_display_value(item.get("value")),item.get("mandatory",False),item.get("status"),_provenance_text(item.get("sources"))])
+    criteria=[[item.get("id"),item.get("title"),item.get("description"),item.get("scored",False),item.get("scale") or "",item.get("status"),_provenance_text(item.get("sources"))] for item in body.get("review_criteria") or []]
+    questions=[[item] for item in body.get("open_questions") or []]
+    return body.get("working_title",""),body.get("sponsor",""),body.get("mechanism") or "",body.get("purpose",""),rows,criteria,questions,data.get("version"),_artifact_status(data),data
+
+def solicitation_body(metadata,working_title,sponsor,mechanism,purpose,fact_rows,criterion_rows,question_rows):
+    prior=(metadata or {}).get("body") or {}
+    prior_facts={(category,str(item.get("id"))):item for category in ("eligibility","requirements","deadlines","budget_rules","attachments") for item in prior.get(category) or []}
+    body={"schema_version":1,"working_title":str(working_title or "").strip(),"sponsor":str(sponsor or "").strip(),"mechanism":str(mechanism or "").strip() or None,"purpose":str(purpose or "").strip(),"eligibility":[],"requirements":[],"review_criteria":[],"deadlines":[],"budget_rules":[],"attachments":[],"open_questions":[]}
+    for row in _records(fact_rows,SOLICITATION_FACT_HEADERS):
+        category=str(row["Category"] or "").strip()
+        if category not in {"eligibility","requirements","deadlines","budget_rules","attachments"}:raise gr.Error(f"Unknown solicitation fact category: {category}")
+        item_id=str(row["ID"] or "").strip();prior_item=prior_facts.get((category,item_id),{})
+        body[category].append({"id":item_id,"label":str(row["Label"] or "").strip(),"value":_parse_value(row["Value"]),"mandatory":bool(row["Mandatory"]),"status":prior_item.get("status") or "human_corrected","sources":prior_item.get("sources") or []})
+    prior_criteria={str(item.get("id")):item for item in prior.get("review_criteria") or []}
+    for row in _records(criterion_rows,SOLICITATION_CRITERION_HEADERS):
+        item_id=str(row["ID"] or "").strip();prior_item=prior_criteria.get(item_id,{})
+        body["review_criteria"].append({"id":item_id,"title":str(row["Title"] or "").strip(),"description":str(row["Description"] or "").strip(),"scored":bool(row["Scored"]),"scale":str(row["Scale"] or "").strip() or None,"status":prior_item.get("status") or "human_corrected","sources":prior_item.get("sources") or []})
+    body["open_questions"]=[str(row["Question"]).strip() for row in _records(question_rows,["Question"]) if str(row["Question"] or "").strip()]
+    return body
+
+def save_solicitation_form(project,actor,version,metadata,*fields):
+    body=solicitation_body(metadata,*fields)
+    data=api("POST",f"/api/projects/{project}/workflow/artifacts/solicitation_profile",json={"body":body,"source":"human_structured_editor","author":actor,"expected_version":int(version) if version else None})
+    return (*load_solicitation_form(project)[:-3],data["version"],f"Saved solicitation profile v{data['version']}; approval is still required.",data)
+
+def approve_solicitation_form(project,actor,version,metadata,*fields):
+    body=mark_solicitation_facts_human_approved(solicitation_body(metadata,*fields))
+    current=api("GET",f"/api/projects/{project}/workflow/artifacts/solicitation_profile")
+    if body!=current.get("body"):
+        current=api("POST",f"/api/projects/{project}/workflow/artifacts/solicitation_profile",json={"body":body,"source":"human_structured_editor","author":actor,"expected_version":int(version) if version else None})
+    approved=api("POST",f"/api/projects/{project}/workflow/artifacts/solicitation_profile/approve",json={"version":int(current["version"]),"approver":actor})
+    loaded=load_solicitation_form(project)
+    return (*loaded[:-2],_approval_message(approved,"solicitation profile"),approved,api("GET",f"/api/projects/{project}/workflow/status"))
+
+def load_framework_form(project):
+    data=api("GET",f"/api/projects/{project}/workflow/artifacts/research_framework");body=data.get("body") or {}
+    rows=[[n.get("key"),n.get("title"),n.get("position"),", ".join(n.get("requirement_ids") or []),", ".join(n.get("review_criterion_ids") or []),n.get("narrative_purpose"),n.get("key_argument"),", ".join(n.get("linked_aim_ids") or []),", ".join(n.get("evidence_needs") or []),", ".join(n.get("missing_investigator_inputs") or []),n.get("owner_user_id"),n.get("approver_user_id"),n.get("target_words"),", ".join(n.get("dependencies") or [])] for n in body.get("nodes") or []]
+    return body.get("overall_argument",""),rows,data.get("version"),_artifact_status(data),data
+
+def framework_body(metadata,argument,rows):
+    prior=(metadata or {}).get("body") or {}
+    nodes=[]
+    for row in _records(rows,FRAMEWORK_HEADERS):
+        nodes.append({"key":str(row["Key"] or "").strip(),"title":str(row["Title"] or "").strip(),"position":int(row["Position"] or 0),"requirement_ids":_split_values(row["Requirement IDs"]),"review_criterion_ids":_split_values(row["Criterion IDs"]),"narrative_purpose":str(row["Narrative purpose"] or "").strip(),"key_argument":str(row["Key argument"] or "").strip(),"linked_aim_ids":_split_values(row["Aim IDs"]),"evidence_needs":_split_values(row["Evidence needs"]),"missing_investigator_inputs":_split_values(row["Missing investigator inputs"]),"owner_user_id":str(row["Owner user ID"] or "").strip(),"approver_user_id":str(row["Approver user ID"] or "").strip(),"target_words":int(row["Target words"] or 0),"dependencies":_split_values(row["Dependencies"])})
+    return {"schema_version":1,"solicitation_profile_version":int(prior.get("solicitation_profile_version") or 0),"overall_argument":str(argument or "").strip(),"nodes":nodes}
+
+def save_framework_form(project,actor,version,metadata,argument,rows,approve=False):
+    body=framework_body(metadata,argument,rows);current=api("GET",f"/api/projects/{project}/workflow/artifacts/research_framework")
+    if body!=current.get("body"):
+        current=api("POST",f"/api/projects/{project}/workflow/artifacts/research_framework",json={"body":body,"source":"human_structured_editor","author":actor,"expected_version":int(version) if version else None})
+    if approve:current=api("POST",f"/api/projects/{project}/workflow/artifacts/research_framework/approve",json={"version":int(current["version"]),"approver":actor})
+    loaded=load_framework_form(project);status=(_approval_message(current,"research framework") if approve else f"Saved research framework v{current['version']}; approval is still required.")
+    return (*loaded[:-2],status,current)
+
+def generate_framework_form(project,actor):
+    artifact_editor_generate(project,"research_framework",actor)
+    return load_framework_form(project)
+
+def load_aims_form(project):
+    data=api("GET",f"/api/projects/{project}/workflow/artifacts/aim_set");body=data.get("body") or {}
+    rows=[[a.get("id"),a.get("title"),a.get("statement"),a.get("rationale"),a.get("approach_summary"),a.get("expected_outcome"),a.get("impact"),a.get("innovation"),a.get("classification"),", ".join(a.get("dependencies") or []),", ".join(str(x) for x in a.get("supporting_evidence_ids") or [])] for a in body.get("aims") or []]
+    return body.get("overall_objective",""),body.get("central_hypothesis_or_thesis",""),rows,data.get("version"),_artifact_status(data),data
+
+def aims_body(metadata,objective,hypothesis,rows):
+    prior=(metadata or {}).get("body") or {};aims=[]
+    for row in _records(rows,CORE_AIM_HEADERS):
+        aims.append({"id":str(row["ID"] or "").strip(),"title":str(row["Title"] or "").strip(),"statement":str(row["Statement"] or "").strip(),"rationale":str(row["Rationale"] or "").strip(),"approach_summary":str(row["Approach summary"] or "").strip(),"expected_outcome":str(row["Expected outcome"] or "").strip(),"impact":str(row["Impact"] or "").strip(),"innovation":str(row["Innovation"] or "").strip(),"classification":str(row["Classification"] or "assumption").strip(),"dependencies":_split_values(row["Dependencies"]),"supporting_evidence_ids":_int_values(row["Supporting evidence IDs"])})
+    return {"schema_version":1,"framework_version":int(prior.get("framework_version") or 0),"overall_objective":str(objective or "").strip(),"central_hypothesis_or_thesis":str(hypothesis or "").strip(),"aims":aims}
+
+def save_aims_form(project,actor,version,metadata,objective,hypothesis,rows,approve=False):
+    body=aims_body(metadata,objective,hypothesis,rows);current=api("GET",f"/api/projects/{project}/workflow/artifacts/aim_set")
+    if body!=current.get("body"):
+        current=api("POST",f"/api/projects/{project}/workflow/artifacts/aim_set",json={"body":body,"source":"human_structured_editor","author":actor,"expected_version":int(version) if version else None})
+    if approve:current=api("POST",f"/api/projects/{project}/workflow/artifacts/aim_set/approve",json={"version":int(current["version"]),"approver":actor})
+    loaded=load_aims_form(project);status=(_approval_message(current,"aim set") if approve else f"Saved aim set v{current['version']}; approval is still required.")
+    return (*loaded[:-2],status,current)
+
+def generate_aims_form(project,actor):
+    artifact_editor_generate(project,"aim_set",actor)
+    return load_aims_form(project)
+
+def load_literature_form(project):
+    data=api("GET",f"/api/projects/{project}/workflow/artifacts/literature_manifest");body=data.get("body") or {}
+    queries=[[q.get("id"),q.get("query"),q.get("rationale"),", ".join(q.get("aim_ids") or []),", ".join(q.get("requirement_ids") or []),", ".join(q.get("criterion_ids") or []),", ".join(q.get("preferred_domains") or [])] for q in body.get("queries") or []]
+    needs=[[n.get("evidence_need_id"),n.get("disposition"),", ".join(str(x) for x in n.get("evidence_ids") or []),n.get("rationale")] for n in body.get("evidence_needs") or []]
+    contradictions=[[value] for value in body.get("contradictions") or []]
+    manifest=f"Run `{body.get('run_id','—')}` · {body.get('search_provider','—')} · {body.get('started_at','—')} → {body.get('completed_at','—')} · source IDs {body.get('source_ids') or []} · citation IDs {body.get('citation_ids') or []}"
+    return manifest,queries,needs,contradictions,data.get("version"),_artifact_status(data),data
+
+def literature_body(metadata,query_rows,need_rows,contradiction_rows):
+    body=dict((metadata or {}).get("body") or {})
+    body["queries"]=[{"id":str(r["ID"] or "").strip(),"query":str(r["Query"] or "").strip(),"rationale":str(r["Rationale"] or "").strip(),"aim_ids":_split_values(r["Aim IDs"]),"requirement_ids":_split_values(r["Requirement IDs"]),"criterion_ids":_split_values(r["Criterion IDs"]),"preferred_domains":_split_values(r["Preferred domains"])} for r in _records(query_rows,LITERATURE_QUERY_HEADERS)]
+    body["evidence_needs"]=[{"evidence_need_id":str(r["Evidence need ID"] or "").strip(),"disposition":str(r["Disposition"] or "unresolved_risk").strip(),"evidence_ids":_int_values(r["Evidence IDs"]),"rationale":str(r["Rationale"] or "").strip()} for r in _records(need_rows,EVIDENCE_NEED_HEADERS)]
+    body["contradictions"]=[str(r["Contradiction"] or "").strip() for r in _records(contradiction_rows,["Contradiction"]) if str(r["Contradiction"] or "").strip()]
+    return body
+
+def save_literature_form(project,actor,version,metadata,query_rows,need_rows,contradiction_rows,approve=False):
+    body=literature_body(metadata,query_rows,need_rows,contradiction_rows);current=api("GET",f"/api/projects/{project}/workflow/artifacts/literature_manifest")
+    if body!=current.get("body"):
+        current=api("POST",f"/api/projects/{project}/workflow/artifacts/literature_manifest",json={"body":body,"source":"human_structured_editor","author":actor,"expected_version":int(version) if version else None})
+    if approve:current=api("POST",f"/api/projects/{project}/workflow/artifacts/literature_manifest/approve",json={"version":int(current["version"]),"approver":actor})
+    loaded=load_literature_form(project);status=(_approval_message(current,"literature manifest") if approve else f"Saved literature manifest v{current['version']}; approval is still required.")
+    return (*loaded[:-2],status,current)
+
+def collaboration_markdown(data):
+    messages=data.get("messages") or []
+    if not messages:return '<div class="team-chat">No messages yet. Start the project conversation.</div>'
+    blocks=[]
+    for m in messages:
+        blocks.append(f'<div class="chat-message"><div class="chat-meta"><b>{html.escape(str(m.get("author") or ""))}</b> · {html.escape(str(m.get("created_at") or ""))}</div>{html.escape(str(m.get("body") or "")).replace(chr(10),"<br>")}</div>')
+    return '<div class="team-chat">'+"".join(blocks)+"</div>"
+
+def collaboration_rows(data):
+    members=[[x.get("name"),x.get("role"),x.get("last_seen_at")] for x in data.get("members") or []]
+    activity=[[x.get("created_at"),x.get("actor"),x.get("kind"),x.get("detail")] for x in data.get("activity") or []]
+    return members,activity
+
+def load_collaboration(project):
+    if not project:raise gr.Error("Open a project first.")
+    d=api("GET",f"/api/projects/{project}/collaboration");members,activity=collaboration_rows(d)
+    return collaboration_markdown(d),members,activity,""
+
+def join_collaboration(project,name,role):
+    if not project:raise gr.Error("Open a project first.")
+    d=api("POST",f"/api/projects/{project}/collaboration/join",json={"author":name or "","role":role or "Contributor"});members,activity=collaboration_rows(d)
+    return collaboration_markdown(d),members,activity,f"✓ Joined this project as **{name}**."
+
+def post_team_message(project,name,message):
+    if not project:raise gr.Error("Open a project first.")
+    d=api("POST",f"/api/projects/{project}/collaboration",json={"author":name or "","body":message or ""});members,activity=collaboration_rows(d)
+    return collaboration_markdown(d),members,activity,"",f"Message posted by **{name}**."
+
+def version_history(project,key):
+    if not project or not key:return [],gr.update(choices=[],value=None)
+    items=api("GET",f"/api/projects/{project}/sections/{key}/versions")
+    rows=[[x.get("version"),x.get("created_at"),x.get("editor") or x.get("source"),x.get("approved"),x.get("characters"),x.get("preview")] for x in items]
+    choices=[(f"v{x.get('version')} · {x.get('editor') or x.get('source')} · {x.get('created_at')}",x.get("version")) for x in items]
+    return rows,gr.update(choices=choices,value=(choices[0][1] if choices else None))
+
+def restore_version(project,project_title,section,key,current_version,restore_id,actor):
+    if not restore_id:raise gr.Error("Choose a version to restore.")
+    if int(restore_id)==int(current_version):raise gr.Error("That is already the latest version.")
+    api("POST",f"/api/projects/{project}/sections/{key}/restore",json={"version_id":int(restore_id),"base_version_id":int(current_version),"actor":actor or None})
+    loaded=load_section(project,project_title,section);rows,choices=version_history(project,key)
+    loaded=list(loaded);loaded[3]=f"Restored v{restore_id} as a new auditable version. Approval is still required."
+    return *loaded,rows,choices
+
 def assert_section_identity(section,key):
     expected=slug(section)
     if not expected or key!=expected:
@@ -219,10 +737,12 @@ def refresh_projects():
     items=api("GET","/api/projects");choices=[(f"{p['title']} · {p['stage']} · {p['id'][:8]}",p["id"]) for p in items]
     return gr.update(choices=choices,value=(choices[0][1] if choices else None))
 
-def create_project(title,sponsor,mechanism,source,source_url,source_text,supporting,brand):
+def create_project(title,sponsor,mechanism,source,source_url,source_text,supporting,brand,workflow=None,actor=None):
     if not title.strip():raise gr.Error("Working title is required.")
     if not source and not (source_url or "").strip() and not (source_text or "").strip():raise gr.Error("Upload, link, or paste a funding opportunity.")
-    d=api("POST","/api/projects",json={"title":title.strip(),"sponsor":sponsor or None,"mechanism":mechanism or None,"sections":DEFAULT_SECTIONS})
+    payload={"title":title.strip(),"sponsor":sponsor or None,"mechanism":mechanism or None,"sections":DEFAULT_SECTIONS,"actor":actor or None}
+    if workflow is not None:payload["workflow"]=workflow
+    d=api("POST","/api/projects",json=payload)
     pid=d["id"];count=0
     if source:
         p=Path(file_path(source));count+=int(push_doc(pid,p.name,"funding_opportunity",extract_file(source)))
@@ -237,10 +757,50 @@ def create_project(title,sponsor,mechanism,source,source_url,source_text,support
     assets=copy_brand_assets(pid,brand);profile=build_design_profile(pid,sponsor,assets)
     api("POST",f"/api/projects/{pid}/design-profile",json={"profile":profile})
     analysis=api("POST",f"/api/projects/{pid}/analyze-requirements",timeout=600)
-    comp=api("POST",f"/api/projects/{pid}/compliance/compile",timeout=900)
+    enabled=set((workflow or {}).get("enabled_modules") or [])
+    comp=api("POST",f"/api/projects/{pid}/compliance/compile",timeout=900) if "sponsor_compliance" in enabled else {"profile":{"rules":[]}}
     sections=api("GET",f"/api/projects/{pid}/sections");section_choices=[x["title"] for x in sections]
     rule_count=len((comp.get("profile") or {}).get("rules") or [])
     return pid,f"Project `{pid}` created. {count} unique source(s), {analysis['count']} atomic grant requirements, and {rule_count} deterministic sponsor/submission rules were compiled from the opportunity. Review and approve both before final submission.","",requirement_rows(analysis["requirements"]),gr.update(choices=section_choices,value=(section_choices[0] if section_choices else None))
+
+def configured_project_creation(title,sponsor,mechanism,deadline,grant_type,source,source_url,source_text,supporting,brand,
+                                preset_key,selected,required,review_mode,review_required,routing_mode,owner_id,team_rows):
+    owner=(owner_id or "").strip()
+    if not owner:raise gr.Error("An authenticated owner identifier is required for project authorship and approvals.")
+    workflow=build_workflow_config(preset_key,selected,required,grant_type,deadline,review_mode,review_required,routing_mode)
+    pid,status,notice,requirements,sections=create_project(title,sponsor,mechanism,source,source_url,source_text,supporting,brand,workflow,owner)
+    selected_set=set(selected or [])
+    if "team_collaboration" in selected_set:
+        members=_records(team_rows,["Email","Role"])
+        role_map={"project owner":"owner","owner":"owner","principal investigator":"pi","pi":"pi","scientific writer":"contributor","contributor":"contributor","statistician/methodologist":"contributor","methodologist":"contributor","research administrator":"research_administrator","approver":"approver","reviewer":"reviewer","viewer":"viewer"}
+        for row in members:
+            email=_cell(row.get("Email"));label=_cell(row.get("Role")).lower()
+            if not email:continue
+            role=role_map.get(label)
+            if not role:raise gr.Error(f"Unsupported project role for {email}: {row.get('Role')}")
+            api("POST",f"/api/projects/{pid}/invites",json={"email":email,"role":role,"expires_in_days":7})
+        approvers=[owner]
+        routing={"schema_version":1,"project_owner_user_id":owner,"routes":[
+            {"artifact_type":artifact,"owner_user_id":owner,"approver_user_ids":approvers,"minimum_approvals":1}
+            for artifact in ("solicitation_profile","research_framework","aim_set","literature_manifest","proposal_section","proposal_snapshot")
+        ]}
+        routing_record=api("POST",f"/api/projects/{pid}/workflow/artifacts/collaboration_record",json={"body":routing,"source":"human_wizard","author":owner,"expected_version":None})
+        api("POST",f"/api/projects/{pid}/workflow/artifacts/collaboration_record/approve",json={"version":routing_record["version"],"approver":owner})
+    workflow_data=api("GET",f"/api/projects/{pid}/workflow")
+    workflow_status=api("GET",f"/api/projects/{pid}/workflow/status")
+    summary=(f"### {html.escape(title.strip())}\nWorkflow definition **v{workflow_data.get('definition_version')}** · configuration **v{workflow_data.get('config_version')}** · "
+             f"{len(selected_set)} optional capabilities · model routing **{routing_mode}**. The shared server is the source of truth for every teammate.")
+    visibility={key:key in selected_set for key in WORKFLOW_MODULES}
+    return (gr.update(visible=False),pid,status,notice,requirements,sections,summary,workflow_status,
+            gr.update(visible=visibility.get("investigator_interview",False)),
+            gr.update(visible=visibility.get("clinical_design",False)),
+            gr.update(visible=visibility.get("competitive_intelligence",False)),
+            gr.update(visible=visibility.get("sponsor_compliance",False)),
+            gr.update(visible=visibility.get("review_simulator",False)),
+            gr.update(visible=visibility.get("advanced_workbench",False)))
+
+def wizard_to_preview(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows):
+    return wizard_page_updates(7)+[workflow_preview_html(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows)]
 
 def load_project(pid):
     if not pid:raise gr.Error("Choose a project.")
@@ -292,6 +852,56 @@ def submit_answer(project,questions,current_q,raw,confidence,classification,note
 
 def run_research(project,max_queries,results_per):
     d=api("POST",f"/api/projects/{project}/research/run",json={"max_queries":int(max_queries),"results_per_query":int(results_per)},timeout=1200);status=f"Saved {d['sources_saved']} evidence source(s).";status+=(f" {len(d['failures'])} isolated failures." if d.get("failures") else "");return evidence_rows(d.get("evidence",[])),status
+
+def reviewer_role_rows(project):
+    data=api("GET",f"/api/projects/{project}/review-panel/roles")
+    rows=[[role.get("key"),role.get("title"),role.get("description"),", ".join(role.get("criterion_ids") or [])] for role in data.get("roles") or []]
+    return rows,data.get("synthetic_review_notice") or ""
+
+def create_panel_plan(project,mode):
+    plan=api("POST",f"/api/projects/{project}/review-panel/plan",json={"mode":mode})
+    rows=[[role.get("key"),role.get("title"),role.get("description"),", ".join(role.get("criterion_ids") or [])] for role in plan.get("roles") or []]
+    return plan.get("id"),rows,f"Draft panel plan `{plan.get('id')}` was derived from approved solicitation profile v{plan.get('solicitation_profile_version')}. Approval is required before execution.",plan
+
+def approve_panel_plan(project,plan_id):
+    if not plan_id:raise gr.Error("Create a panel plan first.")
+    plan=api("POST",f"/api/projects/{project}/review-panel/plan/{plan_id}/approve",json={})
+    return f"✓ Panel plan `{plan_id}` approved by {plan.get('approved_by_user_id')}.",plan
+
+def review_result_views(data):
+    result=data.get("result") or {}
+    rows=[]
+    for review in result.get("reviews") or []:
+        for score in review.get("criterion_scores") or []:
+            rows.append([review.get("reviewer_archetype"),score.get("criterion_id"),score.get("score"),score.get("confidence"),"\n".join(score.get("strengths") or []),"\n".join(score.get("weaknesses") or []),", ".join(score.get("proposal_anchors") or [])])
+    tasks=[[index,task.get("priority"),task.get("title"),task.get("description"),task.get("rationale"),", ".join(task.get("proposal_anchors") or [])] for index,task in enumerate(result.get("revision_tasks") or [])]
+    status=f"Review run `{data.get('id')}` · **{data.get('status')}** · immutable result SHA-256 `{str(data.get('result_sha256') or '')[:20]}…`"
+    return data.get("id"),result.get("panel_summary") or {},rows,tasks,result.get("causal_analysis") or {},status,data
+
+def execute_review_panel(project,plan_id):
+    if not plan_id:raise gr.Error("Create and approve a solicitation-derived panel plan first.")
+    data=api("POST",f"/api/projects/{project}/review-simulations",json={"panel_plan_id":plan_id},timeout=3600)
+    return review_result_views(data)
+
+def create_revision_tasks(project,run_id,indexes,owner_id,due_at):
+    if not run_id:raise gr.Error("Run a review simulation first.")
+    selected=[]
+    for value in _split_values(indexes):
+        try:selected.append(int(value))
+        except ValueError:raise gr.Error("Task indexes must be comma-separated integers.")
+    data=api("POST",f"/api/projects/{project}/review-simulations/{run_id}/tasks",json={"task_indexes":selected,"owner_user_id":str(owner_id or "").strip(),"due_at":str(due_at or "").strip() or None})
+    return data,f"✓ Created {len(data.get('created_tasks') or [])} assigned revision task(s) from immutable review run `{run_id}`."
+
+def load_causal_models(project,run_id):
+    if not run_id:raise gr.Error("Run a causal review first.")
+    models=api("GET",f"/api/projects/{project}/review-simulations/{run_id}/causal-models")
+    latest=(models or [{}])[0]
+    return latest.get("body") or {},models,f"Loaded {len(models)} append-only causal model version(s)."
+
+def save_causal_editor(project,run_id,body,confirmed):
+    if not isinstance(body,dict):raise gr.Error("The causal editor must contain a structured object.")
+    saved=api("POST",f"/api/projects/{project}/review-simulations/{run_id}/causal-models",json={"body":body,"confirmed":bool(confirmed)})
+    return body,f"Saved causal model v{saved.get('version')} as {'methodologist-confirmed' if confirmed else 'inferred/unconfirmed'}; prior versions remain immutable."
 
 def rebuild_index(project):
     d=api("POST",f"/api/projects/{project}/index/rebuild",timeout=1800);return f"✓ Knowledge index: {d['rows']} records × {d['dimensions']} dimensions with `{d['embedding_model']}`.",d
@@ -639,6 +1249,9 @@ def approve_section(project,project_title,section,key,current_version,baseline,e
     if body!=baseline:
         saved=api("POST",f"/api/projects/{project}/sections/{key}",json={"title":section,"body":body,"html":None,"base_version_id":int(current_version)},timeout=2400);version=saved["version"];baseline=body
     d=api("POST",f"/api/projects/{project}/sections/{key}/approve",json={"version_id":int(version),"competitive_update_event_id":int(competitive_update_event_id) if competitive_update_event_id else None},timeout=2400)
+    if not d.get("approved"):
+        progress=d.get("approval_progress") or {}
+        return version,baseline,section_preview(project,project_title,section,baseline,key,version,None),f"Approval recorded ({progress.get('approvals',0)} of {progress.get('minimum_approvals','?')}); this exact version remains unapproved until the configured threshold is met.",gr.update(value=baseline,visible=False),gr.update(visible=False),gr.update(visible=False),None,""
     return version,baseline,section_preview(project,project_title,section,baseline,key,version,None),f"✓ Human approved exact version {d['approved_version']} for {section}. Workflow stage: `{d['stage']}`.",gr.update(value=baseline,visible=False),gr.update(visible=False),gr.update(visible=False),None,""
 
 def preview_approved_grant(project):
@@ -703,15 +1316,101 @@ def export(project,fmt,_title):
     paths.append(package)
     return paths,f"Created from immutable export snapshot {snap['snapshot_id']} ({snap['sha256'][:16]}…). Sponsor-compliant package: {package}"
 
-with gr.Blocks(title="Grant Workbench") as demo:
-    gr.Markdown(f"# {ORGANIZATION_NAME} Grant Workbench\nLocal OLMo/Apple-MLX drafting + Claude research and high-value synthesis + enforced human approval · Build {GRANT_BUILD_VERSION}")
+with gr.Blocks(title="Grantspace") as demo:
+    with gr.Column(visible=True,elem_classes="wizard-lightbox") as wizard_shell:
+        with gr.Row(elem_classes="wizard-shell"):
+            wizard_rail=gr.HTML(wizard_rail_html(1),container=False)
+            with gr.Column(elem_classes="wizard-main"):
+                with gr.Column(visible=True,elem_id="wizard-page-1") as wizard_page_1:
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">Composable grant workflow</div><h1>Start with the grant.<br><span class="accent">Build only what you need.</span></h1><p>Grantspace turns each solicitation into a shared, approval-ready workflow grounded in evidence, owned by your team, and reproducible at export.</p></div>')
+                    with gr.Row():
+                        with gr.Column(scale=3,elem_classes=["wizard-panel","wizard-hero"]):
+                            gr.Markdown("## Create a new shared grant\nCompose a workflow from a new RFA, RFI, NOFO, or application form.")
+                            wizard_new_btn=gr.Button("Start configuration →",variant="primary")
+                        with gr.Column(scale=2):
+                            with gr.Group(elem_classes="wizard-panel"):
+                                gr.Markdown("### Open an existing grant\nRestore its persisted workflow, files, versions, and decisions for this teammate.")
+                                wizard_existing=gr.Dropdown(label="Shared grant",choices=[])
+                                with gr.Row():
+                                    wizard_refresh_btn=gr.Button("Refresh")
+                                    wizard_open_btn=gr.Button("Open",variant="secondary")
+                            with gr.Group(elem_classes="wizard-panel"):
+                                gr.Markdown("### Import a local project\nMigration accepts a Grantspace project export; validation runs before any shared records are written.")
+                                wizard_import=gr.File(label="Grantspace project export",file_types=[".zip"],type="filepath")
+                                wizard_import_btn=gr.Button("Validate and import")
+                    gr.HTML('<div class="privacy-note"><b>Your research stays governed.</b><br>Provider routing and the exact cloud-bound task categories are shown before the project is created.</div>')
+                with gr.Column(visible=False,elem_id="wizard-page-2") as wizard_page_2:
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">02 · Grant ask</div><h2>Give us the source of truth</h2><p>Add the solicitation and its context. Requirements, review criteria, deadlines, attachments, and questions remain linked to their exact source.</p></div>')
+                    with gr.Row():
+                        with gr.Column(scale=1,elem_classes="wizard-panel"):
+                            wizard_source=gr.File(label="RFA, RFI, NOFO, or application form",file_count="single",type="filepath")
+                            wizard_source_url=gr.Textbox(label="Or import a public URL",placeholder="https://…")
+                            wizard_source_text=gr.Textbox(label="Or paste the grant ask",lines=9)
+                            wizard_supporting=gr.File(label="Supporting guidance and sponsor strategy",file_count="multiple",type="filepath")
+                            wizard_brand=gr.File(label="Brand and layout references",file_count="multiple",type="filepath")
+                        with gr.Column(scale=1,elem_classes="wizard-panel"):
+                            wizard_title=gr.Textbox(label="Working title")
+                            with gr.Row():
+                                wizard_sponsor=gr.Textbox(label="Sponsor")
+                                wizard_mechanism=gr.Textbox(label="Mechanism")
+                            with gr.Row():
+                                wizard_grant_type=gr.Dropdown(["research","clinical_trial","implementation","training","center_program","foundation","rfi_response","custom"],value="research",label="Grant type")
+                                wizard_deadline=gr.Textbox(label="Sponsor deadline",placeholder="YYYY-MM-DD")
+                            gr.HTML('<div class="privacy-note"><b>Content routing</b><br>The final screen discloses the selected local and cloud providers before processing starts.</div>')
+                    with gr.Row():wizard_2_back=gr.Button("← Back");wizard_2_next=gr.Button("Continue →",variant="primary")
+                with gr.Column(visible=False,elem_id="wizard-page-3") as wizard_page_3:
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">03 · Core workflow</div><h2>Five outcomes. Always included.</h2><p>Each produces an approved input required by the next. These stages cannot be disabled.</p></div>')
+                    gr.HTML(core_flow_html())
+                    gr.HTML('<div class="privacy-note"><b>Approval gates protect the final proposal.</b> Drafting and export use the exact approved versions recorded in the compilation manifest.</div>')
+                    with gr.Row():wizard_3_back=gr.Button("← Back");wizard_3_next=gr.Button("Continue →",variant="primary")
+                with gr.Column(visible=False,elem_id="wizard-page-4") as wizard_page_4:
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">04 · Optional modules</div><h2>Compose the right level of rigor</h2><p>Selected capabilities appear in project navigation and gates. Unselected capabilities are absent and cannot block completion.</p></div>')
+                    wizard_preset=gr.Dropdown(PRESET_CHOICES,value=WORKFLOW_REGISTRY["default_preset_key"],label="Start from a preset")
+                    gr.HTML(module_catalog_html())
+                    wizard_modules=gr.CheckboxGroup(MODULE_CHOICES,label="Selected capabilities",value=WORKFLOW_PRESETS[WORKFLOW_REGISTRY["default_preset_key"]]["enabled_modules"],elem_classes="wizard-option-grid")
+                    wizard_required_modules=gr.CheckboxGroup([],label="Capabilities that add a required completion gate",value=[],elem_classes="wizard-option-grid")
+                    with gr.Row():wizard_4_back=gr.Button("← Back");wizard_4_next=gr.Button("Continue →",variant="primary")
+                with gr.Column(visible=False,elem_id="wizard-page-5") as wizard_page_5:
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">05 · Review configuration</div><h2>Build the panel before the critique</h2><p>Synthetic role archetypes use public criteria and proposal evidence. They do not represent named people or predict an award decision.</p></div>')
+                    with gr.Row():
+                        with gr.Column(elem_classes="wizard-panel"):
+                            wizard_review_mode=gr.Radio(REVIEW_MODE_CHOICES,value=REVIEW_MODE_CHOICES[0][1],label="Review mode")
+                            wizard_review_required=gr.Checkbox(label="Require an approved simulated review before final export",value=False)
+                        with gr.Column(elem_classes="wizard-panel"):
+                            gr.Markdown("### Reviewer-role registry\nThe server derives the actual panel from the human-approved solicitation rubric and this versioned registry. Roles are not manually preselected or inferred from a sponsor name.")
+                            gr.Dataframe(value=REVIEWER_ARCHETYPE_ROWS,headers=["Available archetype","Responsibility"],interactive=False,label="Versioned archetype registry")
+                            gr.Markdown("Every score and critique must cite a rubric item and proposal anchor. Unsupported scores fail validation.")
+                    with gr.Row():wizard_5_back=gr.Button("← Back");wizard_5_next=gr.Button("Continue →",variant="primary")
+                with gr.Column(visible=False,elem_id="wizard-page-6") as wizard_page_6:
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">06 · Team & routing</div><h2>Put a name on every decision</h2><p>Configure stable identities, review responsibility, internal dates, and notifications before work begins.</p></div>')
+                    with gr.Row():
+                        with gr.Column(scale=3,elem_classes="wizard-panel"):
+                            wizard_owner_id=gr.Textbox(label="Authenticated project owner ID",interactive=False)
+                            wizard_identity_status=gr.Markdown()
+                            wizard_team=gr.Dataframe(headers=["Email","Role"],datatype=["str","str"],row_count=(3,"dynamic"),column_count=(2,"fixed"),interactive=True,label="Team invitations and roles")
+                        with gr.Column(scale=2,elem_classes="wizard-panel"):
+                            wizard_routing=gr.Dropdown(WORKFLOW_REGISTRY["model_routing_modes"],value=os.getenv("MODEL_ROUTING_MODE","local_only"),label="Model routing policy")
+                            gr.Markdown(f"**Local provider:** `{os.getenv('LOCAL_LLM_PROVIDER','not configured')}`  \n**Local model:** `{os.getenv('LOCAL_LLM_MODEL','not configured')}`  \n**Cloud model:** `{os.getenv('CLAUDE_MODEL','not configured')}`")
+                            gr.HTML('<div class="privacy-note">Local-only prevents proposal content from being sent to Claude. Hybrid routing shows and records the provider and model for every generated artifact.</div>')
+                    with gr.Row():wizard_6_back=gr.Button("← Back");wizard_6_next=gr.Button("Preview workflow →",variant="primary")
+                with gr.Column(visible=False,elem_id="wizard-page-7") as wizard_page_7:
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">07 · Workflow preview</div><h2>Your grant, composed</h2><p>This exact configuration becomes the server-side source of truth for every teammate.</p></div>')
+                    wizard_preview=gr.HTML()
+                    gr.HTML('<div class="privacy-note"><b>Configuration validation</b><br>The server rejects unknown modules, hidden prerequisites, stale definitions, and required modules that are not enabled.</div>')
+                    with gr.Row():wizard_7_back=gr.Button("← Back");wizard_create_btn=gr.Button("Create shared grant →",variant="primary")
+                with gr.Row(elem_classes="wizard-footer"):
+                    gr.Markdown("Configuration is not persisted until you create the grant.")
+                    wizard_progress=gr.Markdown("1 of 7",elem_id="wizard-progress")
+    gr.Markdown(f"# Grantspace\n{ORGANIZATION_NAME} · Compose the workflow. Write the grant. Win the review. · Build {GRANT_BUILD_VERSION}")
     project_id=gr.State("");interview_questions=gr.State([]);current_question=gr.State(None);current_version=gr.State(None);baseline_body=gr.State("");current_section_key=gr.State("");current_competitive_update_event=gr.State(None)
+    workspace_workflow_summary=gr.Markdown()
+    workspace_workflow_status=gr.JSON(label="Composable workflow status",visible=False)
     with gr.Row():
         recent=gr.Dropdown(label="Open existing project",choices=[]);refresh_projects_btn=gr.Button("Refresh Projects");open_project_btn=gr.Button("Open Project",variant="secondary")
     agentic_global_notice=gr.Markdown()
     competitive_update_timer=gr.Timer(value=COMPETITIVE_UI_POLL_SECONDS,active=True)
-    with gr.Tabs():
-        with gr.Tab("1 · Intake & Requirements"):
+    with gr.Tabs() as workspace_tabs:
+        with gr.Tab("1 · Intake & Requirements") as intake_tab:
             with gr.Row():
                 with gr.Column(scale=2):
                     project_title=gr.Textbox(label="Working title");sponsor=gr.Textbox(label="Sponsor");mechanism=gr.Textbox(label="Mechanism")
@@ -729,22 +1428,76 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
                 with gr.Column(scale=5):
                     requirements_table=gr.Dataframe(headers=["ID","Category","Mandatory","Requirement","Evidence needed","Status","Approved"],datatype=["str","str","bool","str","str","str","bool"],interactive=False,label="Parsed atomic requirements")
                     approve_req=gr.Button("✓ Approve Requirements",variant="primary");req_status=gr.Markdown()
-        with gr.Tab("2 · Investigator Interview"):
+                    gr.Markdown("### Versioned solicitation profile\nThe profile normalizes eligibility, requirements, rubric, deadlines, budget, attachments, and unresolved human questions. Exact source offsets and hashes are validated by the server.")
+                    solicitation_version=gr.State(None)
+                    with gr.Row():
+                        load_solicitation_btn=gr.Button("Load profile")
+                        save_solicitation_btn=gr.Button("Save corrected profile")
+                        approve_solicitation_btn=gr.Button("✓ Approve solicitation profile",variant="primary")
+                    with gr.Row():
+                        solicitation_working_title=gr.Textbox(label="Solicitation working title")
+                        solicitation_sponsor=gr.Textbox(label="Sponsor")
+                        solicitation_mechanism=gr.Textbox(label="Mechanism")
+                    solicitation_purpose=gr.Textbox(label="Purpose",lines=4)
+                    solicitation_facts=gr.Dataframe(headers=SOLICITATION_FACT_HEADERS,column_count=(len(SOLICITATION_FACT_HEADERS),"fixed"),row_count=(8,"dynamic"),interactive=True,label="Eligibility, requirements, deadlines, budget rules, and attachments")
+                    solicitation_criteria=gr.Dataframe(headers=SOLICITATION_CRITERION_HEADERS,column_count=(len(SOLICITATION_CRITERION_HEADERS),"fixed"),row_count=(4,"dynamic"),interactive=True,label="Solicitation-derived review rubric")
+                    solicitation_questions=gr.Dataframe(headers=["Question"],column_count=(1,"fixed"),row_count=(3,"dynamic"),interactive=True,label="Questions requiring human resolution")
+                    solicitation_artifact_json=gr.JSON(label="Solicitation artifact metadata",visible=False)
+                    solicitation_status=gr.Markdown()
+        with gr.Tab("2 · Research Plan Framework") as framework_tab:
+            gr.Markdown("### Sponsor-mapped research plan\nGenerate from the exact approved solicitation profile, then edit the argument, mappings, evidence gaps, ownership, dependencies, and word allocations before approval.")
+            framework_version=gr.State(None)
+            with gr.Row():
+                load_framework_btn=gr.Button("Load framework")
+                generate_framework_btn=gr.Button("Generate from approved solicitation",variant="primary")
+                save_framework_btn=gr.Button("Save framework")
+                approve_framework_btn=gr.Button("✓ Approve framework",variant="primary")
+            framework_argument=gr.Textbox(label="Overall proposal argument",lines=5)
+            framework_nodes=gr.Dataframe(headers=FRAMEWORK_HEADERS,column_count=(len(FRAMEWORK_HEADERS),"fixed"),row_count=(8,"dynamic"),interactive=True,label="Ordered sponsor-mapped framework nodes")
+            framework_artifact_json=gr.JSON(label="Framework artifact metadata",visible=False)
+            framework_status=gr.Markdown()
+        with gr.Tab("3 · Key Aims") as aims_tab:
+            gr.Markdown("### Versioned aims\nKeep objectives, central thesis, rationale, approach, outcomes, impact, innovation, dependencies, classifications, and supporting evidence explicit.")
+            aims_version=gr.State(None)
+            with gr.Row():
+                load_aims_btn=gr.Button("Load aims")
+                generate_aims_btn=gr.Button("Generate from approved framework",variant="primary")
+                save_aims_btn=gr.Button("Save aims")
+                approve_aims_btn=gr.Button("✓ Approve aims",variant="primary")
+            with gr.Row():
+                aims_objective=gr.Textbox(label="Overall objective",lines=4)
+                aims_hypothesis=gr.Textbox(label="Central hypothesis or thesis",lines=4)
+            core_aims=gr.Dataframe(headers=CORE_AIM_HEADERS,column_count=(len(CORE_AIM_HEADERS),"fixed"),row_count=(3,"dynamic"),interactive=True,label="Structured aims · classification must be fact, estimate, or assumption")
+            aims_artifact_json=gr.JSON(label="Aims artifact metadata",visible=False)
+            aims_status=gr.Markdown()
+        with gr.Tab("Optional · Investigator Interview",visible=False) as interview_tab:
             with gr.Row():
                 with gr.Column(scale=3):
                     generate_q=gr.Button("Generate / Recompute Missing Questions",variant="primary");question_card=gr.HTML(render_question(None));answer=gr.Textbox(label="Answer")
                     with gr.Row():confidence=gr.Dropdown(["high","medium","low"],value="high",label="Confidence");classification=gr.Dropdown(["verified_fact","investigator_estimate","assumption","unknown"],value="verified_fact",label="Classification")
                     answer_notes=gr.Textbox(label="Supporting explanation / notes",lines=4);answered_by=gr.Textbox(label="Answered by / role");submit=gr.Button("Save Answer & Continue",variant="primary");interview_status=gr.Markdown()
                 with gr.Column(scale=2):interview_table=gr.JSON(label="Interview state")
-        with gr.Tab("3 · Research & Evidence"):
+        with gr.Tab("4 · Literature & Evidence") as research_tab:
             with gr.Row():max_queries=gr.Slider(1,24,value=8,step=1,label="Maximum research queries");results_per=gr.Slider(1,10,value=5,step=1,label="Results per query");research_btn=gr.Button("Run Evidence Research",variant="primary")
             evidence_table=gr.Dataframe(headers=["Evidence ID","Requirement","Source type","Evidence purpose","Status","Confidence","URL"],interactive=False);research_status=gr.Markdown()
+            gr.Markdown("### Reproducible literature manifest\nReview the exact approved upstream versions, queries, evidence dispositions, citations, contradictions, and unresolved risks before locking the research run.")
+            literature_version=gr.State(None)
+            with gr.Row():
+                load_literature_btn=gr.Button("Load latest manifest")
+                save_literature_btn=gr.Button("Save manifest corrections")
+                approve_literature_btn=gr.Button("✓ Approve literature manifest",variant="primary")
+            literature_manifest_summary=gr.Markdown()
+            literature_queries=gr.Dataframe(headers=LITERATURE_QUERY_HEADERS,column_count=(len(LITERATURE_QUERY_HEADERS),"fixed"),row_count=(8,"dynamic"),interactive=True,label="Approved solicitation- and aim-grounded queries")
+            literature_needs=gr.Dataframe(headers=EVIDENCE_NEED_HEADERS,column_count=(len(EVIDENCE_NEED_HEADERS),"fixed"),row_count=(8,"dynamic"),interactive=True,label="Evidence-need dispositions")
+            literature_contradictions=gr.Dataframe(headers=["Contradiction"],column_count=(1,"fixed"),row_count=(3,"dynamic"),interactive=True,label="Contradictions and unresolved tensions")
+            literature_artifact_json=gr.JSON(label="Literature artifact metadata",visible=False)
+            literature_artifact_status=gr.Markdown()
             gr.Markdown("### Compiled HPC Knowledge Index")
             with gr.Row():rebuild_idx=gr.Button("Build / Refresh MMAP Index");status_idx=gr.Button("Check Index Status")
             index_message=gr.Markdown();index_json=gr.JSON(label="Index manifest / status")
             with gr.Row():retrieval_query=gr.Textbox(label="Test hybrid retrieval query");retrieval_k=gr.Slider(1,50,value=12,step=1,label="Top K");retrieval_btn=gr.Button("Run Retrieval")
             retrieval_table=gr.Dataframe(headers=["Score","Semantic","BM25","Evidence","Freshness","Graph boost","Kind","Source","Excerpt"],interactive=False)
-        with gr.Tab("4 · Clinical Study Design"):
+        with gr.Tab("4 · Clinical Study Design",visible=False) as clinical_tab:
             gr.Markdown("### Authoritative clinical study model\nThese structured values are the source of truth injected into every grant section. Deterministic checks flag feasibility and consistency issues; they never rewrite human-approved prose.")
             with gr.Row():
                 load_clinical_btn=gr.Button("Load Saved Study")
@@ -816,7 +1569,7 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
             resources_table=gr.Dataframe(headers=RESOURCE_HEADERS,datatype=["str","str","bool","bool","str"],row_count=(4,"dynamic"),column_count=(5,"fixed"),interactive=True)
             clinical_assessment=gr.JSON(label="Deterministic clinical assessment")
             clinical_status=gr.Markdown()
-        with gr.Tab("5 · Competitive Applicant Intelligence"):
+        with gr.Tab("5 · Competitive Applicant Intelligence",visible=False) as competitive_tab:
             gr.Markdown("### Public competitive applicant intelligence\nThe system builds a capability profile from this grant and clinical design, then identifies organizations whose **public** grants, publications, clinical trials, patents/IP signals, and disclosed technologies overlap with that profile. These are potential capability-matched competitors—not confirmed applicants. The resulting strategy is injected into grant drafting to emphasize defensible superiority and differentiation.")
             with gr.Row():
                 generate_comp_profile_btn=gr.Button("Generate Likely Strong-Applicant Profile",variant="secondary")
@@ -829,7 +1582,7 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
             asset_table=gr.Dataframe(headers=["Potential competitor","Asset type","Relevance","Public asset","Year","Provider","URL"],interactive=False,label="Top public grants / publications / trials / IP signals / technology evidence")
             competitive_strategy=gr.Markdown("No competitive positioning run yet.")
             competitive_raw=gr.JSON(label="Auditable competitive run",visible=False)
-        with gr.Tab("6 · Sponsor Compliance & Submission"):
+        with gr.Tab("6 · Sponsor Compliance & Submission",visible=False) as compliance_tab:
             gr.Markdown("""### Deterministic Sponsor Compliance
 The approved funding opportunity is compiled into atomic submission rules. You can correct the parsed rules before approval. Hard sponsor rules—not AI opinion—control final export readiness.""")
             with gr.Row():
@@ -864,7 +1617,7 @@ Register the actual files that must travel with the proposal. Use a stable slot 
                 register_artifact_btn=gr.Button("Register Attachment(s)")
             artifact_table=gr.Dataframe(headers=["Slot","Filename","Extension","SHA-256"],interactive=False,label="Registered submission artifacts")
             compliance_status=gr.Markdown()
-        with gr.Tab("7 · Write, Edit & Approve"):
+        with gr.Tab("7 · Write, Edit & Approve") as writing_tab:
             with gr.Row():section=gr.Dropdown(DEFAULT_SECTIONS,value=(DEFAULT_SECTIONS[0] if DEFAULT_SECTIONS else None),label="Section",allow_custom_value=True);high=gr.Checkbox(label="Escalate this draft to Claude (sends this section’s compiled context to the configured cloud API)",value=False)
             additional=gr.Textbox(lines=4,label="Optional additional human context");gen=gr.Button("Compile Context & Draft Section",variant="primary")
             section_update_banner=gr.Markdown()
@@ -873,7 +1626,35 @@ Register the actual files that must travel with the proposal. Use a stable slot 
             editor=gr.Textbox(lines=20,label="Section text",visible=False)
             with gr.Row():save_btn=gr.Button("Save Edit",visible=False);cancel=gr.Button("Cancel Edit",visible=False)
             write_status=gr.Markdown("No section loaded.")
-        with gr.Tab("8 · Final Export"):
+        with gr.Tab("Optional · Synthetic Review & Causal Critique",visible=False) as review_tab:
+            gr.Markdown("### Solicitation-grounded synthetic review panel\nFeedback is generated from role archetypes derived from the approved solicitation. It does not represent real reviewers or predict a sponsor decision.")
+            review_plan_id=gr.State(None);review_run_id=gr.State(None);review_plan_json=gr.JSON(visible=False);review_run_json=gr.JSON(visible=False)
+            with gr.Row():
+                refresh_reviewer_roles_btn=gr.Button("Derive roles from approved solicitation")
+                review_mode=gr.Dropdown(REVIEW_MODE_CHOICES,value=(REVIEW_MODE_CHOICES[0][1] if REVIEW_MODE_CHOICES else None),label="Review mode")
+                create_review_plan_btn=gr.Button("Create panel plan")
+                approve_review_plan_btn=gr.Button("Approve panel plan",variant="secondary")
+                run_review_panel_btn=gr.Button("Freeze snapshot & run panel",variant="primary")
+            review_notice=gr.Markdown()
+            review_roles=gr.Dataframe(headers=["Role key","Role","Responsibility","Solicitation criterion IDs"],interactive=False,label="Derived and approved reviewer roles")
+            review_status=gr.Markdown()
+            panel_summary=gr.JSON(label="Synthetic panel summary and disagreement map")
+            reviewer_findings=gr.Dataframe(headers=["Role","Criterion","Score","Confidence","Strengths","Weaknesses","Proposal anchors"],interactive=False,label="Validated independent reviews")
+            revision_findings=gr.Dataframe(headers=["Index","Priority","Title","Description","Rationale","Proposal anchors"],interactive=False,label="Grounded revision backlog")
+            with gr.Row():
+                revision_task_indexes=gr.Textbox(label="Revision task indexes",placeholder="Blank imports all; or 0, 2, 4")
+                revision_task_owner=gr.Textbox(label="Assigned owner user ID")
+                revision_task_due=gr.Textbox(label="Due date/time (optional)")
+                create_revision_tasks_btn=gr.Button("Create assigned tasks")
+            revision_task_result=gr.JSON(label="Created task records",visible=False);revision_task_status=gr.Markdown()
+            gr.Markdown("#### Human-editable causal model\nModel-proposed nodes and edges remain inferred until a PI/methodologist confirms an append-only corrected version.")
+            with gr.Row():
+                load_causal_btn=gr.Button("Load causal model history")
+                confirm_causal=gr.Checkbox(label="Confirm as PI/methodologist-reviewed",value=False)
+                save_causal_btn=gr.Button("Save new causal model version")
+            causal_editor=gr.JSON(label="Causal graph, assumptions, threats, and claim checks")
+            causal_history=gr.JSON(label="Append-only causal model history",visible=False);causal_status=gr.Markdown()
+        with gr.Tab("8 · Final Export") as export_tab:
             gr.Markdown("### Human-Approved Grant Assembly\nOnly exact section versions approved by the human are included below or in final exports. AI drafts and unapproved edits are excluded.")
             preview_approved_btn=gr.Button("Refresh Approved Grant Preview",variant="secondary")
             approved_sections_table=gr.Dataframe(headers=["Order","Section","Status","Approved version"],datatype=["number","str","str","number"],interactive=False,label="Approved section assembly")
@@ -881,7 +1662,7 @@ Register the actual files that must travel with the proposal. Use a stable slot 
             approved_preview_status=gr.Markdown()
             check_ready=gr.Button("Check Submission Readiness");readiness_json=gr.JSON(label="Backend readiness gates");readiness_status=gr.Markdown()
             fmt=gr.Radio(["DOCX","PDF","BOTH"],value="DOCX",label="Would you like me to produce a professionally formatted DOCX, PDF, or both?",visible=False);export_btn=gr.Button("Compile Approved Grant",variant="primary",visible=False);export_file=gr.File(label="Generated file(s)",file_count="multiple");export_status=gr.Markdown()
-        with gr.Tab("9 · System & Diagnostics"):
+        with gr.Tab("9 · System & Diagnostics",visible=False) as diagnostics_tab:
             gr.Markdown("""### Production runtime diagnostics
 This view exposes non-secret runtime/build information and a local HPC benchmark. It does not display API keys or uploaded grant content.""")
             with gr.Row():
@@ -891,38 +1672,272 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
             with gr.Row():
                 system_info_json=gr.JSON(label="Runtime / build information")
                 hpc_benchmark_json=gr.JSON(label="MMAP / OpenMP / BLAS benchmark")
+        with gr.Tab("System administration",visible=os.getenv("AUTH_MODE","local_single_user")=="internal_accounts") as account_admin_tab:
+            gr.Markdown("### Account administration\nOnly the bootstrap system administrator can use these controls. Accounts are created with a username, verified email destination, and temporary password; the first login is restricted to changing that password.")
+            with gr.Row():
+                account_username=gr.Textbox(label="Username")
+                account_email=gr.Textbox(label="Email")
+                account_display_name=gr.Textbox(label="Display name")
+                account_temp_password=gr.Textbox(label="Temporary password",type="password")
+            with gr.Row():
+                create_account_btn=gr.Button("Create account and email credentials",variant="primary")
+                refresh_accounts_btn=gr.Button("Refresh accounts")
+            account_admin_status=gr.Markdown()
+            accounts_table=gr.Dataframe(headers=["User ID","Username","Email","Display name","System role","Must change password","Active","Last seen","Locked until"],interactive=False,label="Organization accounts")
+            gr.Markdown("#### Account recovery and access")
+            account_target_id=gr.Textbox(label="Target user ID",placeholder="Copy the stable user ID from the table")
+            with gr.Row():
+                send_account_reset_btn=gr.Button("Email password-reset link")
+                disable_account_btn=gr.Button("Disable account")
+                enable_account_btn=gr.Button("Enable account")
 
-    create.click(create_project,[project_title,sponsor,mechanism,source,source_url,source_text,supporting,brand],[project_id,project_status,agentic_global_notice,requirements_table,section])
-    approve_req.click(approve_requirements,[project_id],[req_status])
-    generate_q.click(generate_interview,[project_id],[interview_questions,current_question,question_card,answer,interview_status,interview_table])
-    submit.click(submit_answer,[project_id,interview_questions,current_question,answer,confidence,classification,answer_notes,answered_by],[interview_questions,current_question,question_card,answer,interview_status])
-    research_btn.click(run_research,[project_id,max_queries,results_per],[evidence_table,research_status]);rebuild_idx.click(rebuild_index,[project_id],[index_message,index_json]);status_idx.click(index_status,[project_id],[index_message,index_json]);retrieval_btn.click(test_retrieval,[project_id,retrieval_query,retrieval_k],[retrieval_table])
-    load_clinical_btn.click(load_clinical_study,[project_id],[clinical_problem,knowledge_gap,central_hypothesis,disease,disease_stage,biomarker,inclusion,exclusion,design_type,study_phase,randomization,allocation_ratio,blinding,follow_up_months,design_sites,available_patients,eligibility_pct,biomarker_pct,consent_pct,target_enrollment,accrual_months,recruitment_sites,test_type,alpha,power,attrition_pct,control_rate,treatment_rate,null_rate,alternative_rate,mean_delta,std_dev,hazard_ratio,event_probability,aims_table,arms_table,endpoints_table,timeline_table,resources_table,clinical_assessment,clinical_status])
-    save_clinical_btn.click(save_clinical_study,[project_id]+[clinical_problem,knowledge_gap,central_hypothesis,disease,disease_stage,biomarker,inclusion,exclusion,design_type,study_phase,randomization,allocation_ratio,blinding,follow_up_months,design_sites,available_patients,eligibility_pct,biomarker_pct,consent_pct,target_enrollment,accrual_months,recruitment_sites,test_type,alpha,power,attrition_pct,control_rate,treatment_rate,null_rate,alternative_rate,mean_delta,std_dev,hazard_ratio,event_probability,aims_table,arms_table,endpoints_table,timeline_table,resources_table],[clinical_assessment,clinical_status])
-    calculate_n_btn.click(calculate_sample_size,[project_id,test_type,alpha,power,attrition_pct,control_rate,treatment_rate,null_rate,alternative_rate,mean_delta,std_dev,hazard_ratio,event_probability],[sample_size_json,sample_size_status])
-    scenario_btn.click(run_feasibility_scenarios,[project_id,scenario_sites,scenario_consent,scenario_biomarker],[scenario_table,scenario_status])
-    generate_comp_profile_btn.click(generate_competitive_profile,[project_id],[competitive_profile_json,competitive_status])
-    load_competitive_btn.click(load_competitive,[project_id],[competitive_profile_json,competitor_table,asset_table,provider_status_json,competitive_strategy,competitive_raw,competitive_status,agentic_global_notice])
-    run_competitive_btn.click(run_competitive_intelligence,[project_id],[competitor_table,asset_table,provider_status_json,competitive_strategy,competitive_raw,competitive_status,agentic_global_notice])
-    load_compliance_btn.click(load_compliance,[project_id],[compliance_profile_state,opportunity_source_preview,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules,compliance_provenance,compliance_findings,compliance_json,artifact_table,compliance_status])
-    compile_compliance_btn.click(compile_compliance,[project_id],[compliance_profile_state,opportunity_source_preview,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules,compliance_provenance,compliance_findings,compliance_json,compliance_status,section])
-    save_compliance_btn.click(save_compliance,[project_id,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules],[compliance_profile_state,compliance_rules,compliance_provenance,compliance_findings,compliance_json,compliance_status,section])
-    approve_compliance_btn.click(approve_compliance,[project_id],[compliance_provenance,compliance_findings,compliance_json,compliance_status])
-    resolve_compliance_btn.click(resolve_compliance,[project_id,compliance_rule_id,compliance_resolution,compliance_resolution_notes,compliance_resolved_by],[compliance_findings,compliance_json,compliance_status])
-    register_artifact_btn.click(register_submission_artifacts,[project_id,artifact_slot,artifact_files],[artifact_table,compliance_findings,compliance_json,compliance_status])
-    measure_compliance_btn.click(measure_compliance,[project_id],[compliance_findings,compliance_json,compliance_status])
-    section.change(load_section,[project_id,project_title,section],[current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner])
-    gen.click(draft_section,[project_id,project_title,section,additional,high],[current_version,baseline_body,current_section_key,preview_box,write_status,editor,save_btn,cancel,current_competitive_update_event,section_update_banner])
+    wizard_pages=[wizard_page_1,wizard_page_2,wizard_page_3,wizard_page_4,wizard_page_5,wizard_page_6,wizard_page_7]
+    wizard_nav_outputs=wizard_pages+[wizard_rail,wizard_progress]
+    wizard_new_btn.click(wizard_go(2),outputs=wizard_nav_outputs,js=wizard_nav_js(2)).then(gateway_callback(authenticated_identity),outputs=[wizard_owner_id,wizard_identity_status])
+    wizard_2_back.click(wizard_go(1),outputs=wizard_nav_outputs,js=wizard_nav_js(1))
+    wizard_2_next.click(validate_grant_ask_and_continue,[wizard_title,wizard_source,wizard_source_url,wizard_source_text,wizard_deadline],wizard_nav_outputs).then(fn=None,js=wizard_nav_js(3))
+    wizard_3_back.click(wizard_go(2),outputs=wizard_nav_outputs,js=wizard_nav_js(2))
+    wizard_3_next.click(wizard_go(4),outputs=wizard_nav_outputs,js=wizard_nav_js(4))
+    wizard_4_back.click(wizard_go(3),outputs=wizard_nav_outputs,js=wizard_nav_js(3))
+    wizard_4_next.click(wizard_after_modules,[wizard_modules],wizard_nav_outputs).then(fn=None,js=wizard_nav_from_progress_js())
+    wizard_5_back.click(wizard_go(4),outputs=wizard_nav_outputs,js=wizard_nav_js(4))
+    wizard_5_next.click(wizard_go(6),outputs=wizard_nav_outputs,js=wizard_nav_js(6))
+    wizard_6_back.click(wizard_team_back,[wizard_modules],wizard_nav_outputs).then(fn=None,js=wizard_nav_from_progress_js())
+    wizard_6_next.click(validate_team_and_preview,[wizard_owner_id,wizard_title,wizard_sponsor,wizard_mechanism,wizard_deadline,wizard_modules,wizard_required_modules,wizard_review_mode,wizard_review_required,wizard_routing,wizard_team],wizard_nav_outputs+[wizard_preview]).then(fn=None,js=wizard_nav_js(7))
+    wizard_7_back.click(wizard_go(6),outputs=wizard_nav_outputs,js=wizard_nav_js(6))
+    wizard_preset.change(apply_workflow_preset,[wizard_preset],[wizard_modules,wizard_required_modules]).then(reconcile_module_gates,[wizard_modules,wizard_required_modules],[wizard_required_modules])
+    wizard_modules.change(reconcile_module_gates,[wizard_modules,wizard_required_modules],[wizard_required_modules])
+    wizard_refresh_btn.click(gateway_callback(refresh_projects),outputs=[wizard_existing])
+    wizard_open_btn.click(lambda:gr.update(visible=False),outputs=[wizard_shell]).then(gateway_callback(load_project),[wizard_existing],[project_id,project_title,sponsor,mechanism,project_status,agentic_global_notice,requirements_table,section,current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner]).then(gateway_callback(project_workflow_ui),[project_id],[workspace_workflow_summary,workspace_workflow_status,interview_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab]).then(gateway_callback(authenticated_identity),outputs=[wizard_owner_id,wizard_identity_status])
+    wizard_create_btn.click(gateway_callback(configured_project_creation),
+        [wizard_title,wizard_sponsor,wizard_mechanism,wizard_deadline,wizard_grant_type,wizard_source,wizard_source_url,wizard_source_text,wizard_supporting,wizard_brand,wizard_preset,wizard_modules,wizard_required_modules,wizard_review_mode,wizard_review_required,wizard_routing,wizard_owner_id,wizard_team],
+        [wizard_shell,project_id,project_status,agentic_global_notice,requirements_table,section,workspace_workflow_summary,workspace_workflow_status,interview_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab])
+
+    create.click(gateway_callback(create_project),[project_title,sponsor,mechanism,source,source_url,source_text,supporting,brand],[project_id,project_status,agentic_global_notice,requirements_table,section])
+    approve_req.click(gateway_callback(approve_requirements),[project_id],[req_status])
+    solicitation_form=[solicitation_working_title,solicitation_sponsor,solicitation_mechanism,solicitation_purpose,solicitation_facts,solicitation_criteria,solicitation_questions]
+    solicitation_outputs=solicitation_form+[solicitation_version,solicitation_status,solicitation_artifact_json]
+    load_solicitation_btn.click(gateway_callback(load_solicitation_form),[project_id],solicitation_outputs)
+    save_solicitation_btn.click(gateway_callback(save_solicitation_form),[project_id,wizard_owner_id,solicitation_version,solicitation_artifact_json]+solicitation_form,solicitation_outputs)
+    approve_solicitation_btn.click(gateway_callback(approve_solicitation_form),[project_id,wizard_owner_id,solicitation_version,solicitation_artifact_json]+solicitation_form,solicitation_outputs+[workspace_workflow_status])
+    framework_outputs=[framework_argument,framework_nodes,framework_version,framework_status,framework_artifact_json]
+    load_framework_btn.click(gateway_callback(load_framework_form),[project_id],framework_outputs)
+    generate_framework_btn.click(gateway_callback(generate_framework_form),[project_id,wizard_owner_id],framework_outputs)
+    save_framework_btn.click(gateway_callback(lambda project,actor,version,metadata,argument,rows:save_framework_form(project,actor,version,metadata,argument,rows,False)),[project_id,wizard_owner_id,framework_version,framework_artifact_json,framework_argument,framework_nodes],framework_outputs)
+    approve_framework_btn.click(gateway_callback(lambda project,actor,version,metadata,argument,rows:save_framework_form(project,actor,version,metadata,argument,rows,True)),[project_id,wizard_owner_id,framework_version,framework_artifact_json,framework_argument,framework_nodes],framework_outputs).then(gateway_callback(lambda project:api("GET",f"/api/projects/{project}/workflow/status")),[project_id],[workspace_workflow_status])
+    aims_outputs=[aims_objective,aims_hypothesis,core_aims,aims_version,aims_status,aims_artifact_json]
+    load_aims_btn.click(gateway_callback(load_aims_form),[project_id],aims_outputs)
+    generate_aims_btn.click(gateway_callback(generate_aims_form),[project_id,wizard_owner_id],aims_outputs)
+    save_aims_btn.click(gateway_callback(lambda project,actor,version,metadata,objective,hypothesis,rows:save_aims_form(project,actor,version,metadata,objective,hypothesis,rows,False)),[project_id,wizard_owner_id,aims_version,aims_artifact_json,aims_objective,aims_hypothesis,core_aims],aims_outputs)
+    approve_aims_btn.click(gateway_callback(lambda project,actor,version,metadata,objective,hypothesis,rows:save_aims_form(project,actor,version,metadata,objective,hypothesis,rows,True)),[project_id,wizard_owner_id,aims_version,aims_artifact_json,aims_objective,aims_hypothesis,core_aims],aims_outputs).then(gateway_callback(lambda project:api("GET",f"/api/projects/{project}/workflow/status")),[project_id],[workspace_workflow_status])
+    generate_q.click(gateway_callback(generate_interview),[project_id],[interview_questions,current_question,question_card,answer,interview_status,interview_table])
+    submit.click(gateway_callback(submit_answer),[project_id,interview_questions,current_question,answer,confidence,classification,answer_notes,answered_by],[interview_questions,current_question,question_card,answer,interview_status])
+    literature_outputs=[literature_manifest_summary,literature_queries,literature_needs,literature_contradictions,literature_version,literature_artifact_status,literature_artifact_json]
+    research_btn.click(gateway_callback(run_research),[project_id,max_queries,results_per],[evidence_table,research_status]).then(gateway_callback(load_literature_form),[project_id],literature_outputs)
+    load_literature_btn.click(gateway_callback(load_literature_form),[project_id],literature_outputs)
+    save_literature_btn.click(gateway_callback(lambda project,actor,version,metadata,queries,needs,contradictions:save_literature_form(project,actor,version,metadata,queries,needs,contradictions,False)),[project_id,wizard_owner_id,literature_version,literature_artifact_json,literature_queries,literature_needs,literature_contradictions],literature_outputs)
+    approve_literature_btn.click(gateway_callback(lambda project,actor,version,metadata,queries,needs,contradictions:save_literature_form(project,actor,version,metadata,queries,needs,contradictions,True)),[project_id,wizard_owner_id,literature_version,literature_artifact_json,literature_queries,literature_needs,literature_contradictions],literature_outputs).then(gateway_callback(lambda project:api("GET",f"/api/projects/{project}/workflow/status")),[project_id],[workspace_workflow_status])
+    refresh_reviewer_roles_btn.click(gateway_callback(reviewer_role_rows),[project_id],[review_roles,review_notice])
+    create_review_plan_btn.click(gateway_callback(create_panel_plan),[project_id,review_mode],[review_plan_id,review_roles,review_status,review_plan_json])
+    approve_review_plan_btn.click(gateway_callback(approve_panel_plan),[project_id,review_plan_id],[review_status,review_plan_json])
+    run_review_panel_btn.click(gateway_callback(execute_review_panel),[project_id,review_plan_id],[review_run_id,panel_summary,reviewer_findings,revision_findings,causal_editor,review_status,review_run_json])
+    create_revision_tasks_btn.click(gateway_callback(create_revision_tasks),[project_id,review_run_id,revision_task_indexes,revision_task_owner,revision_task_due],[revision_task_result,revision_task_status])
+    load_causal_btn.click(gateway_callback(load_causal_models),[project_id,review_run_id],[causal_editor,causal_history,causal_status])
+    save_causal_btn.click(gateway_callback(save_causal_editor),[project_id,review_run_id,causal_editor,confirm_causal],[causal_editor,causal_status])
+    rebuild_idx.click(gateway_callback(rebuild_index),[project_id],[index_message,index_json]);status_idx.click(gateway_callback(index_status),[project_id],[index_message,index_json]);retrieval_btn.click(gateway_callback(test_retrieval),[project_id,retrieval_query,retrieval_k],[retrieval_table])
+    load_clinical_btn.click(gateway_callback(load_clinical_study),[project_id],[clinical_problem,knowledge_gap,central_hypothesis,disease,disease_stage,biomarker,inclusion,exclusion,design_type,study_phase,randomization,allocation_ratio,blinding,follow_up_months,design_sites,available_patients,eligibility_pct,biomarker_pct,consent_pct,target_enrollment,accrual_months,recruitment_sites,test_type,alpha,power,attrition_pct,control_rate,treatment_rate,null_rate,alternative_rate,mean_delta,std_dev,hazard_ratio,event_probability,aims_table,arms_table,endpoints_table,timeline_table,resources_table,clinical_assessment,clinical_status])
+    save_clinical_btn.click(gateway_callback(save_clinical_study),[project_id]+[clinical_problem,knowledge_gap,central_hypothesis,disease,disease_stage,biomarker,inclusion,exclusion,design_type,study_phase,randomization,allocation_ratio,blinding,follow_up_months,design_sites,available_patients,eligibility_pct,biomarker_pct,consent_pct,target_enrollment,accrual_months,recruitment_sites,test_type,alpha,power,attrition_pct,control_rate,treatment_rate,null_rate,alternative_rate,mean_delta,std_dev,hazard_ratio,event_probability,aims_table,arms_table,endpoints_table,timeline_table,resources_table],[clinical_assessment,clinical_status])
+    calculate_n_btn.click(gateway_callback(calculate_sample_size),[project_id,test_type,alpha,power,attrition_pct,control_rate,treatment_rate,null_rate,alternative_rate,mean_delta,std_dev,hazard_ratio,event_probability],[sample_size_json,sample_size_status])
+    scenario_btn.click(gateway_callback(run_feasibility_scenarios),[project_id,scenario_sites,scenario_consent,scenario_biomarker],[scenario_table,scenario_status])
+    generate_comp_profile_btn.click(gateway_callback(generate_competitive_profile),[project_id],[competitive_profile_json,competitive_status])
+    load_competitive_btn.click(gateway_callback(load_competitive),[project_id],[competitive_profile_json,competitor_table,asset_table,provider_status_json,competitive_strategy,competitive_raw,competitive_status,agentic_global_notice])
+    run_competitive_btn.click(gateway_callback(run_competitive_intelligence),[project_id],[competitor_table,asset_table,provider_status_json,competitive_strategy,competitive_raw,competitive_status,agentic_global_notice])
+    load_compliance_btn.click(gateway_callback(load_compliance),[project_id],[compliance_profile_state,opportunity_source_preview,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules,compliance_provenance,compliance_findings,compliance_json,artifact_table,compliance_status])
+    compile_compliance_btn.click(gateway_callback(compile_compliance),[project_id],[compliance_profile_state,opportunity_source_preview,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules,compliance_provenance,compliance_findings,compliance_json,compliance_status,section])
+    save_compliance_btn.click(gateway_callback(save_compliance),[project_id,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules],[compliance_profile_state,compliance_rules,compliance_provenance,compliance_findings,compliance_json,compliance_status,section])
+    approve_compliance_btn.click(gateway_callback(approve_compliance),[project_id],[compliance_provenance,compliance_findings,compliance_json,compliance_status])
+    resolve_compliance_btn.click(gateway_callback(resolve_compliance),[project_id,compliance_rule_id,compliance_resolution,compliance_resolution_notes,compliance_resolved_by],[compliance_findings,compliance_json,compliance_status])
+    register_artifact_btn.click(gateway_callback(register_submission_artifacts),[project_id,artifact_slot,artifact_files],[artifact_table,compliance_findings,compliance_json,compliance_status])
+    measure_compliance_btn.click(gateway_callback(measure_compliance),[project_id],[compliance_findings,compliance_json,compliance_status])
+    section.change(gateway_callback(load_section),[project_id,project_title,section],[current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner])
+    gen.click(gateway_callback(draft_section),[project_id,project_title,section,additional,high],[current_version,baseline_body,current_section_key,preview_box,write_status,editor,save_btn,cancel,current_competitive_update_event,section_update_banner])
     edit.click(show_editor,[baseline_body],[editor,save_btn,cancel])
-    save_btn.click(save_edit,[project_id,project_title,section,current_section_key,current_version,baseline_body,editor],[current_version,baseline_body,preview_box,write_status,editor,save_btn,cancel,current_competitive_update_event,section_update_banner])
-    cancel.click(cancel_edit,[project_id,project_title,section,current_section_key,current_version,baseline_body],[preview_box,editor,save_btn,cancel,write_status])
-    approve_btn.click(approve_section,[project_id,project_title,section,current_section_key,current_version,baseline_body,editor,current_competitive_update_event],[current_version,baseline_body,preview_box,write_status,editor,save_btn,cancel,current_competitive_update_event,section_update_banner])
-    preview_approved_btn.click(preview_approved_grant,[project_id],[approved_sections_table,approved_grant_preview,approved_preview_status])
-    check_ready.click(readiness,[project_id],[readiness_json,readiness_status,fmt,export_btn]);export_btn.click(export,[project_id,fmt,project_title],[export_file,export_status])
-    refresh_projects_btn.click(refresh_projects,outputs=[recent])
-    open_project_btn.click(load_project,[recent],[project_id,project_title,sponsor,mechanism,project_status,agentic_global_notice,requirements_table,section,current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner])
-    system_info_btn.click(system_diagnostics,outputs=[system_info_json,diagnostics_status])
-    hpc_bench_btn.click(run_hpc_diagnostics,outputs=[hpc_benchmark_json,diagnostics_status])
-    competitive_update_timer.tick(poll_competitive_updates,[project_id],[agentic_global_notice],show_progress="hidden")
+    save_btn.click(gateway_callback(save_edit),[project_id,project_title,section,current_section_key,current_version,baseline_body,editor],[current_version,baseline_body,preview_box,write_status,editor,save_btn,cancel,current_competitive_update_event,section_update_banner])
+    cancel.click(gateway_callback(cancel_edit),[project_id,project_title,section,current_section_key,current_version,baseline_body],[preview_box,editor,save_btn,cancel,write_status])
+    approve_btn.click(gateway_callback(approve_section),[project_id,project_title,section,current_section_key,current_version,baseline_body,editor,current_competitive_update_event],[current_version,baseline_body,preview_box,write_status,editor,save_btn,cancel,current_competitive_update_event,section_update_banner])
+    preview_approved_btn.click(gateway_callback(preview_approved_grant),[project_id],[approved_sections_table,approved_grant_preview,approved_preview_status])
+    check_ready.click(gateway_callback(readiness),[project_id],[readiness_json,readiness_status,fmt,export_btn]);export_btn.click(gateway_callback(export),[project_id,fmt,project_title],[export_file,export_status])
+    refresh_projects_btn.click(gateway_callback(refresh_projects),outputs=[recent])
+    open_project_btn.click(gateway_callback(load_project),[recent],[project_id,project_title,sponsor,mechanism,project_status,agentic_global_notice,requirements_table,section,current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner])
+    system_info_btn.click(gateway_callback(system_diagnostics),outputs=[system_info_json,diagnostics_status])
+    hpc_bench_btn.click(gateway_callback(run_hpc_diagnostics),outputs=[hpc_benchmark_json,diagnostics_status])
+    refresh_accounts_btn.click(gateway_callback(account_rows),outputs=[accounts_table])
+    create_account_btn.click(gateway_callback(create_account),[account_username,account_email,account_display_name,account_temp_password],[accounts_table,account_admin_status,account_temp_password])
+    send_account_reset_btn.click(gateway_callback(send_account_reset),[account_target_id],[account_admin_status])
+    disable_account_btn.click(gateway_callback(lambda user_id:set_account_status(user_id,False)),[account_target_id],[accounts_table,account_admin_status])
+    enable_account_btn.click(gateway_callback(lambda user_id:set_account_status(user_id,True)),[account_target_id],[accounts_table,account_admin_status])
+    competitive_update_timer.tick(gateway_callback(poll_competitive_updates),[project_id],[agentic_global_notice],show_progress="hidden")
 
-if __name__=="__main__":demo.launch(server_name="0.0.0.0",server_port=7860,css=CSS)
+APP_THEME=gr.themes.Base(primary_hue=gr.themes.colors.purple,secondary_hue=gr.themes.colors.fuchsia,neutral_hue=gr.themes.colors.gray)
+
+def _auth_api(method,path,token=None,payload=None):
+    headers={"Idempotency-Key":str(uuid.uuid4())} if method.upper() not in {"GET","HEAD","OPTIONS"} else {}
+    if token:headers["Authorization"]=f"Bearer {token}"
+    response=requests.request(method,f"{CORE}{path}",json=payload,headers=headers,timeout=20)
+    data=response.json() if response.headers.get("content-type","").startswith("application/json") else {}
+    if not response.ok:raise RuntimeError(data.get("error") or "Authentication request failed.")
+    return data
+
+AUTH_STYLE="""
+body{margin:0;background:#0d0b14;color:#f7f3fb;font:15px/1.5 system-ui,-apple-system,sans-serif}.auth{max-width:460px;margin:8vh auto;padding:34px;background:#17131f;border:1px solid #342a40;border-radius:18px;box-shadow:0 24px 70px #0008}h1{font:38px/1.1 Georgia,serif;margin:0 0 12px}.muted{color:#aaa0b5}.error{background:#421e2b;border:1px solid #82374e;padding:12px;border-radius:9px}label{display:block;margin:15px 0 6px}input{box-sizing:border-box;width:100%;padding:12px;border:1px solid #463951;border-radius:8px;background:#100d17;color:#fff}button{width:100%;margin-top:20px;padding:12px;border:0;border-radius:8px;background:linear-gradient(100deg,#7c3aed,#d946ef);color:#fff;font-weight:700;cursor:pointer}a{color:#c77dff}.links{display:flex;justify-content:space-between;margin-top:20px}.brand{color:#c06cf4;font-size:12px;letter-spacing:.16em;text-transform:uppercase}
+"""
+
+def _auth_page(title,fields,action,submit,error=None,help_text=None,csrf=None):
+    csrf=csrf or secrets.token_urlsafe(32)
+    message=f'<p class="error">{html.escape(str(error))}</p>' if error else ""
+    help_html=f'<p class="muted">{html.escape(help_text)}</p>' if help_text else ""
+    body=f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{html.escape(title)} · Grantspace</title><style>{AUTH_STYLE}</style></head><body><main class="auth"><div class="brand">Grantspace</div><h1>{html.escape(title)}</h1>{help_html}{message}<form method="post" action="{action}"><input type="hidden" name="csrf" value="{html.escape(csrf)}">{fields}<button type="submit">{html.escape(submit)}</button></form><div class="links"><a href="/login">Sign in</a><a href="/forgot-password">Forgot password?</a></div></main></body></html>'''
+    response=HTMLResponse(body)
+    response.set_cookie("grantspace_csrf",csrf,httponly=True,secure=_secure_cookie(),samesite="lax",max_age=3600,path="/")
+    return response
+
+def _field(name,label,password=False,autocomplete=None,value=""):
+    kind="password" if password else "text"
+    return f'<label for="{name}">{html.escape(label)}</label><input required id="{name}" name="{name}" type="{kind}" autocomplete="{autocomplete or ("current-password" if password else "off")}" value="{html.escape(value)}">'
+
+def _secure_cookie():
+    explicit=os.getenv("SESSION_COOKIE_SECURE")
+    if explicit is not None:return explicit.strip().lower() in {"1","true","yes","on"}
+    return os.getenv("APP_PUBLIC_URL","").startswith("https://")
+
+async def _form(request):
+    raw=(await request.body()).decode("utf-8",errors="strict")
+    return {key:values[-1] for key,values in parse_qs(raw,keep_blank_values=True).items()}
+
+def _csrf_valid(request,form):
+    supplied=form.get("csrf","");stored=request.cookies.get("grantspace_csrf","")
+    return bool(supplied and stored and secrets.compare_digest(supplied,stored))
+
+def _session_user(request):
+    token=request.cookies.get("grantspace_session")
+    if not token:return None
+    try:return _auth_api("GET","/api/me",token=token)
+    except Exception:return None
+
+def _set_session(response,token):
+    response.set_cookie("grantspace_session",token,httponly=True,secure=_secure_cookie(),samesite="lax",max_age=int(os.getenv("AUTH_SESSION_TTL_SECONDS","43200")),path="/")
+    return response
+
+def _login_fields(username=""):
+    return _field("username","Username",value=username,autocomplete="username")+_field("password","Password",password=True,autocomplete="current-password")
+
+def build_internal_account_app():
+    web=FastAPI(title="Grantspace")
+
+    @web.get("/")
+    async def root(request:Request):
+        try:
+            if _auth_api("GET","/api/auth/bootstrap/status").get("bootstrap_required"):return RedirectResponse("/setup",303)
+        except Exception:return RedirectResponse("/login",303)
+        user=_session_user(request)
+        if not user:return RedirectResponse("/login",303)
+        if user.get("must_change_password"):return RedirectResponse("/change-password",303)
+        return RedirectResponse("/app/",303)
+
+    @web.get("/setup")
+    async def setup_get(request:Request):
+        if not _auth_api("GET","/api/auth/bootstrap/status").get("bootstrap_required"):return RedirectResponse("/login",303)
+        fields=_field("setup_token","Initial setup token",password=True,autocomplete="off")+_field("username","Administrator username",autocomplete="username")+_field("email","Administrator email",autocomplete="email")+_field("display_name","Display name")+_field("temporary_password","Temporary password",password=True,autocomplete="new-password")
+        return _auth_page("Create the first administrator",fields,"/setup","Create the only bootstrap account",help_text="This one-time screen closes permanently after the database transaction succeeds. You must replace the temporary password on first login.")
+
+    @web.post("/setup")
+    async def setup_post(request:Request):
+        form=await _form(request)
+        if not _csrf_valid(request,form):return _auth_page("Create the first administrator","","/setup","Try again",error="The form expired. Reload the setup page.")
+        try:
+            payload={key:form.get(key,"") for key in ("setup_token","username","email","display_name","temporary_password")}
+            _auth_api("POST","/api/auth/bootstrap",payload=payload)
+            login=_auth_api("POST","/api/auth/login",payload={"username":form.get("username","") ,"password":form.get("temporary_password","")})
+            return _set_session(RedirectResponse("/change-password",303),login["access_token"])
+        except Exception as error:
+            fields=_field("setup_token","Initial setup token",password=True)+_field("username","Administrator username",value=form.get("username",""))+_field("email","Administrator email",value=form.get("email",""))+_field("display_name","Display name",value=form.get("display_name",""))+_field("temporary_password","Temporary password",password=True)
+            return _auth_page("Create the first administrator",fields,"/setup","Create the only bootstrap account",error=error)
+
+    @web.get("/login")
+    async def login_get(request:Request):
+        if _auth_api("GET","/api/auth/bootstrap/status").get("bootstrap_required"):return RedirectResponse("/setup",303)
+        user=_session_user(request)
+        if user:return RedirectResponse("/change-password" if user.get("must_change_password") else "/app/",303)
+        return _auth_page("Sign in",_login_fields(),"/login","Sign in",help_text="Use the username assigned by your administrator.")
+
+    @web.post("/login")
+    async def login_post(request:Request):
+        form=await _form(request)
+        if not _csrf_valid(request,form):return _auth_page("Sign in",_login_fields(form.get("username","")),"/login","Sign in",error="The form expired. Reload and try again.")
+        try:
+            result=_auth_api("POST","/api/auth/login",payload={"username":form.get("username","") ,"password":form.get("password","")})
+            destination="/change-password" if result.get("user",{}).get("must_change_password") else "/app/"
+            return _set_session(RedirectResponse(destination,303),result["access_token"])
+        except Exception as error:return _auth_page("Sign in",_login_fields(form.get("username","")),"/login","Sign in",error=error)
+
+    @web.get("/change-password")
+    async def change_get(request:Request):
+        if not _session_user(request):return RedirectResponse("/login",303)
+        fields=_field("current_password","Current or temporary password",password=True)+_field("new_password","New password",password=True,autocomplete="new-password")+_field("confirm_password","Confirm new password",password=True,autocomplete="new-password")
+        return _auth_page("Choose a new password",fields,"/change-password","Save password",help_text="At least 14 characters and three character classes. It cannot contain your username or email name.")
+
+    @web.post("/change-password")
+    async def change_post(request:Request):
+        token=request.cookies.get("grantspace_session")
+        if not token:return RedirectResponse("/login",303)
+        form=await _form(request);fields=_field("current_password","Current or temporary password",password=True)+_field("new_password","New password",password=True)+_field("confirm_password","Confirm new password",password=True)
+        if not _csrf_valid(request,form):return _auth_page("Choose a new password",fields,"/change-password","Save password",error="The form expired. Reload and try again.")
+        if form.get("new_password")!=form.get("confirm_password"):return _auth_page("Choose a new password",fields,"/change-password","Save password",error="New passwords do not match.")
+        try:_auth_api("POST","/api/auth/change-password",token=token,payload={"current_password":form.get("current_password","") ,"new_password":form.get("new_password","")})
+        except Exception as error:return _auth_page("Choose a new password",fields,"/change-password","Save password",error=error)
+        return RedirectResponse("/app/",303)
+
+    @web.get("/forgot-password")
+    async def forgot_get(request:Request):return _auth_page("Reset your password",_field("login","Username or email",autocomplete="username"),"/forgot-password","Email reset link")
+
+    @web.post("/forgot-password")
+    async def forgot_post(request:Request):
+        form=await _form(request)
+        if not _csrf_valid(request,form):return _auth_page("Reset your password",_field("login","Username or email"),"/forgot-password","Email reset link",error="The form expired. Reload and try again.")
+        try:_auth_api("POST","/api/auth/password-reset/request",payload={"login":form.get("login","")})
+        except Exception as error:return _auth_page("Reset your password",_field("login","Username or email"),"/forgot-password","Email reset link",error=error)
+        return _auth_page("Check your email","","/forgot-password","Send another link",help_text="If an active account matched, a single-use reset link was sent.")
+
+    @web.get("/password-reset")
+    async def reset_get(request:Request,token:str=""):
+        fields=f'<input type="hidden" name="token" value="{html.escape(token)}">'+_field("new_password","New password",password=True,autocomplete="new-password")+_field("confirm_password","Confirm new password",password=True,autocomplete="new-password")
+        return _auth_page("Set a new password",fields,"/password-reset","Reset password")
+
+    @web.post("/password-reset")
+    async def reset_post(request:Request):
+        form=await _form(request);token=form.get("token","");fields=f'<input type="hidden" name="token" value="{html.escape(token)}">'+_field("new_password","New password",password=True)+_field("confirm_password","Confirm new password",password=True)
+        if not _csrf_valid(request,form):return _auth_page("Set a new password",fields,"/password-reset","Reset password",error="The form expired. Reopen the email link.")
+        if form.get("new_password")!=form.get("confirm_password"):return _auth_page("Set a new password",fields,"/password-reset","Reset password",error="New passwords do not match.")
+        try:_auth_api("POST","/api/auth/password-reset/confirm",payload={"token":token,"new_password":form.get("new_password","")})
+        except Exception as error:return _auth_page("Set a new password",fields,"/password-reset","Reset password",error=error)
+        return RedirectResponse("/login",303)
+
+    @web.get("/logout")
+    async def logout(request:Request):
+        token=request.cookies.get("grantspace_session")
+        if token:
+            try:_auth_api("POST","/api/auth/logout",token=token,payload={})
+            except Exception:pass
+        response=RedirectResponse("/login",303);response.delete_cookie("grantspace_session",path="/");return response
+
+    def authorize_gradio(request:Request):
+        user=_session_user(request)
+        return (user.get("username") or user.get("id")) if user and not user.get("must_change_password") else None
+
+    return gr.mount_gradio_app(web,demo,path="/app",auth_dependency=authorize_gradio,css=CSS,theme=APP_THEME)
+
+if __name__=="__main__":
+    if os.getenv("AUTH_MODE","local_single_user")=="internal_accounts":
+        import uvicorn
+        uvicorn.run(build_internal_account_app(),host="0.0.0.0",port=7860,proxy_headers=True,forwarded_allow_ips=os.getenv("TRUSTED_PROXY_IPS","127.0.0.1"))
+    else:demo.launch(server_name="0.0.0.0",server_port=7860,css=CSS,theme=APP_THEME)

@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # Source repositories/revisions are provenance. API model names are stable local aliases.
-LLM_REPO="${OLMO_MODEL_REPO:-${OLMO_MODEL:-mlx-community/Olmo-3-7B-Instruct-4bit}}"
+LLM_REPO="${LOCAL_LLM_MODEL_REPO:-${OLMO_MODEL_REPO:-${OLMO_MODEL:-mlx-community/Olmo-3-7B-Instruct-4bit}}}"
 EMBED_REPO="${EMBEDDING_MODEL_REPO:-${EMBEDDING_MODEL:-mlx-community/all-MiniLM-L6-v2-4bit}}"
-LLM_REVISION="${OLMO_MODEL_REVISION:-}"
+LLM_REVISION="${LOCAL_LLM_MODEL_REVISION:-${OLMO_MODEL_REVISION:-}}"
 EMBED_REVISION="${EMBEDDING_MODEL_REVISION:-}"
-LLM_API_NAME="${OLMO_API_MODEL:-grant-olmo}"
+LLM_API_NAME="${LOCAL_LLM_API_MODEL:-${OLMO_API_MODEL:-grant-olmo}}"
 EMBED_API_NAME="${EMBEDDING_API_MODEL:-grant-embedding}"
 PORT="${OLMO_PORT:-8000}"
 VLLM_MLX_VERSION="${VLLM_MLX_VERSION:-0.4.1}"
@@ -22,7 +22,7 @@ RELEASE_LOCK="$SCRIPT_ROOT/config/mlx-runtime.lock"
 RUNTIME_LOCK="$RUNTIME_DIR/mlx-runtime.resolved.lock"
 
 valid_alias='^[A-Za-z0-9_.-]+$'
-[[ "$LLM_API_NAME" =~ $valid_alias ]] || { echo "Invalid OLMO_API_MODEL alias: $LLM_API_NAME" >&2; exit 2; }
+[[ "$LLM_API_NAME" =~ $valid_alias ]] || { echo "Invalid LOCAL_LLM_API_MODEL alias: $LLM_API_NAME" >&2; exit 2; }
 [[ "$EMBED_API_NAME" =~ $valid_alias ]] || { echo "Invalid EMBEDDING_API_MODEL alias: $EMBED_API_NAME" >&2; exit 2; }
 [[ "$LLM_API_NAME" != "$EMBED_API_NAME" ]] || { echo "Generation and embedding API aliases must differ" >&2; exit 2; }
 

@@ -13,3 +13,13 @@ if [[ "${GRANT_RUNTIME_PROFILE:-}" == "apple_mlx" ]]; then
     rm -f "$PID_FILE"
   fi
 fi
+if [[ "${GRANT_RUNTIME_PROFILE:-}" == "apple_ollama" ]]; then
+  RUNTIME_DIR="$HOME/Library/Application Support/GrantWriter/ollama-runtime"
+  PID_FILE="$RUNTIME_DIR/server.pid"
+  STARTED_FILE="$RUNTIME_DIR/started-by-grant-writer"
+  if [[ -f "$PID_FILE" && -f "$STARTED_FILE" ]]; then
+    PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+    [[ -n "$PID" ]] && kill "$PID" 2>/dev/null || true
+    rm -f "$PID_FILE" "$STARTED_FILE"
+  fi
+fi
