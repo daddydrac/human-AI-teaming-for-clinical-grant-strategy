@@ -1,6 +1,6 @@
 # Clinical Grant Workbench
 
-Clinical Grant Workbench is a local, human-in-the-loop application for developing sponsor-ready grant proposals. It turns a funding opportunity and supporting project materials into structured requirements, evidence, clinical-study design, competitive intelligence, reviewed grant sections, and a final DOCX/PDF submission package. The app runs as a Gradio UI backed by containerized Rust and Python services; supported Apple Silicon Macs can use local MLX inference, while other Macs use Claude with local CPU embeddings.
+Clinical Grant Workbench is a local, human-in-the-loop application for developing sponsor-ready grant proposals. It turns a funding opportunity and supporting project materials into structured requirements, evidence, clinical-study design, competitive intelligence, reviewed grant sections, and a final DOCX/PDF submission package. The UI, Rust API, rendering, ingestion, embeddings, and local Ollama inference all run in Docker containers with persistent Docker volumes.
 
 ## UI workflow
 
@@ -21,9 +21,8 @@ Public opportunity URLs are rendered in Chromium and converted to Markdown befor
 ### Prerequisites
 
 - macOS with at least 10 GB of free disk space
-- Docker Desktop installed and running
-- `uv` installed when using the native Apple MLX profile (automatically selected on Apple Silicon Macs with at least 16 GB RAM)
-- An Anthropic API key on Intel or lower-memory Macs, where the automatic runtime profile uses Claude for generation
+- An internet connection for the first image and model download
+- Permission to install and start Docker Desktop if it is not already present
 
 ### Install and run
 
@@ -38,12 +37,16 @@ Edit `.env` before starting:
 - Optionally set `OPENALEX_API_KEY` for publication discovery.
 - Adjust `ORGANIZATION_NAME`, `GRANT_SECTIONS`, and `GRANT_EXPORT_HOME` as needed.
 
-Then bootstrap and start the application:
+Then bootstrap and start the application with one command:
 
 ```bash
 ./install.sh
-./start.sh
 ```
+
+The installer installs Docker Desktop when necessary, builds every application
+service, downloads the selected Ollama model into a persistent Docker volume,
+starts the stack, and opens the UI. It does not install Python, Rust, Ollama,
+MLX, Node, Chromium, or application libraries on the host.
 
 Open [http://localhost:7860](http://localhost:7860). The first startup may take longer while containers and local models are downloaded.
 
@@ -137,7 +140,34 @@ expiring email invitation. The invited address must match the authenticated
 account accepting the link. General, framework, aims, and section channels
 support threaded messages and member mentions. Comments are validated against
 an exact immutable artifact range, tasks enforce owner/leadership transitions,
-and notifications and configured approval thresholds remain auditable.
+and notifications and configured approval thresholds remain auditable. The UI
+polls the shared server every `COLLABORATION_UI_POLL_SECONDS` (five seconds by
+default) for members, activity, tasks, notifications, approval routing, and the
+active channel. Project requests refresh the authenticated member's advisory
+presence timestamp; a 15-second window drives the Online indicator, while all
+edit safety continues to rely on immutable base/expected versions. Editable
+literature artifacts are not silently replaced during
+polling: the UI warns when a teammate publishes a newer version, and the server
+rejects a stale save through its expected-version contract.
+
+Authorized contributors retain final control within the workflow step they are
+working on. They can replace model output by publishing a human-authored
+version, record literature waivers and resolutions in the typed evidence
+contract, or return an exact approved artifact or proposal-section version for
+revision with a required rationale. A return resets effective approval votes,
+reopens downstream gates where necessary, and creates append-only approval and
+workflow events; it never deletes the returned content or its prior approvals.
+These controls do not bypass authentication, organization/project isolation,
+immutable history, or deterministic sponsor rules that are not legally or
+operationally waivable.
+
+The Team Workspace project-health tab is derived by the API from shared state
+and refreshes on the collaboration polling interval. It reports blocked
+workflow gates, stale approved artifacts, overdue or blocked tasks, invalid due
+dates, pending configured approvals, unresolved version comments, unresolved
+evidence risks, literature contradictions, and approaching or missed project
+deadlines. Findings include the responsible workflow step or task owner and a
+specific remediation; browsers do not calculate independent health states.
 
 The solicitation, framework, aims, and literature editors load their selectable
 identifiers from `GET /api/projects/{id}/workflow/editor-context`. That response
@@ -146,6 +176,15 @@ project-scoped evidence, sources, and citations. Approval fails closed when an
 artifact contains an unknown, stale, inactive-member, or cross-project
 reference; fact-classified aims require supporting evidence, and literature run
 timestamps must be valid and ordered RFC 3339 values.
+
+Literature research is a two-step controlled operation. A contributor first
+generates or edits a versioned search plan grounded in the exact approved
+solicitation, framework, and aims; a named approver must approve that version.
+Execution is then bound to that immutable plan. Search and model validation are
+staged outside SQLite, and queries, source assessments, evidence, citations,
+dispositions, the run record, and the versioned manifest commit in one database
+transaction. If the plan or any approved upstream artifact changes while the
+run is active, finalization fails without publishing partial research data.
 
 ---
 
@@ -795,13 +834,13 @@ GRANT_RUNTIME_PROFILE=auto
 Typical behavior:
 
 ```text
-Apple Silicon + sufficient unified memory
+Apple Silicon (M2 or M4)
         ↓
-apple_mlx
+container_ollama + CPU embeddings
 
-Intel Mac / low-memory Mac
+Other supported Docker hosts
         ↓
-docker_cpu
+docker_cpu or container_ollama
 ```
 
 An explicit private/local profile is also available for the 8 GB Apple-Silicon
@@ -810,25 +849,19 @@ case:
 ```text
 M2 8 GB + env.m2Mac.8gb.txt
         ↓
-apple_ollama + qwen3:1.7b + CPU embeddings
+container_ollama + qwen3:1.7b + CPU embeddings
 ```
 
 Manual overrides are available:
 
 ```bash
-GRANT_RUNTIME_PROFILE=apple_mlx
+GRANT_RUNTIME_PROFILE=container_ollama
 ```
 
 or:
 
 ```bash
 GRANT_RUNTIME_PROFILE=docker_cpu
-```
-
-or:
-
-```bash
-GRANT_RUNTIME_PROFILE=apple_ollama
 ```
 
 Only override automatic selection for troubleshooting or controlled deployments.
@@ -870,9 +903,9 @@ local HPC retrieval
 Supported values are `hybrid`, `claude_only`, and `local_only`. The repository
 ships three machine-oriented templates:
 
-- `env.m4Mac.txt`: MLX OLMo 3 + Claude.
-- `env.m4Mac.qwen3.txt`: MLX Qwen 3 8B + Claude.
-- `env.m2Mac.8gb.txt`: Ollama Qwen 3 1.7B, local-only by default with an
+- `env.m4Mac.txt`: containerized Ollama OLMo 3 7B + Claude.
+- `env.m4Mac.qwen3.txt`: containerized Ollama Qwen 3 8B + Claude.
+- `env.m2Mac.8gb.txt`: containerized Ollama Qwen 3 1.7B, local-only by default with a
   documented hybrid toggle.
 
 ### Structured model-output contracts
@@ -881,7 +914,7 @@ Every task that returns machine-readable data uses a versioned JSON Schema
 generated from the Rust type that the application will deserialize. The same
 schema is encoded through the provider's native mechanism:
 
-- MLX/vLLM-compatible servers receive `response_format.type=json_schema`.
+- OpenAI-compatible/vLLM adapters receive `response_format.type=json_schema` when used by an externally configured deployment.
 - Ollama receives the schema in the native `/api/chat` `format` field.
 - Claude is forced to call a single `submit_structured_output` tool whose
   `input_schema` is that same contract.

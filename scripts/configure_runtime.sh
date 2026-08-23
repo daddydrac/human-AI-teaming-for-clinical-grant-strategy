@@ -8,64 +8,35 @@ MEM_BYTES="$(sysctl -n hw.memsize 2>/dev/null || echo 8589934592)"
 MEM_GB=$(( MEM_BYTES / 1024 / 1024 / 1024 ))
 OVERRIDE="${GRANT_RUNTIME_PROFILE:-auto}"
 
-if [[ "$OVERRIDE" != "auto" ]]; then
+if [[ "$OVERRIDE" == "apple_mlx" || "$OVERRIDE" == "apple_ollama" ]]; then
+  echo "Native runtime profile '$OVERRIDE' is being migrated to the portable container_ollama profile." >&2
+  PROFILE="container_ollama"
+elif [[ "$OVERRIDE" != "auto" ]]; then
   PROFILE="$OVERRIDE"
-elif [[ "$ARCH" == "arm64" && "$MEM_GB" -ge 16 ]]; then
-  PROFILE="apple_mlx"
+elif [[ "$ARCH" == "arm64" ]]; then
+  PROFILE="container_ollama"
 else
   PROFILE="docker_cpu"
 fi
 
 case "$PROFILE" in
-  apple_mlx|apple_ollama|docker_cpu) ;;
+  container_ollama|docker_cpu) ;;
   *) echo "Unsupported GRANT_RUNTIME_PROFILE: $PROFILE" >&2; exit 2 ;;
 esac
 
-if [[ "$PROFILE" == "apple_mlx" ]]; then
-  OMP=$(( CORES > 10 ? CORES-4 : (CORES > 6 ? CORES-2 : (CORES > 2 ? CORES-1 : 1)) ))
-  cat > "$OUT" <<EOF
-GRANT_RUNTIME_PROFILE=apple_mlx
-COMPOSE_PROFILES=
-MODEL_ROUTING_MODE=hybrid
-LOCAL_LLM_PROVIDER=mlx
-LOCAL_LLM_URL=${LOCAL_LLM_URL:-${OLMO_URL:-http://host.docker.internal:8000/v1/chat/completions}}
-LOCAL_LLM_API_MODEL=${LOCAL_LLM_API_MODEL:-${OLMO_API_MODEL:-grant-olmo}}
-LOCAL_LLM_MAX_TOKENS=${LOCAL_LLM_MAX_TOKENS:-${OLMO_MAX_TOKENS:-4096}}
-EMBEDDING_URL=http://host.docker.internal:8000/v1/embeddings
-EMBEDDING_API_MODEL=grant-embedding
-EMBEDDING_DOCUMENT_PREFIX=
-EMBEDDING_QUERY_PREFIX=
-EMBEDDING_BATCH_SIZE=64
-INDEX_EMBED_BATCH_RECORDS=64
-OMP_NUM_THREADS=$OMP
-RAYON_NUM_THREADS=$OMP
-OPENBLAS_NUM_THREADS=1
-RESEARCH_MAX_CONCURRENCY=8
-CONTEXT_RETRIEVAL_K=24
-CONTEXT_MAX_CHARS=48000
-CORE_MEMORY_LIMIT=2g
-UI_MEMORY_LIMIT=768m
-RENDERER_MEMORY_LIMIT=1g
-INGESTION_MEMORY_LIMIT=1g
-CORE_CPU_LIMIT=$OMP
-UI_CPU_LIMIT=1.0
-RENDERER_CPU_LIMIT=1.5
-INGESTION_CPU_LIMIT=1.5
-EMBEDDING_CPU_LIMIT=2.0
-EOF
-elif [[ "$PROFILE" == "apple_ollama" ]]; then
+if [[ "$PROFILE" == "container_ollama" ]]; then
   THREADS=$(( CORES >= 8 ? 2 : 1 ))
   ROUTING_MODE="${MODEL_ROUTING_MODE:-local_only}"
   LOCAL_MODEL="${LOCAL_LLM_API_MODEL:-${OLLAMA_MODEL:-qwen3:1.7b}}"
   cat > "$OUT" <<EOF
-GRANT_RUNTIME_PROFILE=apple_ollama
-COMPOSE_PROFILES=cpu-embedding
+GRANT_RUNTIME_PROFILE=container_ollama
+COMPOSE_PROFILES=cpu-embedding,local-model
 MODEL_ROUTING_MODE=$ROUTING_MODE
 LOCAL_LLM_PROVIDER=ollama
-LOCAL_LLM_URL=http://host.docker.internal:${OLLAMA_PORT:-11434}/v1/chat/completions
+LOCAL_LLM_URL=http://ollama:11434/v1/chat/completions
 LOCAL_LLM_API_MODEL=$LOCAL_MODEL
 LOCAL_LLM_MAX_TOKENS=${LOCAL_LLM_MAX_TOKENS:-2048}
-OLMO_URL=http://host.docker.internal:${OLLAMA_PORT:-11434}/v1/chat/completions
+OLMO_URL=http://ollama:11434/v1/chat/completions
 OLMO_API_MODEL=$LOCAL_MODEL
 OLMO_MAX_TOKENS=${LOCAL_LLM_MAX_TOKENS:-2048}
 EMBEDDING_URL=http://embedding-cpu:8010/v1/embeddings
@@ -91,11 +62,13 @@ UI_MEMORY_LIMIT=512m
 RENDERER_MEMORY_LIMIT=512m
 INGESTION_MEMORY_LIMIT=512m
 EMBEDDING_MEMORY_LIMIT=512m
-CORE_CPU_LIMIT=1.5
+CORE_CPU_LIMIT=$THREADS.0
 UI_CPU_LIMIT=0.5
 RENDERER_CPU_LIMIT=0.75
 INGESTION_CPU_LIMIT=0.75
 EMBEDDING_CPU_LIMIT=1.0
+OLLAMA_MEMORY_LIMIT=$(( MEM_GB >= 16 ? 10 : 3 ))g
+OLLAMA_CPU_LIMIT=$(( CORES >= 8 ? CORES-2 : (CORES >= 4 ? CORES-1 : 2) )).0
 EOF
 else
   THREADS=$(( CORES >= 8 ? 3 : (CORES >= 4 ? 2 : 1) ))
@@ -148,10 +121,7 @@ EOF
 if [[ "$PROFILE" == "docker_cpu" ]]; then
   echo "  inference: Claude API (local 7B disabled for speed/memory)"
   echo "  embeddings: FastEmbed/ONNX CPU container"
-elif [[ "$PROFILE" == "apple_ollama" ]]; then
-  echo "  inference: native Ollama (${LOCAL_MODEL}) with ${ROUTING_MODE} routing"
+elif [[ "$PROFILE" == "container_ollama" ]]; then
+  echo "  inference: containerized Ollama (${LOCAL_MODEL}) with ${ROUTING_MODE} routing"
   echo "  embeddings: FastEmbed/ONNX CPU container"
-else
-  echo "  inference: native Apple MLX + selective Claude escalation"
-  echo "  embeddings: native Apple MLX"
 fi

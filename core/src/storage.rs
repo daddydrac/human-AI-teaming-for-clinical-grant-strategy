@@ -51,6 +51,36 @@ pub struct InternalSessionRecord {
     pub expires_at: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct StagedResearchSource {
+    pub source: FetchedSource,
+    pub validation_status: String,
+    pub confidence: f64,
+    pub supporting_excerpt: String,
+    pub explanation: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct StagedResearchQuery {
+    pub query: crate::workflow_artifacts::LiteratureQueryRecord,
+    pub terminal_status: String,
+    pub sources: Vec<StagedResearchSource>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StagedResearchRun {
+    pub id: String,
+    pub search_plan_version: i64,
+    pub solicitation_profile_version: i64,
+    pub framework_version: i64,
+    pub aim_set_version: i64,
+    pub search_provider: String,
+    pub started_at: String,
+    pub completed_at: String,
+    pub queries: Vec<StagedResearchQuery>,
+    pub failures: Vec<String>,
+}
+
 impl Store {
     fn configure(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -382,6 +412,68 @@ impl Store {
             if !Self::has_column(conn,"generation_runs","output_schema_json")?{conn.execute("ALTER TABLE generation_runs ADD COLUMN output_schema_json TEXT",[])?;}
             if !Self::has_column(conn,"generation_runs","output_schema_sha256")?{conn.execute("ALTER TABLE generation_runs ADD COLUMN output_schema_sha256 TEXT",[])?;}
         }
+        if current < 25 {
+            if !Self::has_column(conn,"research_queries","run_id")?{conn.execute("ALTER TABLE research_queries ADD COLUMN run_id TEXT",[])?;}
+            if !Self::has_column(conn,"research_queries","plan_query_id")?{conn.execute("ALTER TABLE research_queries ADD COLUMN plan_query_id TEXT",[])?;}
+            conn.execute_batch(r#"
+            CREATE TABLE IF NOT EXISTS research_runs(
+              id TEXT PRIMARY KEY,project_id TEXT NOT NULL,search_plan_version INTEGER NOT NULL,
+              input_manifest_json TEXT NOT NULL,input_manifest_sha256 TEXT NOT NULL,search_provider TEXT NOT NULL,
+              status TEXT NOT NULL CHECK(status IN ('running','complete','failed')),failure_json TEXT NOT NULL DEFAULT '[]',
+              started_by_user_id TEXT NOT NULL,started_at TEXT NOT NULL,completed_at TEXT,
+              manifest_artifact_version INTEGER,manifest_sha256 TEXT,
+              FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_research_runs_project ON research_runs(project_id,started_at DESC,id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_research_runs_active ON research_runs(project_id) WHERE status='running';
+            CREATE TABLE IF NOT EXISTS research_query_sources(
+              query_id INTEGER NOT NULL,source_id INTEGER NOT NULL,validation_status TEXT NOT NULL,
+              confidence REAL NOT NULL,supporting_excerpt TEXT NOT NULL,explanation TEXT NOT NULL,
+              PRIMARY KEY(query_id,source_id),FOREIGN KEY(query_id) REFERENCES research_queries(id) ON DELETE CASCADE,
+              FOREIGN KEY(source_id) REFERENCES research_sources(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS research_query_requirements(
+              query_id INTEGER NOT NULL,requirement_external_id TEXT NOT NULL,
+              PRIMARY KEY(query_id,requirement_external_id),
+              FOREIGN KEY(query_id) REFERENCES research_queries(id) ON DELETE CASCADE
+            );
+            "#)?;
+        }
+        if current < 26 {
+            conn.execute_batch(r#"
+            CREATE TABLE IF NOT EXISTS artifact_approval_events(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,project_id TEXT NOT NULL,artifact_type TEXT NOT NULL,
+              artifact_version INTEGER NOT NULL,actor_user_id TEXT NOT NULL,role_at_decision TEXT NOT NULL,
+              decision TEXT NOT NULL CHECK(decision IN ('approved','rejected')),notes TEXT,
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+              FOREIGN KEY(actor_user_id) REFERENCES users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_artifact_approval_events
+              ON artifact_approval_events(project_id,artifact_type,artifact_version,id);
+            INSERT INTO artifact_approval_events(
+              project_id,artifact_type,artifact_version,actor_user_id,role_at_decision,decision,notes,created_at
+            )
+            SELECT d.project_id,d.artifact_type,d.artifact_version,d.approver_user_id,
+                   d.role_at_approval,d.decision,d.notes,d.created_at
+            FROM artifact_approval_decisions d
+            WHERE NOT EXISTS(
+              SELECT 1 FROM artifact_approval_events e
+              WHERE e.project_id=d.project_id AND e.artifact_type=d.artifact_type
+                AND e.artifact_version=d.artifact_version AND e.actor_user_id=d.approver_user_id
+                AND e.decision=d.decision AND e.created_at=d.created_at
+            );
+            "#)?;
+        }
+        if current < 27 {
+            if !Self::has_column(conn,"projects","archived_at")? {
+                conn.execute("ALTER TABLE projects ADD COLUMN archived_at TEXT",[])?;
+            }
+            if !Self::has_column(conn,"projects","archived_by_user_id")? {
+                conn.execute("ALTER TABLE projects ADD COLUMN archived_by_user_id TEXT",[])?;
+            }
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_active_updated ON projects(archived_at,updated_at DESC)",[])?;
+        }
         // Section catalog backfill is idempotent and safe on every startup.
         conn.execute_batch(
             r#"
@@ -576,6 +668,7 @@ impl Store {
         CREATE TABLE IF NOT EXISTS research_queries(
           id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, requirement_external_id TEXT NOT NULL,
           query TEXT NOT NULL, preferred_domains_json TEXT NOT NULL, rationale TEXT, status TEXT NOT NULL DEFAULT 'queued',
+          run_id TEXT,plan_query_id TEXT,
           created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_research_queries ON research_queries(project_id,status,id);
@@ -585,6 +678,27 @@ impl Store {
           UNIQUE(project_id,url,content_sha256), FOREIGN KEY(query_id) REFERENCES research_queries(id)
         );
         CREATE INDEX IF NOT EXISTS idx_research_sources ON research_sources(project_id,query_id);
+        CREATE TABLE IF NOT EXISTS research_runs(
+          id TEXT PRIMARY KEY,project_id TEXT NOT NULL,search_plan_version INTEGER NOT NULL,
+          input_manifest_json TEXT NOT NULL,input_manifest_sha256 TEXT NOT NULL,search_provider TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('running','complete','failed')),failure_json TEXT NOT NULL DEFAULT '[]',
+          started_by_user_id TEXT NOT NULL,started_at TEXT NOT NULL,completed_at TEXT,
+          manifest_artifact_version INTEGER,manifest_sha256 TEXT,
+          FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_research_runs_project ON research_runs(project_id,started_at DESC,id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_research_runs_active ON research_runs(project_id) WHERE status='running';
+        CREATE TABLE IF NOT EXISTS research_query_sources(
+          query_id INTEGER NOT NULL,source_id INTEGER NOT NULL,validation_status TEXT NOT NULL,
+          confidence REAL NOT NULL,supporting_excerpt TEXT NOT NULL,explanation TEXT NOT NULL,
+          PRIMARY KEY(query_id,source_id),FOREIGN KEY(query_id) REFERENCES research_queries(id) ON DELETE CASCADE,
+          FOREIGN KEY(source_id) REFERENCES research_sources(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS research_query_requirements(
+          query_id INTEGER NOT NULL,requirement_external_id TEXT NOT NULL,
+          PRIMARY KEY(query_id,requirement_external_id),
+          FOREIGN KEY(query_id) REFERENCES research_queries(id) ON DELETE CASCADE
+        );
 
         CREATE TABLE IF NOT EXISTS evidence(
           id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, requirement_external_id TEXT,
@@ -789,7 +903,7 @@ impl Store {
             conn.execute("UPDATE project_workflows SET definition_version=?1,definition_sha256=?2,config_sha256=?3,config_json=?4 WHERE project_id=?5",
               params![workflow_registry.definition_version,definition_sha256,config_sha256,config_json,project_id])?;
         }
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(24)",[])?;
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(27)",[])?;
         Ok(Self {
             path: path_buf,
             workflow_registry,
@@ -1013,6 +1127,7 @@ impl Store {
         let solicitation=Self::latest_approved_artifact_json(&c,project,"solicitation_profile")?;
         let framework=Self::latest_approved_artifact_json(&c,project,"research_framework")?;
         let aims=Self::latest_approved_artifact_json(&c,project,"aim_set")?;
+        let search_plan=Self::latest_approved_artifact_json(&c,project,"literature_search_plan")?;
         let literature=Self::latest_approved_artifact_json(&c,project,"literature_manifest")?;
 
         let mut members=Vec::new();
@@ -1029,7 +1144,7 @@ impl Store {
         Ok(json!({
             "project_id":project,
             "contract":crate::workflow_artifacts::editor_contract_json(),
-            "approved_artifacts":{"solicitation_profile":solicitation,"research_framework":framework,"aim_set":aims,"literature_manifest":literature},
+            "approved_artifacts":{"solicitation_profile":solicitation,"research_framework":framework,"aim_set":aims,"literature_search_plan":search_plan,"literature_manifest":literature},
             "members":members,"evidence":evidence,"sources":sources,"citations":citations,"sections":sections
         }))
     }
@@ -1065,7 +1180,7 @@ impl Store {
     }
 
     fn validate_artifact_dependencies(c:&Connection,project:&str,artifact_type:&str,body:&Value)->Result<()>{
-        use crate::workflow_artifacts::{AimSet,LiteratureManifest,OpportunityFitAssessment,ProposalSnapshot,ResearchFramework,SolicitationProfile};
+        use crate::workflow_artifacts::{AimSet,LiteratureManifest,LiteratureSearchPlan,OpportunityFitAssessment,ProposalSnapshot,ResearchFramework,SolicitationProfile};
         match artifact_type{
             "solicitation_profile"=>{
                 let(total,approved):(i64,i64)=c.query_row("SELECT COUNT(*),COALESCE(SUM(approved),0) FROM requirements WHERE project_id=?1",[project],|row|Ok((row.get(0)?,row.get(1)?)))?;
@@ -1096,6 +1211,20 @@ impl Store {
                     if exists!=1{bail!("aim set references evidence {evidence_id} outside the project");}
                 }
             }
+            "literature_search_plan"=>{
+                let plan:LiteratureSearchPlan=serde_json::from_value(body.clone())?;
+                let profile:SolicitationProfile=serde_json::from_value(Self::approved_artifact_body_at(c,project,"solicitation_profile",plan.solicitation_profile_version)?)?;
+                let _=Self::approved_artifact_body_at(c,project,"research_framework",plan.framework_version)?;
+                let aims:AimSet=serde_json::from_value(Self::approved_artifact_body_at(c,project,"aim_set",plan.aim_set_version)?)?;
+                let valid_aims:BTreeSet<&str>=aims.aims.iter().map(|aim|aim.id.as_str()).collect();
+                let valid_requirements:BTreeSet<&str>=profile.requirements.iter().map(|fact|fact.id.as_str()).collect();
+                let valid_criteria:BTreeSet<&str>=profile.review_criteria.iter().map(|criterion|criterion.id.as_str()).collect();
+                for query in &plan.queries{
+                    for id in &query.aim_ids{if !valid_aims.contains(id.as_str()){bail!("literature query {} references unknown aim {id}",query.id);}}
+                    for id in &query.requirement_ids{if !valid_requirements.contains(id.as_str()){bail!("literature query {} references unknown solicitation requirement {id}",query.id);}}
+                    for id in &query.criterion_ids{if !valid_criteria.contains(id.as_str()){bail!("literature query {} references unknown review criterion {id}",query.id);}}
+                }
+            }
             "literature_manifest"=>{
                 let manifest:LiteratureManifest=serde_json::from_value(body.clone())?;
                 let profile:SolicitationProfile=serde_json::from_value(Self::approved_artifact_body_at(c,project,"solicitation_profile",manifest.solicitation_profile_version)?)?;
@@ -1104,6 +1233,10 @@ impl Store {
                 let valid_aims:BTreeSet<&str>=aims.aims.iter().map(|aim|aim.id.as_str()).collect();
                 let valid_requirements:BTreeSet<&str>=profile.requirements.iter().map(|fact|fact.id.as_str()).collect();
                 let valid_criteria:BTreeSet<&str>=profile.review_criteria.iter().map(|criterion|criterion.id.as_str()).collect();
+                if let Some(search_plan_version)=manifest.search_plan_version{
+                    let plan:LiteratureSearchPlan=serde_json::from_value(Self::approved_artifact_body_at(c,project,"literature_search_plan",search_plan_version)?)?;
+                    if plan.queries!=manifest.queries{bail!("literature manifest queries differ from the exact approved search plan");}
+                }
                 for query in &manifest.queries{
                     for id in &query.aim_ids{if !valid_aims.contains(id.as_str()){bail!("literature query {} references unknown aim {id}",query.id);}}
                     for id in &query.requirement_ids{if !valid_requirements.contains(id.as_str()){bail!("literature query {} references unknown solicitation requirement {id}",query.id);}}
@@ -1268,7 +1401,7 @@ impl Store {
         Ok(row.and_then(|(version, approved)| approved.then_some(version)))
     }
 
-    fn workflow_artifact_is_fresh(&self, project: &str, artifact_type: &str) -> Result<bool> {
+    pub fn workflow_artifact_is_fresh(&self, project: &str, artifact_type: &str) -> Result<bool> {
         let artifact = self.workflow_artifact_json(project, artifact_type)?;
         if !artifact.get("approved").and_then(Value::as_bool).unwrap_or(false) {
             return Ok(false);
@@ -1285,14 +1418,24 @@ impl Store {
                 self.current_approved_artifact_version(project, "research_framework")?
                     == Some(aims.framework_version)
             }
+            "literature_search_plan" => {
+                let plan:crate::workflow_artifacts::LiteratureSearchPlan=serde_json::from_value(body)?;
+                self.current_approved_artifact_version(project,"solicitation_profile")?==Some(plan.solicitation_profile_version)
+                    && self.current_approved_artifact_version(project,"research_framework")?==Some(plan.framework_version)
+                    && self.current_approved_artifact_version(project,"aim_set")?==Some(plan.aim_set_version)
+            }
             "literature_manifest" => {
                 let manifest: crate::workflow_artifacts::LiteratureManifest = serde_json::from_value(body)?;
-                self.current_approved_artifact_version(project, "solicitation_profile")?
+                let upstream_fresh=self.current_approved_artifact_version(project, "solicitation_profile")?
                     == Some(manifest.solicitation_profile_version)
                     && self.current_approved_artifact_version(project, "research_framework")?
                         == Some(manifest.framework_version)
-                    && self.current_approved_artifact_version(project, "aim_set")?
-                        == Some(manifest.aim_set_version)
+                    && self.current_approved_artifact_version(project, "aim_set")? == Some(manifest.aim_set_version);
+                upstream_fresh && match manifest.search_plan_version{
+                    Some(version)=>self.current_approved_artifact_version(project,"literature_search_plan")?==Some(version)
+                        && self.workflow_artifact_is_fresh(project,"literature_search_plan")?,
+                    None=>manifest.schema_version==1,
+                }
             }
             "opportunity_fit" => {
                 let assessment: crate::workflow_artifacts::OpportunityFitAssessment =
@@ -1328,7 +1471,8 @@ impl Store {
                 config.enabled(&module.step.key)
                     && module.step.artifact_type.as_deref() == Some(artifact_type)
             });
-        if !core_artifact && !enabled_artifact {
+        let auxiliary_core_artifact=artifact_type=="literature_search_plan";
+        if !core_artifact && !enabled_artifact && !auxiliary_core_artifact {
             bail!("workflow artifact type is not enabled for this project: {artifact_type}");
         }
         crate::workflow_artifacts::validate_artifact_document(artifact_type, body, false)?;
@@ -1356,53 +1500,169 @@ impl Store {
         self.workflow_artifact_json(project, artifact_type)
     }
 
-    pub fn finalize_research_run(
+    pub fn begin_research_run(
         &self,
         project: &str,
-        query_statuses: &[(i64, String)],
-        manifest: &Value,
-    ) -> Result<Value> {
-        crate::workflow_artifacts::validate_artifact_document("literature_manifest", manifest, false)?;
-        let raw = serde_json::to_string(manifest)?;
-        let sha = sha256_hex(raw.as_bytes());
-        let mut c = self.conn()?;
-        Self::validate_artifact_source_anchors(&c, project, manifest)?;
-        let tx = c.transaction()?;
-        Self::validate_artifact_dependencies(&tx, project, "literature_manifest", manifest)?;
-        for (query_id, status) in query_statuses {
-            if !matches!(status.as_str(), "complete" | "complete_no_sources" | "failed") {
-                bail!("unsupported terminal research query status: {status}");
-            }
-            let changed = tx.execute(
-                "UPDATE research_queries SET status=?1 WHERE id=?2 AND project_id=?3",
-                params![status, query_id, project],
-            )?;
-            if changed != 1 {
-                bail!("research query {query_id} does not belong to this project");
-            }
+        search_plan_version: i64,
+        search_provider: &str,
+        actor: &str,
+        started_at: &str,
+    ) -> Result<String> {
+        if actor.trim().is_empty() || search_provider.trim().is_empty() {
+            bail!("research run requires an authenticated actor and search provider");
         }
-        let current: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(version),0) FROM workflow_artifacts WHERE project_id=?1 AND artifact_type='literature_manifest'",
-            [project],
-            |row| row.get(0),
+        let plan = self.workflow_artifact_json(project, "literature_search_plan")?;
+        if plan.get("version").and_then(Value::as_i64) != Some(search_plan_version)
+            || !plan.get("approved").and_then(Value::as_bool).unwrap_or(false)
+            || !self.workflow_artifact_is_fresh(project, "literature_search_plan")?
+        {
+            bail!("the selected literature search plan is missing, unapproved, or stale");
+        }
+        let manifest = json!({
+            "search_plan_version": search_plan_version,
+            "search_plan_sha256": plan.get("sha256"),
+            "search_plan": plan.get("body"),
+            "workflow": self.workflow_config_record_json(project)?
+        });
+        let manifest_json = serde_json::to_string(&manifest)?;
+        let manifest_sha = sha256_hex(manifest_json.as_bytes());
+        let run_id = Uuid::new_v4().to_string();
+        self.conn()?.execute(
+            "INSERT INTO research_runs(id,project_id,search_plan_version,input_manifest_json,input_manifest_sha256,search_provider,status,started_by_user_id,started_at) VALUES(?1,?2,?3,?4,?5,?6,'running',?7,?8)",
+            params![run_id,project,search_plan_version,manifest_json,manifest_sha,search_provider,actor,started_at],
+        ).context("another literature research run is already active for this project")?;
+        Ok(run_id)
+    }
+
+    pub fn fail_research_run(&self, project: &str, run_id: &str, failures: &[String], completed_at: &str) -> Result<()> {
+        let failure_json = serde_json::to_string(failures)?;
+        let changed = self.conn()?.execute(
+            "UPDATE research_runs SET status='failed',failure_json=?1,completed_at=?2 WHERE id=?3 AND project_id=?4 AND status='running'",
+            params![failure_json,completed_at,run_id,project],
         )?;
-        let version = current + 1;
-        tx.execute(
-            "INSERT INTO workflow_artifacts(project_id,artifact_type,version,body_json,content_sha256,source) VALUES(?1,'literature_manifest',?2,?3,?4,'research_pipeline')",
-            params![project, version, raw, sha],
+        if changed != 1 { bail!("active research run not found"); }
+        Ok(())
+    }
+
+    pub fn finalize_research_run_atomic(&self, project: &str, run: &StagedResearchRun) -> Result<Value> {
+        if run.queries.is_empty() { bail!("research run has no staged queries"); }
+        let mut c = self.conn()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (status, stored_plan_version):(String,i64)=tx.query_row(
+            "SELECT status,search_plan_version FROM research_runs WHERE id=?1 AND project_id=?2",
+            params![run.id,project],|row|Ok((row.get(0)?,row.get(1)?)),
+        ).context("research run not found")?;
+        if status != "running" || stored_plan_version != run.search_plan_version {
+            bail!("research run is not active for the approved search plan");
+        }
+        let plan_raw:String=tx.query_row(
+            "SELECT body_json FROM workflow_artifacts WHERE project_id=?1 AND artifact_type='literature_search_plan' AND version=?2 AND approved=1",
+            params![project,run.search_plan_version],|row|row.get(0),
+        ).context("approved search plan disappeared before research commit")?;
+        let plan:crate::workflow_artifacts::LiteratureSearchPlan=serde_json::from_str(&plan_raw)?;
+        if plan.solicitation_profile_version!=run.solicitation_profile_version
+            || plan.framework_version!=run.framework_version
+            || plan.aim_set_version!=run.aim_set_version {
+            bail!("staged research inputs do not match the approved search plan");
+        }
+        let latest_plan_version:i64=tx.query_row(
+            "SELECT COALESCE(MAX(version),0) FROM workflow_artifacts WHERE project_id=?1 AND artifact_type='literature_search_plan'",
+            [project],|row|row.get(0),
         )?;
-        tx.execute(
-            "INSERT INTO workflow_events(project_id,event_type,payload_json) VALUES(?1,'research_run_finalized',?2)",
-            params![project, serde_json::to_string(&json!({
-                "run_id":manifest.get("run_id"),
-                "artifact_version":version,
-                "artifact_sha256":sha,
-                "query_count":query_statuses.len()
-            }))?],
-        )?;
-        Self::touch_project_conn(&tx, project)?;
-        tx.commit()?;
-        self.workflow_artifact_json(project, "literature_manifest")
+        if latest_plan_version!=run.search_plan_version{bail!("the literature search plan changed while research was running");}
+        for (artifact_type,expected_version) in [
+            ("solicitation_profile",run.solicitation_profile_version),
+            ("research_framework",run.framework_version),
+            ("aim_set",run.aim_set_version),
+        ]{
+            let current:Option<(i64,bool)>=tx.query_row(
+                "SELECT version,approved!=0 FROM workflow_artifacts WHERE project_id=?1 AND artifact_type=?2 ORDER BY version DESC LIMIT 1",
+                params![project,artifact_type],|row|Ok((row.get(0)?,row.get(1)?)),
+            ).optional()?;
+            if current!=Some((expected_version,true)){bail!("{artifact_type} changed or lost approval while research was running");}
+        }
+        let planned:std::collections::BTreeMap<&str,&crate::workflow_artifacts::LiteratureQueryRecord>=
+            plan.queries.iter().map(|query|(query.id.as_str(),query)).collect();
+        if planned.len()!=run.queries.len(){bail!("staged research query count does not match the approved search plan");}
+
+        let mut query_manifest=Vec::new();
+        let mut evidence_needs=Vec::new();
+        let mut source_ids=BTreeSet::new();
+        let mut citation_ids=BTreeSet::new();
+        let mut contradictions=Vec::new();
+        let mut seen_queries=BTreeSet::new();
+        let mut sources_saved=0usize;
+        for staged in &run.queries {
+            let Some(approved_query)=planned.get(staged.query.id.as_str()) else{bail!("staged query {} is not in the approved search plan",staged.query.id);};
+            if *approved_query!=&staged.query{bail!("staged query {} differs from the approved search plan",staged.query.id);}
+            if !seen_queries.insert(staged.query.id.as_str()){bail!("duplicate staged query {}",staged.query.id);}
+            if !matches!(staged.terminal_status.as_str(),"complete"|"complete_no_sources"|"failed"){
+                bail!("unsupported terminal research query status: {}",staged.terminal_status);
+            }
+            let primary_requirement=staged.query.requirement_ids.first().context("approved research query has no requirement")?;
+            tx.execute(
+                "INSERT INTO research_queries(project_id,requirement_external_id,query,preferred_domains_json,rationale,status,run_id,plan_query_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![project,primary_requirement,staged.query.query,serde_json::to_string(&staged.query.preferred_domains)?,staged.query.rationale,staged.terminal_status,run.id,staged.query.id],
+            )?;
+            let query_id=tx.last_insert_rowid();
+            for requirement_id in &staged.query.requirement_ids{
+                tx.execute("INSERT INTO research_query_requirements(query_id,requirement_external_id) VALUES(?1,?2)",params![query_id,requirement_id])?;
+            }
+            let mut supported_evidence_ids=Vec::new();
+            for assessed in &staged.sources {
+                if !matches!(assessed.validation_status.as_str(),"supported"|"partially_supported"|"contradicted"|"irrelevant"){
+                    bail!("unsupported source validation status: {}",assessed.validation_status);
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO research_sources(project_id,query_id,title,url,text,retrieved_at,content_sha256,http_status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![project,query_id,assessed.source.title,assessed.source.url,assessed.source.text,assessed.source.retrieved_at,assessed.source.sha256,assessed.source.status],
+                )?;
+                let source_id:i64=tx.query_row("SELECT id FROM research_sources WHERE project_id=?1 AND url=?2 AND content_sha256=?3",params![project,assessed.source.url,assessed.source.sha256],|row|row.get(0))?;
+                tx.execute(
+                    "INSERT INTO research_query_sources(query_id,source_id,validation_status,confidence,supporting_excerpt,explanation) VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![query_id,source_id,assessed.validation_status,assessed.confidence.clamp(0.0,1.0),assessed.supporting_excerpt,assessed.explanation],
+                )?;
+                source_ids.insert(source_id);sources_saved+=1;
+                if assessed.validation_status=="irrelevant"{continue;}
+                let exact=!assessed.supporting_excerpt.trim().is_empty()&&assessed.source.text.contains(&assessed.supporting_excerpt);
+                let passage=if exact{assessed.supporting_excerpt.clone()}else{assessed.source.text.chars().take(1800).collect::<String>()};
+                let evidence_status=if exact{assessed.validation_status.as_str()}else{"candidate"};
+                tx.execute(
+                    "INSERT INTO evidence(project_id,requirement_external_id,source_type,source_ref,claim,passage,source_url,confidence,status) VALUES(?1,?2,'external_research',?3,?4,?5,?6,?7,?8)",
+                    params![project,primary_requirement,format!("research_source:{source_id}"),staged.query.rationale,passage,assessed.source.url,assessed.confidence.clamp(0.0,1.0),evidence_status],
+                )?;
+                let evidence_id=tx.last_insert_rowid();
+                if matches!(evidence_status,"supported"|"partially_supported"){supported_evidence_ids.push(evidence_id);}
+                if exact&&assessed.validation_status=="contradicted"{contradictions.push(format!("{}: {}",staged.query.rationale,assessed.explanation));}
+                tx.execute(
+                    "INSERT INTO citations(project_id,evidence_id,citation_key,title,url,passage,content_sha256,verified) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![project,evidence_id,format!("SRC-{source_id}"),assessed.source.title,assessed.source.url,passage,assessed.source.sha256,exact as i64],
+                )?;
+                citation_ids.insert(tx.last_insert_rowid());
+            }
+            let disposition=if supported_evidence_ids.is_empty(){"unresolved_risk"}else{"supported"};
+            evidence_needs.push(json!({"evidence_need_id":staged.query.id,"disposition":disposition,"evidence_ids":supported_evidence_ids,"rationale":staged.query.rationale}));
+            query_manifest.push(serde_json::to_value(&staged.query)?);
+        }
+        if seen_queries.len()!=planned.len(){bail!("not every approved search-plan query was staged");}
+        let manifest=json!({
+            "schema_version":2,"run_id":run.id,"search_plan_version":run.search_plan_version,
+            "solicitation_profile_version":run.solicitation_profile_version,"framework_version":run.framework_version,
+            "aim_set_version":run.aim_set_version,"started_at":run.started_at,"completed_at":run.completed_at,
+            "search_provider":run.search_provider,"queries":query_manifest,"evidence_needs":evidence_needs,
+            "source_ids":source_ids,"citation_ids":citation_ids,"contradictions":contradictions
+        });
+        crate::workflow_artifacts::validate_artifact_document("literature_manifest",&manifest,false)?;
+        Self::validate_artifact_dependencies(&tx,project,"literature_manifest",&manifest)?;
+        let raw=serde_json::to_string(&manifest)?;let sha=sha256_hex(raw.as_bytes());
+        let version:i64=tx.query_row("SELECT COALESCE(MAX(version),0)+1 FROM workflow_artifacts WHERE project_id=?1 AND artifact_type='literature_manifest'",[project],|row|row.get(0))?;
+        tx.execute("INSERT INTO workflow_artifacts(project_id,artifact_type,version,body_json,content_sha256,source) VALUES(?1,'literature_manifest',?2,?3,?4,'atomic_research_pipeline')",params![project,version,raw,sha])?;
+        tx.execute("UPDATE research_runs SET status='complete',failure_json=?1,completed_at=?2,manifest_artifact_version=?3,manifest_sha256=?4 WHERE id=?5 AND project_id=?6 AND status='running'",params![serde_json::to_string(&run.failures)?,run.completed_at,version,sha,run.id,project])?;
+        tx.execute("INSERT INTO workflow_events(project_id,event_type,payload_json) VALUES(?1,'research_run_finalized',?2)",params![project,serde_json::to_string(&json!({"run_id":run.id,"search_plan_version":run.search_plan_version,"artifact_version":version,"artifact_sha256":sha,"query_count":run.queries.len(),"source_count":sources_saved,"isolated_failures":run.failures.len()}))?])?;
+        Self::touch_project_conn(&tx,project)?;tx.commit()?;
+        let mut artifact=self.workflow_artifact_json(project,"literature_manifest")?;
+        artifact["sources_saved"]=json!(sources_saved);
+        Ok(artifact)
     }
 
     pub fn approve_workflow_artifact(
@@ -1413,7 +1673,7 @@ impl Store {
         approver: Option<&str>,
     ) -> Result<Value> {
         let config = self.workflow_config(project)?;
-        let enabled = self
+        let enabled = artifact_type=="literature_search_plan" || self
             .workflow_registry
             .core_steps
             .iter()
@@ -1441,6 +1701,16 @@ impl Store {
         crate::workflow_artifacts::validate_artifact_document(artifact_type, &body, true)?;
         Self::validate_artifact_source_anchors(&tx,project,&body)?;
         Self::validate_artifact_dependencies(&tx,project,artifact_type,&body)?;
+        if let Some(user_id)=approver {
+            let role:String=tx.query_row(
+                "SELECT role FROM project_members WHERE project_id=?1 AND user_id=?2",
+                params![project,user_id],|row|row.get(0),
+            ).context("artifact approver is not a project member")?;
+            tx.execute(
+                "INSERT INTO artifact_approval_events(project_id,artifact_type,artifact_version,actor_user_id,role_at_decision,decision) VALUES(?1,?2,?3,?4,?5,'approved')",
+                params![project,artifact_type,version,user_id,role],
+            )?;
+        }
         let approval_progress = if artifact_type != "collaboration_record" {
             Self::record_configured_artifact_approval(&tx,project,artifact_type,version,approver)?
         } else {
@@ -1465,7 +1735,7 @@ impl Store {
         };
         let section_approval_invalidation = if matches!(
             artifact_type,
-            "solicitation_profile" | "research_framework" | "aim_set" | "literature_manifest"
+            "solicitation_profile" | "research_framework" | "aim_set" | "literature_search_plan" | "literature_manifest"
         ) {
             Self::invalidate_section_approvals(&tx, project, artifact_type, version)?
         } else {
@@ -1495,6 +1765,70 @@ impl Store {
         Ok(artifact)
     }
 
+    pub fn return_workflow_artifact_for_revision(
+        &self,
+        project:&str,
+        artifact_type:&str,
+        version:i64,
+        actor:&str,
+        rationale:&str,
+    )->Result<Value>{
+        let rationale=rationale.trim();
+        if rationale.is_empty(){bail!("a revision rationale is required");}
+        if rationale.chars().count()>4000{bail!("revision rationale exceeds 4000 characters");}
+        let config=self.workflow_config(project)?;
+        let enabled=artifact_type=="literature_search_plan"
+            || self.workflow_registry.core_steps.iter().any(|step|step.artifact_type.as_deref()==Some(artifact_type))
+            || self.workflow_registry.optional_modules.iter().any(|module|config.enabled(&module.step.key)&&module.step.artifact_type.as_deref()==Some(artifact_type));
+        if !enabled{bail!("workflow artifact type is not enabled for this project: {artifact_type}");}
+        let mut c=self.conn()?;
+        let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let role:String=tx.query_row(
+            "SELECT role FROM project_members WHERE project_id=?1 AND user_id=?2",
+            params![project,actor],|row|row.get(0),
+        ).context("revision actor is not a project member")?;
+        let latest:Option<(i64,bool)>=tx.query_row(
+            "SELECT version,approved!=0 FROM workflow_artifacts WHERE project_id=?1 AND artifact_type=?2 ORDER BY version DESC LIMIT 1",
+            params![project,artifact_type],|row|Ok((row.get(0)?,row.get(1)?)),
+        ).optional()?;
+        let Some((latest_version,approved))=latest else{bail!("workflow artifact does not exist");};
+        if latest_version!=version{bail!("only the latest workflow artifact version can be returned; latest is {latest_version}");}
+        let pending_approvals:i64=tx.query_row(
+            "SELECT COUNT(*) FROM artifact_approval_decisions WHERE project_id=?1 AND artifact_type=?2 AND artifact_version=?3 AND decision='approved'",
+            params![project,artifact_type,version],|row|row.get(0),
+        )?;
+        if !approved&&pending_approvals==0{bail!("the selected artifact version is neither approved nor awaiting configured approvals");}
+        tx.execute(
+            "UPDATE workflow_artifacts SET approved=0 WHERE project_id=?1 AND artifact_type=?2 AND version=?3",
+            params![project,artifact_type,version],
+        )?;
+        tx.execute(
+            "UPDATE artifact_approval_decisions SET decision='rejected',notes=?1,created_at=CURRENT_TIMESTAMP WHERE project_id=?2 AND artifact_type=?3 AND artifact_version=?4",
+            params![rationale,project,artifact_type,version],
+        )?;
+        tx.execute(
+            "INSERT INTO artifact_approval_events(project_id,artifact_type,artifact_version,actor_user_id,role_at_decision,decision,notes) VALUES(?1,?2,?3,?4,?5,'rejected',?6)",
+            params![project,artifact_type,version,actor,role,rationale],
+        )?;
+        let section_invalidation=if matches!(artifact_type,"solicitation_profile"|"research_framework"|"aim_set"|"literature_search_plan"|"literature_manifest"){
+            Self::invalidate_section_approvals(&tx,project,artifact_type,version)?
+        }else{None};
+        let event=json!({
+            "artifact_type":artifact_type,"version":version,"decision":"returned_for_revision",
+            "rationale":rationale,"role_at_decision":role,"prior_approval_votes":pending_approvals,
+            "section_approvals_invalidated":section_invalidation,"history_preserved":true
+        });
+        tx.execute(
+            "INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'workflow_artifact_returned_for_revision',?2,?3)",
+            params![project,actor,serde_json::to_string(&event)?],
+        )?;
+        Self::touch_project_conn(&tx,project)?;
+        tx.commit()?;
+        let mut artifact=self.workflow_artifact_json(project,artifact_type)?;
+        artifact["return_decision"]=event;
+        Ok(artifact)
+    }
+
     fn record_configured_artifact_approval(
         tx:&Transaction<'_>,
         project:&str,
@@ -1518,10 +1852,10 @@ impl Store {
         Ok(Some(json!({"artifact_type":artifact_type,"artifact_version":version,"approvals":approvals,"minimum_approvals":route.minimum_approvals,"threshold_met":approvals>=route.minimum_approvals as i64})))
     }
 
-    pub fn list_projects_json(&self) -> Result<Value> {
+    pub fn list_projects_json(&self,include_archived:bool) -> Result<Value> {
         let c = self.conn()?;
-        let mut st=c.prepare("SELECT id,title,sponsor,mechanism,created_at,COALESCE(updated_at,created_at) FROM projects ORDER BY COALESCE(updated_at,created_at) DESC LIMIT 250")?;
-        let rows=st.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"sponsor":r.get::<_,Option<String>>(2)?,"mechanism":r.get::<_,Option<String>>(3)?,"created_at":r.get::<_,String>(4)?,"updated_at":r.get::<_,String>(5)?})))?;
+        let mut st=c.prepare("SELECT id,title,sponsor,mechanism,created_at,COALESCE(updated_at,created_at),archived_at FROM projects WHERE (?1=1 OR archived_at IS NULL) ORDER BY archived_at IS NOT NULL,COALESCE(updated_at,created_at) DESC LIMIT 250")?;
+        let rows=st.query_map([include_archived as i64],|r|Ok(json!({"id":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"sponsor":r.get::<_,Option<String>>(2)?,"mechanism":r.get::<_,Option<String>>(3)?,"created_at":r.get::<_,String>(4)?,"updated_at":r.get::<_,String>(5)?,"archived_at":r.get::<_,Option<String>>(6)?})))?;
         let mut out = Vec::new();
         for row in rows {
             let mut value=row?;
@@ -1702,15 +2036,47 @@ impl Store {
     }
 
     pub fn project_role(&self,project:&str,user_id:&str)->Result<Option<String>> {
-        Ok(self.conn()?.query_row("SELECT role FROM project_members WHERE project_id=?1 AND user_id=?2",params![project,user_id],|row|row.get(0)).optional()?)
+        let mut c=self.conn()?;let tx=c.transaction()?;
+        let role=tx.query_row("SELECT role FROM project_members WHERE project_id=?1 AND user_id=?2",params![project,user_id],|row|row.get(0)).optional()?;
+        if role.is_some(){tx.execute("UPDATE project_members SET last_seen_at=CURRENT_TIMESTAMP WHERE project_id=?1 AND user_id=?2",params![project,user_id])?;}
+        tx.commit()?;Ok(role)
     }
 
-    pub fn list_projects_for_user_json(&self,user_id:&str)->Result<Value> {
+    pub fn list_projects_for_user_json(&self,user_id:&str,organization_id:&str,include_archived:bool)->Result<Value> {
         let c=self.conn()?;
-        let mut st=c.prepare(r#"SELECT p.id,p.title,p.sponsor,p.mechanism,p.created_at,COALESCE(p.updated_at,p.created_at),pm.role
-          FROM projects p JOIN project_members pm ON pm.project_id=p.id WHERE pm.user_id=?1 ORDER BY COALESCE(p.updated_at,p.created_at) DESC LIMIT 250"#)?;
-        let rows=st.query_map([user_id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"sponsor":r.get::<_,Option<String>>(2)?,"mechanism":r.get::<_,Option<String>>(3)?,"created_at":r.get::<_,String>(4)?,"updated_at":r.get::<_,String>(5)?,"role":r.get::<_,String>(6)?})))?;
+        let mut st=c.prepare(r#"SELECT p.id,p.title,p.sponsor,p.mechanism,p.created_at,COALESCE(p.updated_at,p.created_at),COALESCE(mine.role,'contributor'),p.archived_at
+          FROM projects p
+          LEFT JOIN project_members mine ON mine.project_id=p.id AND mine.user_id=?1
+          WHERE EXISTS(SELECT 1 FROM project_members pm JOIN users u ON u.id=pm.user_id WHERE pm.project_id=p.id AND u.organization_id=?2)
+            AND (?3=1 OR p.archived_at IS NULL)
+          ORDER BY p.archived_at IS NOT NULL,COALESCE(p.updated_at,p.created_at) DESC LIMIT 250"#)?;
+        let rows=st.query_map(params![user_id,organization_id,include_archived as i64],|r|Ok(json!({"id":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"sponsor":r.get::<_,Option<String>>(2)?,"mechanism":r.get::<_,Option<String>>(3)?,"created_at":r.get::<_,String>(4)?,"updated_at":r.get::<_,String>(5)?,"role":r.get::<_,String>(6)?,"archived_at":r.get::<_,Option<String>>(7)?})))?;
         let mut out=Vec::new();for row in rows{let mut value=row?;let id=value.get("id").and_then(Value::as_str).unwrap_or_default();value["stage"]=json!(self.compatibility_stage(id)?);out.push(value);}Ok(json!(out))
+    }
+
+    pub fn ensure_organization_project_member(&self,project:&str,user_id:&str,organization_id:&str)->Result<Option<String>>{
+        if let Some(role)=self.project_role(project,user_id)?{return Ok(Some(role));}
+        let c=self.conn()?;
+        let project_org:Option<String>=c.query_row("SELECT u.organization_id FROM project_members pm JOIN users u ON u.id=pm.user_id WHERE pm.project_id=?1 AND u.active=1 ORDER BY CASE pm.role WHEN 'owner' THEN 0 ELSE 1 END,pm.joined_at LIMIT 1",[project],|row|row.get(0)).optional()?;
+        if project_org.as_deref()!=Some(organization_id){return Ok(None);}
+        drop(c);self.add_project_member(project,user_id,"contributor",None)?;Ok(Some("contributor".into()))
+    }
+
+    pub fn update_project_metadata(&self,project:&str,title:Option<&str>,archived:Option<bool>,actor:&str)->Result<Value>{
+        let normalized_title=title.map(str::trim);
+        if normalized_title.is_some_and(str::is_empty){bail!("project title cannot be empty");}
+        if normalized_title.is_some_and(|value|value.chars().count()>240){bail!("project title cannot exceed 240 characters");}
+        let mut c=self.conn()?;let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current:(String,Option<String>)=tx.query_row("SELECT title,archived_at FROM projects WHERE id=?1",[project],|row|Ok((row.get(0)?,row.get(1)?))).context("project not found")?;
+        let next_title=normalized_title.unwrap_or(&current.0);
+        match archived{
+            Some(true)=>{tx.execute("UPDATE projects SET title=?1,archived_at=COALESCE(archived_at,CURRENT_TIMESTAMP),archived_by_user_id=CASE WHEN archived_at IS NULL THEN ?2 ELSE archived_by_user_id END,updated_at=CURRENT_TIMESTAMP WHERE id=?3",params![next_title,actor,project])?;}
+            Some(false)=>{tx.execute("UPDATE projects SET title=?1,archived_at=NULL,archived_by_user_id=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?2",params![next_title,project])?;}
+            None=>{tx.execute("UPDATE projects SET title=?1,updated_at=CURRENT_TIMESTAMP WHERE id=?2",params![next_title,project])?;}
+        }
+        let event_type=match archived{Some(true)=>"project_archived",Some(false)=>"project_restored",None=>"project_metadata_updated"};
+        tx.execute("INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,?2,?3,?4)",params![project,event_type,actor,json!({"previous_title":current.0,"title":next_title,"archived":archived}).to_string()])?;
+        tx.commit()?;self.project_json(project)
     }
 
     pub fn ensure_project_channel(&self,project:&str,kind:&str,subject_key:Option<&str>,name:&str,created_by:&str)->Result<String>{
@@ -1724,10 +2090,11 @@ impl Store {
 
     pub fn project_json(&self, id: &str) -> Result<Value> {
         let c = self.conn()?;
-        let mut project=c.query_row("SELECT id,title,sponsor,mechanism,created_at,COALESCE(updated_at,created_at),interview_generated FROM projects WHERE id=?1",[id],|r|Ok(json!({
+        let mut project=c.query_row("SELECT id,title,sponsor,mechanism,created_at,COALESCE(updated_at,created_at),interview_generated,archived_at,archived_by_user_id FROM projects WHERE id=?1",[id],|r|Ok(json!({
             "id":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"sponsor":r.get::<_,Option<String>>(2)?,
             "mechanism":r.get::<_,Option<String>>(3)?,"created_at":r.get::<_,String>(4)?,
-            "updated_at":r.get::<_,String>(5)?,"interview_generated":r.get::<_,i64>(6)?!=0
+            "updated_at":r.get::<_,String>(5)?,"interview_generated":r.get::<_,i64>(6)?!=0,
+            "archived_at":r.get::<_,Option<String>>(7)?,"archived_by_user_id":r.get::<_,Option<String>>(8)?
         }))).context("project not found")?;
         project["stage"]=json!(self.compatibility_stage(id)?);
         Ok(project)
@@ -2043,8 +2410,8 @@ impl Store {
         let c = self.conn()?;
         let mut members = Vec::new();
         {
-            let mut st=c.prepare("SELECT u.id,u.display_name,u.email,pm.role,pm.joined_at,pm.last_seen_at FROM project_members pm JOIN users u ON u.id=pm.user_id WHERE pm.project_id=?1 ORDER BY pm.last_seen_at DESC")?;
-            let rows=st.query_map([project],|r|Ok(json!({"user_id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"email":r.get::<_,Option<String>>(2)?,"role":r.get::<_,String>(3)?,"joined_at":r.get::<_,String>(4)?,"last_seen_at":r.get::<_,String>(5)?})))?;
+            let mut st=c.prepare("SELECT u.id,u.display_name,u.email,pm.role,pm.joined_at,pm.last_seen_at,pm.last_seen_at>=datetime('now','-15 seconds') FROM project_members pm JOIN users u ON u.id=pm.user_id WHERE pm.project_id=?1 ORDER BY pm.last_seen_at DESC")?;
+            let rows=st.query_map([project],|r|Ok(json!({"user_id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"email":r.get::<_,Option<String>>(2)?,"role":r.get::<_,String>(3)?,"joined_at":r.get::<_,String>(4)?,"last_seen_at":r.get::<_,String>(5)?,"present":r.get::<_,i64>(6)?!=0})))?;
             for row in rows {
                 members.push(row?);
             }
@@ -2185,7 +2552,12 @@ impl Store {
 
     pub fn create_task(&self,project:&str,title:&str,description:&str,owner:&str,source:&str,priority:&str,due_at:Option<&str>,created_by:&str,dependencies:&[String])->Result<Value>{
         let title=title.trim();if title.is_empty()||title.len()>500{bail!("task title must contain 1-500 characters");}if !matches!(priority,"low"|"normal"|"high"|"critical"){bail!("invalid task priority");}
-        let id=Uuid::new_v4().to_string();let mut c=self.conn()?;let tx=c.transaction()?;let owner_member:i64=tx.query_row("SELECT COUNT(*) FROM project_members WHERE project_id=?1 AND user_id=?2",params![project,owner],|r|r.get(0))?;if owner_member!=1{bail!("task owner must be a project member");}
+        let id=Uuid::new_v4().to_string();let mut c=self.conn()?;
+        if let Some(due)=due_at{
+            let valid:i64=c.query_row("SELECT julianday(?1) IS NOT NULL",[due],|row|row.get(0))?;
+            if valid!=1{bail!("task due date must be an ISO-8601 date or timestamp");}
+        }
+        let tx=c.transaction()?;let owner_member:i64=tx.query_row("SELECT COUNT(*) FROM project_members WHERE project_id=?1 AND user_id=?2",params![project,owner],|r|r.get(0))?;if owner_member!=1{bail!("task owner must be a project member");}
         tx.execute("INSERT INTO tasks(id,project_id,title,description,owner_user_id,source,priority,due_at,created_by_user_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id,project,title,description,owner,source,priority,due_at,created_by])?;for dependency in dependencies{let valid:i64=tx.query_row("SELECT COUNT(*) FROM tasks WHERE id=?1 AND project_id=?2",params![dependency,project],|r|r.get(0))?;if valid!=1{bail!("task dependency {dependency} is outside this project");}tx.execute("INSERT INTO task_dependencies(task_id,depends_on_task_id) VALUES(?1,?2)",params![id,dependency])?;}tx.execute("INSERT INTO notifications(user_id,project_id,kind,payload_json) VALUES(?1,?2,'task_assigned',?3)",params![owner,project,serde_json::to_string(&json!({"task_id":id,"title":title}))?])?;tx.commit()?;Ok(json!({"id":id}))
     }
 
@@ -2280,6 +2652,13 @@ impl Store {
             bail!("section version {version_id} does not belong to project/section");
         }
         let approval_type=format!("section:{key}");
+        let role:Option<String>=if let Some(user)=actor{tx.query_row("SELECT role FROM project_members WHERE project_id=?1 AND user_id=?2",params![project,user],|row|row.get(0)).optional()?}else{None};
+        if let (Some(user),Some(role))=(actor,role.as_deref()){
+            tx.execute(
+                "INSERT INTO artifact_approval_events(project_id,artifact_type,artifact_version,actor_user_id,role_at_decision,decision) VALUES(?1,?2,?3,?4,?5,'approved')",
+                params![project,approval_type,version_id,user,role],
+            )?;
+        }
         let approval_progress=Self::record_configured_artifact_approval(&tx,project,&approval_type,version_id,actor)?;
         if let Some(progress)=&approval_progress{
             if !progress.get("threshold_met").and_then(Value::as_bool).unwrap_or(false){
@@ -2296,7 +2675,6 @@ impl Store {
             "UPDATE section_versions SET approved=1 WHERE id=?1",
             [version_id],
         )?;
-        let role:Option<String>=if let Some(user)=actor{tx.query_row("SELECT role FROM project_members WHERE project_id=?1 AND user_id=?2",params![project,user],|row|row.get(0)).optional()?}else{None};
         tx.execute("INSERT INTO approvals(project_id,section_key,version_id,approved_by,approver_user_id,role_at_approval,decision) VALUES(?1,?2,?3,?4,?4,?5,'approved')",params![project,key,version_id,actor,role])?;
         // Any explicit post-update human approval resolves pending competitive text proposals for this section.
         // The human may approve the proposed version, an edited derivative, or deliberately re-approve the prior text.
@@ -2307,6 +2685,65 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(json!({"section_key":key,"approved_version":version_id,"approved":true,"approval_progress":approval_progress}))
+    }
+
+    pub fn return_section_for_revision(
+        &self,
+        project:&str,
+        key:&str,
+        version_id:i64,
+        actor:&str,
+        rationale:&str,
+    )->Result<Value>{
+        let rationale=rationale.trim();
+        if rationale.is_empty(){bail!("a revision rationale is required");}
+        if rationale.chars().count()>4000{bail!("revision rationale exceeds 4000 characters");}
+        let mut c=self.conn()?;
+        let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let role:String=tx.query_row(
+            "SELECT role FROM project_members WHERE project_id=?1 AND user_id=?2",
+            params![project,actor],|row|row.get(0),
+        ).context("revision actor is not a project member")?;
+        let latest:Option<(i64,bool)>=tx.query_row(
+            "SELECT id,approved!=0 FROM section_versions WHERE project_id=?1 AND section_key=?2 ORDER BY id DESC LIMIT 1",
+            params![project,key],|row|Ok((row.get(0)?,row.get(1)?)),
+        ).optional()?;
+        let Some((latest_version,approved))=latest else{bail!("proposal section has no saved version");};
+        if latest_version!=version_id{bail!("only the latest section version can be returned; latest is {latest_version}");}
+        let approval_type=format!("section:{key}");
+        let pending_approvals:i64=tx.query_row(
+            "SELECT COUNT(*) FROM artifact_approval_decisions WHERE project_id=?1 AND artifact_type=?2 AND artifact_version=?3 AND decision='approved'",
+            params![project,approval_type,version_id],|row|row.get(0),
+        )?;
+        if !approved&&pending_approvals==0{bail!("the selected section version is neither approved nor awaiting configured approvals");}
+        tx.execute(
+            "UPDATE section_versions SET approved=0 WHERE project_id=?1 AND section_key=?2 AND id=?3",
+            params![project,key,version_id],
+        )?;
+        tx.execute(
+            "UPDATE artifact_approval_decisions SET decision='rejected',notes=?1,created_at=CURRENT_TIMESTAMP WHERE project_id=?2 AND artifact_type=?3 AND artifact_version=?4",
+            params![rationale,project,approval_type,version_id],
+        )?;
+        tx.execute(
+            "INSERT INTO artifact_approval_events(project_id,artifact_type,artifact_version,actor_user_id,role_at_decision,decision,notes) VALUES(?1,?2,?3,?4,?5,'rejected',?6)",
+            params![project,approval_type,version_id,actor,role,rationale],
+        )?;
+        tx.execute(
+            "INSERT INTO approvals(project_id,section_key,version_id,approved_by,approver_user_id,role_at_approval,decision,notes) VALUES(?1,?2,?3,?4,?4,?5,'rejected',?6)",
+            params![project,key,version_id,actor,role,rationale],
+        )?;
+        let event=json!({
+            "section_key":key,"version":version_id,"decision":"returned_for_revision",
+            "rationale":rationale,"role_at_decision":role,"prior_approval_votes":pending_approvals,
+            "history_preserved":true
+        });
+        tx.execute(
+            "INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'section_returned_for_revision',?2,?3)",
+            params![project,actor,serde_json::to_string(&event)?],
+        )?;
+        Self::touch_project_conn(&tx,project)?;
+        tx.commit()?;
+        Ok(event)
     }
 
     pub fn approved_sections_json(&self, project: &str) -> Result<Value> {
@@ -2882,6 +3319,109 @@ impl Store {
         Ok(
             json!({"definitions":self.workflow_registry.as_json()?,"config":self.workflow_config(project)?,"status":status}),
         )
+    }
+
+    pub fn project_health_json(&self,project:&str)->Result<Value>{
+        let workflow=self.workflow_status_json(project)?;
+        let config=self.workflow_config(project)?;
+        let tasks=self.tasks_json(project)?;
+        let routing=self.approval_routing_status_json(project)?;
+        let c=self.conn()?;
+        let now_julian:f64=c.query_row("SELECT julianday('now')",[],|row|row.get(0))?;
+        let mut issues=Vec::new();
+
+        for step in workflow.get("steps").and_then(Value::as_array).into_iter().flatten(){
+            let status=step.get("status").and_then(Value::as_str).unwrap_or_default();
+            if status=="blocked"{
+                issues.push(json!({
+                    "severity":"high","kind":"blocked_gate","code":format!("blocked_gate_{}",step.get("key").and_then(Value::as_str).unwrap_or("unknown")),
+                    "title":format!("{} is blocked",step.get("title").and_then(Value::as_str).unwrap_or("Workflow step")),
+                    "detail":"One or more prerequisite workflow steps are incomplete.","step_key":step.get("key"),
+                    "owner_user_id":null,"due_at":null,"remediation":format!("Complete the prerequisites, then reopen {}.",step.get("title").and_then(Value::as_str).unwrap_or("this step"))
+                }));
+            }else if status=="awaiting_review"{
+                issues.push(json!({
+                    "severity":"medium","kind":"pending_review","code":format!("pending_review_{}",step.get("key").and_then(Value::as_str).unwrap_or("unknown")),
+                    "title":format!("{} is awaiting review",step.get("title").and_then(Value::as_str).unwrap_or("Workflow step")),
+                    "detail":"Current work exists but the step has not reached its configured completion gate.","step_key":step.get("key"),
+                    "owner_user_id":null,"due_at":null,"remediation":format!("Review and approve the current output for {}.",step.get("title").and_then(Value::as_str).unwrap_or("this step"))
+                }));
+            }
+        }
+
+        let artifact_definitions=self.workflow_registry.core_steps.iter()
+            .chain(self.workflow_registry.optional_modules.iter().filter(|module|config.enabled(&module.step.key)).map(|module|&module.step))
+            .filter(|step|matches!(step.completion_evaluator.as_str(),"artifact_approved"|"solicitation_approved"|"collaboration_routing_complete"));
+        for definition in artifact_definitions{
+            let Some(artifact_type)=definition.artifact_type.as_deref() else{continue;};
+            let artifact=self.workflow_artifact_json(project,artifact_type)?;
+            if artifact.get("version").and_then(Value::as_i64).is_some()
+                && artifact.get("approved").and_then(Value::as_bool).unwrap_or(false)
+                && !self.workflow_artifact_is_fresh(project,artifact_type)?{
+                issues.push(json!({
+                    "severity":"high","kind":"stale_artifact","code":format!("stale_artifact_{artifact_type}"),
+                    "title":format!("{} is stale",definition.title),
+                    "detail":"An approved upstream version changed after this artifact was approved.","step_key":definition.key,
+                    "owner_user_id":null,"due_at":null,"remediation":"Regenerate or correct the artifact against the current approved inputs, then approve the new exact version."
+                }));
+            }
+        }
+
+        for task in tasks.as_array().into_iter().flatten(){
+            let status=task.get("status").and_then(Value::as_str).unwrap_or_default();
+            if matches!(status,"complete"|"cancelled"){continue;}
+            let priority=task.get("priority").and_then(Value::as_str).unwrap_or("normal");
+            let title=task.get("title").and_then(Value::as_str).unwrap_or("Project task");
+            let owner=task.get("owner_user_id").cloned().unwrap_or(Value::Null);
+            let due=task.get("due_at").and_then(Value::as_str);
+            if status=="blocked"{
+                issues.push(json!({"severity":if priority=="critical"{"critical"}else{"high"},"kind":"blocked_task","code":format!("blocked_task_{}",task.get("id").and_then(Value::as_str).unwrap_or("unknown")),"title":format!("Blocked task: {title}"),"detail":task.get("description"),"step_key":null,"owner_user_id":owner,"due_at":due,"remediation":"Resolve the blocking dependency or reassign the task."}));
+            }
+            if let Some(due)=due{
+                let due_julian:Option<f64>=c.query_row("SELECT julianday(?1)",[due],|row|row.get(0))?;
+                match due_julian{
+                    Some(value) if value<now_julian=>issues.push(json!({"severity":if priority=="critical"{"critical"}else{"high"},"kind":"overdue_task","code":format!("overdue_task_{}",task.get("id").and_then(Value::as_str).unwrap_or("unknown")),"title":format!("Overdue task: {title}"),"detail":task.get("description"),"step_key":null,"owner_user_id":owner,"due_at":due,"remediation":"Complete, reassign, or set a defensible new due date."})),
+                    None=>issues.push(json!({"severity":"medium","kind":"invalid_task_date","code":format!("invalid_task_date_{}",task.get("id").and_then(Value::as_str).unwrap_or("unknown")),"title":format!("Task has an invalid due date: {title}"),"detail":format!("The stored value '{due}' is not an ISO-8601 date or timestamp."),"step_key":null,"owner_user_id":owner,"due_at":due,"remediation":"Replace the due date with an ISO-8601 date or timestamp."})),
+                    _=>{}
+                }
+            }
+        }
+
+        for route in routing.get("routes").and_then(Value::as_array).into_iter().flatten(){
+            if route.get("current_version").and_then(Value::as_i64).is_some()&&!route.get("approved").and_then(Value::as_bool).unwrap_or(false){
+                let approvals=route.get("approvals").and_then(Value::as_i64).unwrap_or(0);
+                let required=route.get("minimum_approvals").and_then(Value::as_i64).unwrap_or(1);
+                issues.push(json!({"severity":"medium","kind":"pending_approval","code":format!("pending_approval_{}",route.get("artifact_type").and_then(Value::as_str).unwrap_or("unknown")),"title":format!("Approval pending: {}",route.get("title").and_then(Value::as_str).unwrap_or("workflow artifact")),"detail":format!("{approvals} of {required} configured approvals are recorded."),"step_key":null,"owner_user_id":route.get("owner_user_id"),"due_at":null,"remediation":"A configured approver must review the exact current version."}));
+            }
+        }
+
+        let open_comments:i64=c.query_row("SELECT COUNT(*) FROM comments WHERE project_id=?1 AND resolved_at IS NULL",[project],|row|row.get(0))?;
+        if open_comments>0{
+            issues.push(json!({"severity":"medium","kind":"open_comments","code":"open_version_comments","title":format!("{open_comments} unresolved version comment(s)"),"detail":"Comments remain open on immutable artifact or section versions.","step_key":null,"owner_user_id":null,"due_at":null,"remediation":"Address or explicitly resolve each comment in its version thread."}));
+        }
+
+        let literature=self.workflow_artifact_json(project,"literature_manifest")?;
+        if let Some(body)=literature.get("body").filter(|value|value.is_object()){
+            let unresolved=body.get("evidence_needs").and_then(Value::as_array).map(|items|items.iter().filter(|item|item.get("disposition").and_then(Value::as_str)==Some("unresolved_risk")).count()).unwrap_or(0);
+            let contradictions=body.get("contradictions").and_then(Value::as_array).map_or(0,Vec::len);
+            if unresolved>0{issues.push(json!({"severity":"high","kind":"evidence_risk","code":"unresolved_evidence_risks","title":format!("{unresolved} unresolved evidence risk(s)"),"detail":"The literature manifest records evidence needs that are not supported or waived.","step_key":"literature","owner_user_id":null,"due_at":null,"remediation":"Add grounded evidence, record a justified waiver, or retain the item as an explicit proposal risk."}));}
+            if contradictions>0{issues.push(json!({"severity":"medium","kind":"evidence_contradiction","code":"literature_contradictions","title":format!("{contradictions} evidence contradiction(s) require review"),"detail":"The literature manifest contains conflicting findings that must remain visible in drafting.","step_key":"literature","owner_user_id":null,"due_at":null,"remediation":"Resolve the interpretation or document how the proposal handles the contradiction."}));}
+        }
+
+        if let Some(deadline)=config.target_deadline.as_deref().filter(|value|!value.trim().is_empty()){
+            let deadline_julian:Option<f64>=c.query_row("SELECT julianday(?1)",[deadline],|row|row.get(0))?;
+            match deadline_julian{
+                Some(value) if !workflow.get("ready").and_then(Value::as_bool).unwrap_or(false)&&value<now_julian=>issues.push(json!({"severity":"critical","kind":"submission_deadline","code":"submission_deadline_passed","title":"Target submission deadline has passed","detail":format!("The configured target deadline was {deadline}."),"step_key":null,"owner_user_id":null,"due_at":deadline,"remediation":"Project leadership must set a valid revised target or close the project."})),
+                Some(value) if !workflow.get("ready").and_then(Value::as_bool).unwrap_or(false)&&value-now_julian<=7.0=>issues.push(json!({"severity":"high","kind":"submission_deadline","code":"submission_deadline_near","title":"Submission deadline is within seven days","detail":format!("The configured target deadline is {deadline} and required gates remain open."),"step_key":null,"owner_user_id":null,"due_at":deadline,"remediation":"Prioritize blocking gates, overdue tasks, and pending approvals."})),
+                None=>issues.push(json!({"severity":"medium","kind":"invalid_submission_deadline","code":"invalid_submission_deadline","title":"Configured submission deadline is invalid","detail":format!("The stored value '{deadline}' is not an ISO-8601 date or timestamp."),"step_key":null,"owner_user_id":null,"due_at":deadline,"remediation":"Update the project workflow with a valid ISO-8601 deadline."})),
+                _=>{}
+            }
+        }
+
+        let count=|severity:&str|issues.iter().filter(|item|item.get("severity").and_then(Value::as_str)==Some(severity)).count();
+        let critical=count("critical");let high=count("high");let medium=count("medium");
+        let state=if workflow.get("ready").and_then(Value::as_bool).unwrap_or(false)&&critical==0&&high==0{"ready"}else if critical>0{"critical"}else if high>0||medium>0{"at_risk"}else{"on_track"};
+        Ok(json!({"state":state,"ready":workflow.get("ready"),"summary":{"critical":critical,"high":high,"medium":medium,"total":issues.len()},"issues":issues,"workflow":workflow,"generated_at_unix":time::OffsetDateTime::now_utc().unix_timestamp()}))
     }
 
     pub fn proposed_reviewer_roles_json(&self, project: &str) -> Result<Value> {
@@ -5101,6 +5641,22 @@ mod phase6_storage_tests {
         })
     }
 
+    fn approve_test_framework_aims_and_search_plan(store:&Store,project:&str,solicitation_version:i64)->Result<(i64,i64,i64,crate::workflow_artifacts::LiteratureQueryRecord)>{
+        let framework=store.save_workflow_artifact(project,"research_framework",&framework_body(solicitation_version),"test",Some("test-user"),Some(0))?;
+        let framework_version=framework.get("version").and_then(Value::as_i64).context("framework version")?;
+        store.approve_workflow_artifact(project,"research_framework",framework_version,Some("test-user"))?;
+        let aims=json!({"schema_version":1,"framework_version":framework_version,"overall_objective":"Determine whether the proposed strategy addresses the need.","central_hypothesis_or_thesis":"The strategy will produce a measurable benefit.","aims":[{"id":"aim_1","title":"Evaluate the strategy","statement":"Evaluate the proposed strategy in the target population.","rationale":"The solicitation requires a rigorous research strategy.","approach_summary":"Use a prespecified comparative analysis.","expected_outcome":"A defensible estimate of the strategy's effect.","impact":"The result will inform future implementation.","innovation":"The work integrates sponsor criteria into the design.","classification":"assumption","dependencies":[],"supporting_evidence_ids":[]}]});
+        let aim_set=store.save_workflow_artifact(project,"aim_set",&aims,"test",Some("test-user"),Some(0))?;
+        let aim_set_version=aim_set.get("version").and_then(Value::as_i64).context("aim-set version")?;
+        store.approve_workflow_artifact(project,"aim_set",aim_set_version,Some("test-user"))?;
+        let query=crate::workflow_artifacts::LiteratureQueryRecord{id:"query_primary_evidence".into(),query:"comparative effectiveness target population primary study".into(),rationale:"Resolve the scientific-premise evidence gap.".into(),aim_ids:vec!["aim_1".into()],requirement_ids:vec!["R-001".into()],criterion_ids:vec!["C-001".into()],preferred_domains:vec!["nih.gov".into()]};
+        let plan=serde_json::to_value(crate::workflow_artifacts::LiteratureSearchPlan{schema_version:1,solicitation_profile_version:solicitation_version,framework_version,aim_set_version,queries:vec![query.clone()]})?;
+        let saved_plan=store.save_workflow_artifact(project,"literature_search_plan",&plan,"test",Some("test-user"),Some(0))?;
+        let plan_version=saved_plan.get("version").and_then(Value::as_i64).context("search-plan version")?;
+        store.approve_workflow_artifact(project,"literature_search_plan",plan_version,Some("test-user"))?;
+        Ok((framework_version,aim_set_version,plan_version,query))
+    }
+
     #[test]
     fn framework_approval_rebuilds_active_sections_without_deleting_version_history() -> Result<()> {
         let path = temp_db("framework-sections");
@@ -5181,6 +5737,53 @@ mod phase6_storage_tests {
     }
 
     #[test]
+    fn human_returns_are_exact_version_scoped_and_preserve_approval_history() -> Result<()> {
+        let path=temp_db("human-return-for-revision");
+        let store=Store::open(&path)?;
+        store.upsert_identity("test-user","test-org",Some("test@example.org"),"Test user")?;
+        let project="human-return-for-revision-project";
+        store.create_project_with_workflow(
+            project,"Human control",None,None,&["Specific Aims".into()],
+            &store.default_workflow_config()?,Some("test-user"),
+        )?;
+        store.add_project_member(project,"test-user","owner",None)?;
+        let solicitation_version=approve_test_solicitation(&store,project,"Human-controlled purpose")?;
+        let section_version=store.save_section_by(
+            project,"specific_aims","Specific Aims","Approved narrative",None,"human_edit",Some("test-user"),
+        )?;
+        store.approve_section_version_by(project,"specific_aims",section_version,Some("test-user"))?;
+
+        let section_return=store.return_section_for_revision(
+            project,"specific_aims",section_version,"test-user","The outcome statement needs investigator correction.",
+        )?;
+        assert_eq!(section_return.get("decision").and_then(Value::as_str),Some("returned_for_revision"));
+        assert_eq!(store.section_state_json(project,"specific_aims")?.pointer("/latest/approved").and_then(Value::as_bool),Some(false));
+        assert!(store.return_section_for_revision(project,"specific_aims",section_version,"test-user","Repeat return").is_err());
+        store.approve_section_version_by(project,"specific_aims",section_version,Some("test-user"))?;
+
+        let artifact_return=store.return_workflow_artifact_for_revision(
+            project,"solicitation_profile",solicitation_version,"test-user","Sponsor criterion mapping must be corrected.",
+        )?;
+        assert_eq!(artifact_return.get("approved").and_then(Value::as_bool),Some(false));
+        assert_eq!(store.section_state_json(project,"specific_aims")?.pointer("/latest/approved").and_then(Value::as_bool),Some(false));
+        assert!(store.return_workflow_artifact_for_revision(project,"solicitation_profile",solicitation_version,"test-user","Repeat return").is_err());
+
+        let c=store.conn()?;
+        let artifact_events:i64=c.query_row(
+            "SELECT COUNT(*) FROM artifact_approval_events WHERE project_id=?1 AND artifact_type='solicitation_profile' AND artifact_version=?2 AND decision IN ('approved','rejected')",
+            params![project,solicitation_version],|row|row.get(0),
+        )?;
+        assert_eq!(artifact_events,2);
+        let section_decisions:i64=c.query_row(
+            "SELECT COUNT(*) FROM approvals WHERE project_id=?1 AND section_key='specific_aims' AND version_id=?2 AND decision IN ('approved','rejected')",
+            params![project,section_version],|row|row.get(0),
+        )?;
+        assert_eq!(section_decisions,3);
+        let _=std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
     fn artifact_approval_rejects_unknown_and_cross_project_references() -> Result<()> {
         let path = temp_db("artifact-reference-integrity");
         let store = Store::open(&path)?;
@@ -5207,6 +5810,37 @@ mod phase6_storage_tests {
         assert_eq!(context.pointer("/members/0/user_id").and_then(Value::as_str),Some("test-user"));
         let _=std::fs::remove_file(path);
         Ok(())
+    }
+
+    #[test]
+    fn research_run_commit_is_atomic_and_bound_to_the_approved_plan()->Result<()>{
+        let path=temp_db("atomic-research-run");let store=Store::open(&path)?;let project="atomic-research-project";
+        store.create_project_with_workflow(project,"Atomic research",None,None,&[],&store.default_workflow_config()?,Some("test-user"))?;
+        store.upsert_identity("test-user","test-org",Some("test@example.org"),"Test user")?;
+        store.add_project_member(project,"test-user","owner",Some("test-user"))?;
+        let solicitation_version=approve_test_solicitation(&store,project,"Test atomic research")?;
+        let(framework_version,aim_set_version,plan_version,query)=approve_test_framework_aims_and_search_plan(&store,project,solicitation_version)?;
+
+        let failed_run=store.begin_research_run(project,plan_version,"test_provider","test-user","2026-08-23T12:00:00Z")?;
+        let mut wrong_query=query.clone();wrong_query.id="not_in_the_approved_plan".into();
+        let invalid=StagedResearchRun{id:failed_run.clone(),search_plan_version:plan_version,solicitation_profile_version:solicitation_version,framework_version,aim_set_version,search_provider:"test_provider".into(),started_at:"2026-08-23T12:00:00Z".into(),completed_at:"2026-08-23T12:01:00Z".into(),queries:vec![StagedResearchQuery{query:wrong_query,terminal_status:"complete_no_sources".into(),sources:vec![]}],failures:vec![]};
+        assert!(store.finalize_research_run_atomic(project,&invalid).is_err());
+        let c=store.conn()?;
+        for table in ["research_queries","research_sources","evidence","citations"]{let sql=format!("SELECT COUNT(*) FROM {table} WHERE project_id=?1");let count:i64=c.query_row(&sql,[project],|row|row.get(0))?;assert_eq!(count,0,"{table} must roll back with the failed run");}
+        drop(c);
+        store.fail_research_run(project,&failed_run,&["approved-plan mismatch".into()],"2026-08-23T12:01:00Z")?;
+
+        let run_id=store.begin_research_run(project,plan_version,"test_provider","test-user","2026-08-23T13:00:00Z")?;
+        let source_text="The comparative study found a measurable benefit in the target population.";
+        let run=StagedResearchRun{id:run_id.clone(),search_plan_version:plan_version,solicitation_profile_version:solicitation_version,framework_version,aim_set_version,search_provider:"test_provider".into(),started_at:"2026-08-23T13:00:00Z".into(),completed_at:"2026-08-23T13:01:00Z".into(),queries:vec![StagedResearchQuery{query,terminal_status:"complete".into(),sources:vec![StagedResearchSource{source:FetchedSource{title:"Primary comparative study".into(),url:"https://example.org/primary-study".into(),text:source_text.into(),retrieved_at:"2026-08-23T13:00:30Z".into(),sha256:sha256_hex(source_text.as_bytes()),status:200},validation_status:"supported".into(),confidence:0.94,supporting_excerpt:source_text.into(),explanation:"The exact excerpt directly supports the evidence need.".into()}]}],failures:vec![]};
+        let artifact=store.finalize_research_run_atomic(project,&run)?;
+        assert_eq!(artifact.pointer("/body/schema_version").and_then(Value::as_i64),Some(2));
+        assert_eq!(artifact.pointer("/body/search_plan_version").and_then(Value::as_i64),Some(plan_version));
+        assert_eq!(artifact.pointer("/body/evidence_needs/0/disposition").and_then(Value::as_str),Some("supported"));
+        let c=store.conn()?;
+        for table in ["research_queries","research_sources","evidence","citations"]{let sql=format!("SELECT COUNT(*) FROM {table} WHERE project_id=?1");let count:i64=c.query_row(&sql,[project],|row|row.get(0))?;assert_eq!(count,1,"{table} should commit exactly once");}
+        let status:String=c.query_row("SELECT status FROM research_runs WHERE id=?1",[&run_id],|row|row.get(0))?;assert_eq!(status,"complete");drop(c);
+        let _=std::fs::remove_file(path);Ok(())
     }
 
     #[test]
@@ -5256,6 +5890,10 @@ mod phase6_storage_tests {
         let first_id=first.get("id").and_then(Value::as_str).context("first task ID")?.to_owned();
         let second=store.create_task(project,"Verify attachments","","owner-user","human","normal",None,"owner-user",std::slice::from_ref(&first_id))?;
         let second_id=second.get("id").and_then(Value::as_str).context("second task ID")?;
+        assert!(store.create_task(project,"Invalid due date","","owner-user","human","normal",Some("not-a-date"),"owner-user",&[]).is_err());
+        let overdue=store.create_task(project,"Resolve blocked review","Waiting on an assigned methodological correction.","owner-user","human","critical",Some("2000-01-01T00:00:00Z"),"owner-user",&[])?;
+        let overdue_id=overdue.get("id").and_then(Value::as_str).context("overdue task ID")?.to_owned();
+        store.update_task_status(project,&overdue_id,"blocked","owner-user","owner")?;
         let tasks=store.tasks_json(project)?;
         let dependent=tasks.as_array().and_then(|items|items.iter().find(|item|item.get("id").and_then(Value::as_str)==Some(second_id))).context("dependent task")?;
         assert_eq!(dependent.pointer("/dependencies/0").and_then(Value::as_str),Some(first_id.as_str()));
@@ -5272,6 +5910,12 @@ mod phase6_storage_tests {
         let status=store.approval_routing_status_json(project)?;
         assert_eq!(status.get("configured").and_then(Value::as_bool),Some(true));
         assert_eq!(status.pointer("/routes/0/artifact_type").and_then(Value::as_str),Some("section:specific_aims"));
+        let health=store.project_health_json(project)?;
+        assert_eq!(health.get("state").and_then(Value::as_str),Some("critical"));
+        let issue_codes:std::collections::BTreeSet<&str>=health.get("issues").and_then(Value::as_array).context("health issues")?.iter().filter_map(|item|item.get("code").and_then(Value::as_str)).collect();
+        assert!(issue_codes.contains(format!("blocked_task_{overdue_id}").as_str()));
+        assert!(issue_codes.contains(format!("overdue_task_{overdue_id}").as_str()));
+        assert!(issue_codes.contains("open_version_comments"));
         let _=std::fs::remove_file(path);Ok(())
     }
 
@@ -5682,6 +6326,25 @@ mod phase6_storage_tests {
         assert!(store.password_reset_user("reset-sha")?.is_none());
         assert!(store.consume_password_reset("reset-sha","replay-hash").is_err());
         assert!(store.internal_session("session-sha")?.is_none());
+        let _=std::fs::remove_file(path);Ok(())
+    }
+
+    #[test]
+    fn saved_projects_can_be_renamed_archived_and_restored_without_data_loss() -> Result<()> {
+        let path=temp_db("project-lifecycle");let store=Store::open(&path)?;let project="persistent-grant";
+        store.create_project(project,"Original title",Some("Sponsor"),Some("Mechanism"),&["Specific Aims".into()])?;
+        let version=store.save_section(project,"specific_aims","Specific Aims","Persisted grant text",None,"human_edit")?;
+        store.update_project_metadata(project,Some("Renamed grant"),Some(true),"owner-user")?;
+        assert_eq!(store.list_projects_json(false)?.as_array().map(Vec::len),Some(0));
+        let archived=store.list_projects_json(true)?;assert_eq!(archived.pointer("/0/title").and_then(Value::as_str),Some("Renamed grant"));
+        assert!(archived.pointer("/0/archived_at").is_some_and(|value|!value.is_null()));
+        assert_eq!(store.section_version_json(project,"specific_aims",version)?.get("body").and_then(Value::as_str),Some("Persisted grant text"));
+        store.update_project_metadata(project,None,Some(false),"owner-user")?;
+        assert_eq!(store.list_projects_json(false)?.pointer("/0/id").and_then(Value::as_str),Some(project));
+        assert!(store.project_json(project)?.get("archived_at").is_some_and(Value::is_null));
+        let events=store.workflow_events_json(project,20)?;
+        assert!(events.as_array().is_some_and(|items|items.iter().any(|item|item.get("event_type").and_then(Value::as_str)==Some("project_archived"))));
+        assert!(events.as_array().is_some_and(|items|items.iter().any(|item|item.get("event_type").and_then(Value::as_str)==Some("project_restored"))));
         let _=std::fs::remove_file(path);Ok(())
     }
 }

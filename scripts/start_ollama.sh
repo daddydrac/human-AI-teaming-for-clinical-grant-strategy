@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
   echo "The apple_ollama profile requires an Apple Silicon Mac." >&2
   exit 2
 fi
 if ! command -v ollama >/dev/null 2>&1; then
-  echo "Ollama is required. Install it from https://ollama.com/download/mac and rerun ./start.sh." >&2
-  exit 3
+  "$ROOT/scripts/bootstrap_dependencies.sh"
 fi
 
 MODEL="${LOCAL_LLM_API_MODEL:-${OLLAMA_MODEL:-qwen3:1.7b}}"

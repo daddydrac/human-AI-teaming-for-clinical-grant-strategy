@@ -19,7 +19,10 @@ echo "  Local provider/model: ${LOCAL_LLM_PROVIDER:-legacy}/${LOCAL_LLM_API_MODE
 echo "  OMP/Rayon/BLAS: ${OMP_NUM_THREADS:-?}/${RAYON_NUM_THREADS:-?}/${OPENBLAS_NUM_THREADS:-?}"
 echo "  Competitive refresh: ${COMPETITIVE_REFRESH_TTL_SECONDS:-14400}s"
 echo "  Exports: ${GRANT_EXPORT_HOME:-./exports}"
-if [[ "${GRANT_RUNTIME_PROFILE:-}" == "apple_ollama" ]]; then
-  curl -fsS "http://127.0.0.1:${OLLAMA_PORT:-11434}/api/version" 2>/dev/null || echo "  Ollama: unavailable"
+if docker info >/dev/null 2>&1; then
+  docker compose ps || true
+  if [[ "${GRANT_RUNTIME_PROFILE:-}" == "container_ollama" ]]; then
+    docker compose exec -T ollama ollama list 2>/dev/null || echo "  Containerized Ollama: unavailable"
+  fi
+  curl -fsS http://127.0.0.1:8080/health/ready 2>/dev/null || true
 fi
-if docker info >/dev/null 2>&1; then docker compose ps || true; curl -fsS http://127.0.0.1:8080/health/ready 2>/dev/null || true; fi

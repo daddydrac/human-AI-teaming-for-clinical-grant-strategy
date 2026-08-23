@@ -627,7 +627,7 @@ Exit: a lean project completes all five core steps with every optional module di
 - Add real identities, membership, RBAC, project channels, tasks, comments, authorship, diffs, conflict handling, and rollback-as-new-version.
 - Add shared deployment profile and operational guidance.
 
-Exit: two authenticated browser sessions can edit safely, detect conflicts, discuss, review, approve, and restore with a complete audit trail.
+Exit: multiple authenticated browser sessions can edit safely, detect conflicts, discuss, review, approve, and restore with a complete audit trail.
 
 ### Phase 5 — Optional module adapters
 
@@ -707,15 +707,22 @@ privacy/routing summary:
 
 | Hardware profile | Local runtime | Default routing | Intended responsibility |
 |---|---|---|---|
-| M4, 24 GB, OLMo 3 | Native MLX, 7B 4-bit | Hybrid with Claude required | Local bounded drafting; Claude for sponsor interpretation, evidence validation, compliance, causal/review work, and high-value synthesis |
-| M4, 24 GB, Qwen 3 | Native MLX, 8B 4-bit | Hybrid with Claude required | Same routing boundary, with Qwen as the replaceable local drafting engine |
-| M2, 8 GB | Native Ollama, Qwen 3 1.7B Q4 plus CPU embeddings | Local-only by explicit choice; hybrid recommended for high-stakes use | Privacy-first, bounded drafting and development; do not present the small model as equivalent to the M4 or Claude review path |
+| M4, 24 GB, OLMo 3 | Docker Ollama, OLMo 3 7B Q4 plus Docker CPU embeddings | Hybrid with Claude required | Portable bounded drafting; Claude for sponsor interpretation, evidence validation, compliance, causal/review work, and high-value synthesis |
+| M4, 24 GB, Qwen 3 | Docker Ollama, Qwen 3 8B plus Docker CPU embeddings | Hybrid with Claude required | Same routing boundary, with Qwen as the replaceable local drafting engine |
+| M2, 8 GB | Docker Ollama, Qwen 3 1.7B plus Docker CPU embeddings | Local-only by explicit choice; hybrid recommended for high-stakes use | Privacy-first, bounded drafting and development; do not present the small model as equivalent to the M4 or Claude review path |
 
 The provider-neutral `LOCAL_LLM_*` contract supersedes model-family-specific
 names while retaining `OLMO_*` aliases during migration. A local-only setting
 must prevent all proposal content from being sent to Claude. A hybrid setting
 must show which task kinds are cloud-routed before execution and record the
 provider/model on every generated artifact.
+
+All supported application runtimes are containerized. Docker volumes persist
+the database, project artifacts, embedding cache, and Ollama models across
+logoff, restart, upgrade, and normal `docker compose down` operations. Docker
+Desktop is the only host runtime prerequisite; Apple Metal acceleration is not
+available inside Docker Desktop's Linux virtual machine, so portable local-model
+profiles intentionally use CPU inference.
 
 ## 15. Initial release scope and exclusions
 

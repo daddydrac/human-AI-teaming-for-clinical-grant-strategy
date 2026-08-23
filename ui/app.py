@@ -21,6 +21,7 @@ WORKSPACE=Path(os.getenv("GRANT_WORKSPACE","/workspace"))
 ORGANIZATION_NAME=os.getenv("ORGANIZATION_NAME","Organization")
 CONFIG_ROOT=Path(os.getenv("UI_CONFIG_ROOT",str(Path(__file__).resolve().parents[1]/"config")))
 COMPETITIVE_UI_POLL_SECONDS=max(60,min(86400,int(os.getenv("COMPETITIVE_UI_POLL_SECONDS","14400"))))
+COLLABORATION_UI_POLL_SECONDS=max(2,min(60,int(os.getenv("COLLABORATION_UI_POLL_SECONDS","5"))))
 COMPETITIVE_UPDATE_LABEL=os.getenv("COMPETITIVE_UPDATE_LABEL","Competitive Edge Auto-Update").strip() or "Competitive Edge Auto-Update"
 GRANT_BUILD_VERSION=os.getenv("GRANT_BUILD_VERSION","0.8.0")
 REQUEST_IDENTITY_HEADERS=contextvars.ContextVar("request_identity_headers",default=None)
@@ -460,7 +461,7 @@ def project_workflow_ui(project):
              f"configuration **v{workflow.get('config_version','—')}** · {len(enabled)} optional capabilities · routing **{config.get('model_routing_mode') or 'deployment default'}**")
     return (summary,status,
             gr.update(visible="investigator_interview" in enabled),
-            gr.update(visible="team_collaboration" in enabled),
+            gr.update(visible=True),
             gr.update(visible="clinical_design" in enabled),
             gr.update(visible="competitive_intelligence" in enabled),
             gr.update(visible="sponsor_compliance" in enabled),
@@ -630,6 +631,14 @@ def _approval_message(data,label):
     progress=data.get("approval_progress") or {}
     return f"Approval recorded for {label} v{data.get('version')} ({progress.get('approvals',0)} of {progress.get('minimum_approvals','?')}); the artifact remains unapproved until the configured threshold is met."
 
+def return_artifact_for_revision(project,artifact_type,version,rationale):
+    if not version:raise gr.Error("Load the current artifact version before returning it for revision.")
+    rationale=str(rationale or "").strip()
+    if not rationale:raise gr.Error("Explain what must change before returning approved work for revision.")
+    data=api("POST",f"/api/projects/{project}/workflow/artifacts/{artifact_type}/return-for-revision",json={"version":int(version),"rationale":rationale})
+    status=api("GET",f"/api/projects/{project}/workflow/status")
+    return f"↩ Returned exact {artifact_type} v{version} for revision. The prior version and approval history remain auditable.",data,status,""
+
 def load_solicitation_form(project):
     data=api("GET",f"/api/projects/{project}/workflow/artifacts/solicitation_profile");context=_editor_context(project);data["editor_context"]=context
     body=data.get("body") or {}
@@ -724,9 +733,40 @@ def generate_aims_form(project,actor):
     artifact_editor_generate(project,"aim_set",actor)
     return load_aims_form(project)
 
+def _literature_query_rows(body):
+    return [[q.get("id"),q.get("query"),q.get("rationale"),", ".join(q.get("aim_ids") or []),", ".join(q.get("requirement_ids") or []),", ".join(q.get("criterion_ids") or []),", ".join(q.get("preferred_domains") or [])] for q in body.get("queries") or []]
+
+def load_search_plan_form(project):
+    data=api("GET",f"/api/projects/{project}/workflow/artifacts/literature_search_plan");body=data.get("body") or {};context=_editor_context(project);data["editor_context"]=context
+    upstream=f"Solicitation v{body.get('solicitation_profile_version','—')} · Framework v{body.get('framework_version','—')} · Aims v{body.get('aim_set_version','—')}"
+    return upstream,_literature_query_rows(body),data.get("version"),_artifact_status(data),data,_reference_rows(context,{"aims","requirements","criteria"})
+
+def search_plan_body(metadata,query_rows):
+    prior=(metadata or {}).get("body") or {};context=(metadata or {}).get("editor_context") or {}
+    solicitation=prior.get("solicitation_profile_version") or _approved_artifact(context,"solicitation_profile").get("version")
+    framework=prior.get("framework_version") or _approved_artifact(context,"research_framework").get("version")
+    aims=prior.get("aim_set_version") or _approved_artifact(context,"aim_set").get("version")
+    if not all((solicitation,framework,aims)):raise gr.Error("Approve the solicitation profile, research framework, and aims before saving a literature search plan.")
+    queries=[{"id":str(r["ID"] or "").strip(),"query":str(r["Query"] or "").strip(),"rationale":str(r["Rationale"] or "").strip(),"aim_ids":_split_values(r["Aim IDs"]),"requirement_ids":_split_values(r["Requirement IDs"]),"criterion_ids":_split_values(r["Criterion IDs"]),"preferred_domains":_split_values(r["Preferred domains"])} for r in _records(query_rows,LITERATURE_QUERY_HEADERS)]
+    return {"schema_version":1,"solicitation_profile_version":int(solicitation),"framework_version":int(framework),"aim_set_version":int(aims),"queries":queries}
+
+def save_search_plan_form(project,actor,version,metadata,query_rows,approve=False):
+    body=search_plan_body(metadata,query_rows);current=api("GET",f"/api/projects/{project}/workflow/artifacts/literature_search_plan")
+    if body!=current.get("body"):
+        current=api("POST",f"/api/projects/{project}/workflow/artifacts/literature_search_plan",json={"body":body,"source":"human_structured_editor","author":actor,"expected_version":int(version) if version else None})
+    if approve:current=api("POST",f"/api/projects/{project}/workflow/artifacts/literature_search_plan/approve",json={"version":int(current["version"]),"approver":actor})
+    loaded=load_search_plan_form(project);status=(_approval_message(current,"literature search plan") if approve else f"Saved literature search plan v{current['version']}; approval is still required.")
+    return (*loaded[:3],status,current,loaded[5])
+
+def generate_search_plan_form(project,max_queries):
+    result=api("POST",f"/api/projects/{project}/research/plan",json={"max_queries":int(max_queries)},timeout=1200)
+    loaded=list(load_search_plan_form(project));warnings=result.get("planner_warnings") or []
+    loaded[3]=f"Generated search plan v{loaded[2]} with `{result.get('provider')}:{result.get('model')}`. Review and approve it before any external search runs."+(f" {len(warnings)} invalid or duplicate model suggestion(s) were excluded." if warnings else "")
+    return tuple(loaded)
+
 def load_literature_form(project):
     data=api("GET",f"/api/projects/{project}/workflow/artifacts/literature_manifest");body=data.get("body") or {};context=_editor_context(project);data["editor_context"]=context
-    queries=[[q.get("id"),q.get("query"),q.get("rationale"),", ".join(q.get("aim_ids") or []),", ".join(q.get("requirement_ids") or []),", ".join(q.get("criterion_ids") or []),", ".join(q.get("preferred_domains") or [])] for q in body.get("queries") or []]
+    queries=_literature_query_rows(body)
     needs=[[n.get("evidence_need_id"),n.get("disposition"),", ".join(str(x) for x in n.get("evidence_ids") or []),n.get("rationale")] for n in body.get("evidence_needs") or []]
     contradictions=[[value] for value in body.get("contradictions") or []]
     manifest=f"Run `{body.get('run_id','—')}` · {body.get('search_provider','—')} · {body.get('started_at','—')} → {body.get('completed_at','—')} · source IDs {body.get('source_ids') or []} · citation IDs {body.get('citation_ids') or []}"
@@ -768,8 +808,8 @@ def _member_choices(members):
     return [(f"{item.get('name') or item.get('email') or item.get('user_id')} · {item.get('role')}",str(item.get("user_id"))) for item in members if item.get("user_id")]
 
 def team_workspace_rows(data):
-    members=data.get("members") or [];invites=data.get("invites") or [];tasks=data.get("tasks") or [];notifications=data.get("notifications") or [];routing=(data.get("approval_routing") or {}).get("routes") or []
-    member_rows=[[x.get("user_id"),x.get("name"),x.get("email"),x.get("role"),x.get("joined_at"),x.get("last_seen_at")] for x in members]
+    members=data.get("members") or [];invites=data.get("invites") or [];tasks=data.get("tasks") or [];notifications=data.get("notifications") or [];routing=(data.get("approval_routing") or {}).get("routes") or [];health=(data.get("health") or {}).get("issues") or []
+    member_rows=[[x.get("user_id"),x.get("name"),x.get("email"),x.get("role"),bool(x.get("present")),x.get("joined_at"),x.get("last_seen_at")] for x in members]
     activity_rows=[[x.get("created_at"),x.get("actor"),x.get("kind"),x.get("detail")] for x in data.get("activity") or []]
     invite_rows=[]
     for x in invites:
@@ -778,14 +818,39 @@ def team_workspace_rows(data):
     task_rows=[[x.get("id"),x.get("priority"),x.get("status"),x.get("title"),x.get("owner_user_id"),x.get("due_at"),x.get("source"),", ".join(x.get("dependencies") or []),x.get("updated_at")] for x in tasks]
     notification_rows=[[x.get("id"),not bool(x.get("read_at")),x.get("kind"),_display_value(x.get("payload")),x.get("created_at"),x.get("read_at")] for x in notifications]
     routing_rows=[[x.get("title"),x.get("current_version"),x.get("owner_user_id"),", ".join(x.get("approver_user_ids") or []),x.get("approvals"),x.get("minimum_approvals"),bool(x.get("threshold_met")),bool(x.get("approved"))] for x in routing]
-    return member_rows,activity_rows,invite_rows,task_rows,notification_rows,routing_rows
+    health_rows=[[x.get("severity"),x.get("kind"),x.get("title"),x.get("detail"),x.get("owner_user_id"),x.get("step_key"),x.get("due_at"),x.get("remediation")] for x in health]
+    return member_rows,activity_rows,invite_rows,task_rows,notification_rows,routing_rows,health_rows
+
+def project_health_summary(data):
+    health=data.get("health") or {};summary=health.get("summary") or {};state=str(health.get("state") or "unknown").replace("_"," ")
+    return f"### Project health: **{state}**\nCritical **{summary.get('critical',0)}** · High **{summary.get('high',0)}** · Medium **{summary.get('medium',0)}** · Total active findings **{summary.get('total',0)}**"
 
 def load_team_workspace(project):
     project=_require_project(project);data=api("GET",f"/api/projects/{project}/collaboration/workspace")
     members=data.get("members") or [];tasks=data.get("tasks") or [];invites=[item for item in data.get("invites") or [] if not item.get("accepted_at") and not item.get("revoked_at")];notifications=[item for item in data.get("notifications") or [] if not item.get("read_at")]
     rows=team_workspace_rows(data);member_choices=_member_choices(members);task_choices=[(f"{item.get('title')} · {str(item.get('id'))[:8]}",str(item.get("id"))) for item in tasks]
     permissions=data.get("permissions") or {};status=f"Signed in with project role **{permissions.get('role','unknown')}** · {len(members)} member(s) · {len(tasks)} task(s) · {len(notifications)} unread notification(s)."
-    return (*rows,gr.update(choices=member_choices,value=(member_choices[0][1] if member_choices else None)),gr.update(choices=member_choices,value=[]),gr.update(choices=task_choices,value=(task_choices[0][1] if task_choices else None)),gr.update(choices=task_choices,value=[]),_choice_update(invites,label_key="email"),_choice_update(notifications,label_key="kind"),permissions,status,gr.update(interactive=bool(permissions.get("can_manage_members"))),gr.update(interactive=bool(permissions.get("can_manage_members"))),gr.update(interactive=bool(permissions.get("can_post"))),gr.update(interactive=bool(permissions.get("can_create_tasks"))))
+    return (*rows,project_health_summary(data),gr.update(choices=member_choices,value=(member_choices[0][1] if member_choices else None)),gr.update(choices=member_choices,value=[]),gr.update(choices=task_choices,value=(task_choices[0][1] if task_choices else None)),gr.update(choices=task_choices,value=[]),_choice_update(invites,label_key="email"),_choice_update(notifications,label_key="kind"),permissions,status,gr.update(interactive=bool(permissions.get("can_manage_members"))),gr.update(interactive=bool(permissions.get("can_manage_members"))),gr.update(interactive=bool(permissions.get("can_post"))),gr.update(interactive=bool(permissions.get("can_create_tasks"))))
+
+def poll_team_workspace(project):
+    if not (project or "").strip():return tuple(gr.skip() for _ in range(9))
+    data=api("GET",f"/api/projects/{project}/collaboration/workspace");rows=team_workspace_rows(data);members=data.get("members") or [];tasks=data.get("tasks") or [];notifications=[item for item in data.get("notifications") or [] if not item.get("read_at")];permissions=data.get("permissions") or {}
+    status=f"Live sync · signed in as **{permissions.get('role','unknown')}** · {len(members)} member(s) · {len(tasks)} task(s) · {len(notifications)} unread notification(s)."
+    return (*rows,project_health_summary(data),status)
+
+def poll_team_channel(project,kind,subject_key):
+    if not (project or "").strip():return tuple(gr.skip() for _ in range(3))
+    if str(kind or "general")=="section" and not str(subject_key or "").strip():return tuple(gr.skip() for _ in range(3))
+    loaded=load_team_channel(project,kind,subject_key)
+    return loaded[0],loaded[1],loaded[3]
+
+def poll_shared_artifact_versions(project,local_search_plan_version,local_manifest_version):
+    if not (project or "").strip():return gr.skip()
+    notices=[]
+    for label,artifact_type,local_version in (("search plan","literature_search_plan",local_search_plan_version),("literature manifest","literature_manifest",local_manifest_version)):
+        remote=api("GET",f"/api/projects/{project}/workflow/artifacts/{artifact_type}");remote_version=remote.get("version")
+        if local_version and remote_version and int(local_version)!=int(remote_version):notices.append(f"A teammate published {label} v{remote_version} while this browser has v{int(local_version)} loaded. Reload before editing; stale saves are rejected server-side.")
+    return "\n\n".join(f"> ⚠ {notice}" for notice in notices) if notices else "Live collaboration sync is current."
 
 def channel_messages_html(messages):
     if not messages:return '<div class="team-chat">No messages in this channel yet.</div>'
@@ -912,6 +977,30 @@ def refresh_projects():
     items=api("GET","/api/projects");choices=[(f"{p['title']} · {p['stage']} · {p['id'][:8]}",p["id"]) for p in items]
     return gr.update(choices=choices,value=(choices[0][1] if choices else None))
 
+def project_catalog(include_archived=False):
+    items=api("GET","/api/projects",params={"include_archived":str(bool(include_archived)).lower()})
+    choices=[];rows=[]
+    for project in items:
+        archived=bool(project.get("archived_at"));state="Archived" if archived else "Active"
+        label=f"{project['title']} · {project.get('stage') or 'not started'} · {state} · {project['id'][:8]}"
+        choices.append((label,project["id"]))
+        rows.append([project.get("id"),project.get("title"),project.get("sponsor") or "",project.get("mechanism") or "",project.get("stage"),project.get("role") or "system administrator",state,project.get("updated_at"),project.get("created_at")])
+    active=sum(1 for item in items if not item.get("archived_at"));archived=len(items)-active
+    summary=f"**{active} active grant(s)**"+(f" · {archived} archived" if include_archived else "")+" · saved on the shared server and available after sign-out/sign-in."
+    return gr.update(choices=choices,value=(choices[0][1] if choices else None)),rows,summary
+
+def update_project_manager(project,title,archive_action,include_archived):
+    if not project:raise gr.Error("Choose a saved grant first.")
+    payload={}
+    if (title or "").strip():payload["title"]=title.strip()
+    if archive_action=="Archive":payload["archived"]=True
+    elif archive_action=="Restore":payload["archived"]=False
+    if not payload:raise gr.Error("Enter a new title or choose Archive/Restore.")
+    updated=api("PATCH",f"/api/projects/{project}",json=payload)
+    selector,rows,summary=project_catalog(include_archived)
+    action="archived" if archive_action=="Archive" else ("restored" if archive_action=="Restore" else "updated")
+    return selector,rows,summary,f"Grant **{updated.get('title')}** was {action}. All documents, versions, approvals, research, and collaboration history remain stored.","",None
+
 def create_project(title,sponsor,mechanism,source,source_url,source_text,supporting,brand,workflow=None,actor=None):
     if not title.strip():raise gr.Error("Working title is required.")
     if not source and not (source_url or "").strip() and not (source_text or "").strip():raise gr.Error("Upload, link, or paste a funding opportunity.")
@@ -970,7 +1059,7 @@ def configured_project_creation(title,sponsor,mechanism,deadline,grant_type,sour
     visibility={key:key in selected_set for key in WORKFLOW_MODULES}
     return (gr.update(visible=False),pid,status,notice,requirements,sections,summary,workflow_status,
             gr.update(visible=visibility.get("investigator_interview",False)),
-            gr.update(visible=visibility.get("team_collaboration",False)),
+            gr.update(visible=True),
             gr.update(visible=visibility.get("clinical_design",False)),
             gr.update(visible=visibility.get("competitive_intelligence",False)),
             gr.update(visible=visibility.get("sponsor_compliance",False)),
@@ -1064,8 +1153,9 @@ def submit_answer(project,questions,current_q,raw,confidence,classification,note
     value=parse_typed_answer(current_q,raw);d=api("POST",f"/api/projects/{project}/interview/answer",json={"question_id":current_q["id"],"value":value,"confidence":confidence,"classification":classification,"notes":notes or None,"answered_by":answered_by or None})
     refreshed=api("GET",f"/api/projects/{project}/interview");q=next_open(refreshed);return refreshed,q,render_question(q),"",(f"Saved answer. {d['open_questions']} question(s) remain." if q else "✓ Interview complete; research/writing gates are now open.")
 
-def run_research(project,max_queries,results_per):
-    d=api("POST",f"/api/projects/{project}/research/run",json={"max_queries":int(max_queries),"results_per_query":int(results_per)},timeout=1200);status=f"Saved {d['sources_saved']} evidence source(s).";status+=(f" {len(d['failures'])} isolated failures." if d.get("failures") else "");return evidence_rows(d.get("evidence",[])),status
+def run_research(project,search_plan_version,results_per):
+    if not search_plan_version:raise gr.Error("Generate, review, and approve a literature search plan before running research.")
+    d=api("POST",f"/api/projects/{project}/research/run",json={"search_plan_version":int(search_plan_version),"results_per_query":int(results_per)},timeout=1200);status=f"Atomically committed research run `{d.get('run_id')}` from approved search plan v{d.get('search_plan_version')}, with {d.get('sources_saved') or 0} assessed source(s).";status+=(f" {len(d['failures'])} isolated failure(s) were recorded as unresolved risk." if d.get("failures") else "");return evidence_rows(d.get("evidence",[])),status
 
 def reviewer_role_rows(project):
     data=api("GET",f"/api/projects/{project}/review-panel/roles")
@@ -1496,6 +1586,14 @@ def approve_section(project,project_title,section,key,current_version,baseline,e
         return version,baseline,section_preview(project,project_title,section,baseline,key,version,None),f"Approval recorded ({progress.get('approvals',0)} of {progress.get('minimum_approvals','?')}); this exact version remains unapproved until the configured threshold is met.",gr.update(value=baseline,visible=False),gr.update(visible=False),gr.update(visible=False),None,""
     return version,baseline,section_preview(project,project_title,section,baseline,key,version,None),f"✓ Human approved exact version {d['approved_version']} for {section}. Workflow stage: `{d['stage']}`.",gr.update(value=baseline,visible=False),gr.update(visible=False),gr.update(visible=False),None,""
 
+def return_section_for_revision(project,key,current_version,rationale):
+    if not key or not current_version:raise gr.Error("Load a saved proposal section before returning it for revision.")
+    rationale=str(rationale or "").strip()
+    if not rationale:raise gr.Error("Explain what must change before returning the section for revision.")
+    api("POST",f"/api/projects/{project}/sections/{key}/return-for-revision",json={"version":int(current_version),"rationale":rationale})
+    status=api("GET",f"/api/projects/{project}/workflow/status")
+    return f"↩ Returned exact section version {current_version} for revision. Contributors may now publish a corrected version; all prior work remains in history.",status,""
+
 def preview_approved_grant(project):
     if not project:raise gr.Error("Create or open a project first.")
     d=api("GET",f"/api/projects/{project}/approved-document")
@@ -1650,8 +1748,21 @@ with gr.Blocks(title="Grantspace") as demo:
     workspace_workflow_status=gr.JSON(label="Composable workflow status",visible=False)
     with gr.Row():
         recent=gr.Dropdown(label="Open existing project",choices=[]);refresh_projects_btn=gr.Button("Refresh Projects");open_project_btn=gr.Button("Open Project",variant="secondary")
+    with gr.Accordion("Manage saved grants",open=False):
+        gr.Markdown("Grants are persisted on the shared server, scoped to your account memberships, and remain available after every sign-out or restart. Archiving is reversible and never deletes grant records.")
+        with gr.Row():
+            include_archived_projects=gr.Checkbox(label="Include archived grants",value=False)
+            refresh_project_manager_btn=gr.Button("Refresh saved grants")
+        project_catalog_table=gr.Dataframe(headers=["Project ID","Title","Sponsor","Mechanism","Workflow stage","My role","State","Last updated","Created"],interactive=False,label="Saved grants available to this account")
+        project_catalog_summary=gr.Markdown()
+        with gr.Row():
+            managed_project_title=gr.Textbox(label="New title (optional)")
+            managed_project_action=gr.Dropdown(["Keep active","Archive","Restore"],value="Keep active",label="Lifecycle action")
+            apply_project_management_btn=gr.Button("Apply to selected grant")
+        project_management_status=gr.Markdown()
     agentic_global_notice=gr.Markdown()
     competitive_update_timer=gr.Timer(value=COMPETITIVE_UI_POLL_SECONDS,active=True)
+    collaboration_update_timer=gr.Timer(value=COLLABORATION_UI_POLL_SECONDS,active=True)
     with gr.Tabs() as workspace_tabs:
         with gr.Tab("1 · Intake & Requirements") as intake_tab:
             with gr.Row():
@@ -1687,6 +1798,9 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
                     solicitation_questions=gr.Dataframe(headers=["Question"],column_count=(1,"fixed"),row_count=(3,"dynamic"),interactive=True,label="Questions requiring human resolution")
                     solicitation_artifact_json=gr.JSON(label="Solicitation artifact metadata",visible=False)
                     solicitation_status=gr.Markdown()
+                    with gr.Row():
+                        solicitation_return_reason=gr.Textbox(label="Return-for-revision rationale",placeholder="State the exact correction required")
+                        return_solicitation_btn=gr.Button("↩ Return approved profile for revision")
         with gr.Tab("2 · Research Plan Framework") as framework_tab:
             gr.Markdown("### Sponsor-mapped research plan\nGenerate from the exact approved solicitation profile, then edit the argument, mappings, evidence gaps, ownership, dependencies, and word allocations before approval.")
             framework_version=gr.State(None)
@@ -1700,6 +1814,9 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
             framework_nodes=gr.Dataframe(headers=FRAMEWORK_HEADERS,column_count=(len(FRAMEWORK_HEADERS),"fixed"),row_count=(8,"dynamic"),interactive=True,label="Ordered sponsor-mapped framework nodes")
             framework_artifact_json=gr.JSON(label="Framework artifact metadata",visible=False)
             framework_status=gr.Markdown()
+            with gr.Row():
+                framework_return_reason=gr.Textbox(label="Return-for-revision rationale",placeholder="State the exact correction required")
+                return_framework_btn=gr.Button("↩ Return approved framework for revision")
         with gr.Tab("3 · Key Aims") as aims_tab:
             gr.Markdown("### Versioned aims\nKeep objectives, central thesis, rationale, approach, outcomes, impact, innovation, dependencies, classifications, and supporting evidence explicit.")
             aims_version=gr.State(None)
@@ -1715,6 +1832,9 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
             core_aims=gr.Dataframe(headers=CORE_AIM_HEADERS,column_count=(len(CORE_AIM_HEADERS),"fixed"),row_count=(3,"dynamic"),interactive=True,label="Structured aims · classification must be fact, estimate, or assumption")
             aims_artifact_json=gr.JSON(label="Aims artifact metadata",visible=False)
             aims_status=gr.Markdown()
+            with gr.Row():
+                aims_return_reason=gr.Textbox(label="Return-for-revision rationale",placeholder="State the exact correction required")
+                return_aims_btn=gr.Button("↩ Return approved aims for revision")
         with gr.Tab("Optional · Investigator Interview",visible=False) as interview_tab:
             with gr.Row():
                 with gr.Column(scale=3):
@@ -1723,7 +1843,24 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
                     answer_notes=gr.Textbox(label="Supporting explanation / notes",lines=4);answered_by=gr.Textbox(label="Answered by / role");submit=gr.Button("Save Answer & Continue",variant="primary");interview_status=gr.Markdown()
                 with gr.Column(scale=2):interview_table=gr.JSON(label="Interview state")
         with gr.Tab("4 · Literature & Evidence") as research_tab:
-            with gr.Row():max_queries=gr.Slider(1,24,value=8,step=1,label="Maximum research queries");results_per=gr.Slider(1,10,value=5,step=1,label="Results per query");research_btn=gr.Button("Run Evidence Research",variant="primary")
+            gr.Markdown("### Approved search plan\nGenerate a solicitation-, framework-, and aims-grounded query plan, let contributors correct it, and require named approval before the application performs any external search.")
+            search_plan_version=gr.State(None)
+            with gr.Row():
+                max_queries=gr.Slider(1,24,value=8,step=1,label="Maximum planned queries")
+                generate_search_plan_btn=gr.Button("Generate versioned plan",variant="primary")
+                load_search_plan_btn=gr.Button("Load latest plan")
+                save_search_plan_btn=gr.Button("Save plan corrections")
+                approve_search_plan_btn=gr.Button("✓ Approve search plan")
+            search_plan_upstream=gr.Markdown()
+            search_plan_references=gr.Dataframe(headers=REFERENCE_HEADERS,interactive=False,label="Approved upstream requirement, criterion, and aim catalog")
+            search_plan_queries=gr.Dataframe(headers=LITERATURE_QUERY_HEADERS,column_count=(len(LITERATURE_QUERY_HEADERS),"fixed"),row_count=(8,"dynamic"),interactive=True,label="Reviewable external research queries")
+            search_plan_artifact_json=gr.JSON(label="Search-plan artifact metadata",visible=False)
+            search_plan_status=gr.Markdown()
+            with gr.Row():
+                search_plan_return_reason=gr.Textbox(label="Return-for-revision rationale",placeholder="State the exact query-plan correction required")
+                return_search_plan_btn=gr.Button("↩ Return approved search plan for revision")
+            shared_literature_sync_status=gr.Markdown("Live collaboration sync starts after a project is opened.")
+            with gr.Row():results_per=gr.Slider(1,10,value=5,step=1,label="Results per approved query");research_btn=gr.Button("Run approved plan atomically",variant="primary")
             evidence_table=gr.Dataframe(headers=["Evidence ID","Requirement","Source type","Evidence purpose","Status","Confidence","URL"],interactive=False);research_status=gr.Markdown()
             gr.Markdown("### Reproducible literature manifest\nReview the exact approved upstream versions, queries, evidence dispositions, citations, contradictions, and unresolved risks before locking the research run.")
             literature_version=gr.State(None)
@@ -1738,6 +1875,9 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
             literature_contradictions=gr.Dataframe(headers=["Contradiction"],column_count=(1,"fixed"),row_count=(3,"dynamic"),interactive=True,label="Contradictions and unresolved tensions")
             literature_artifact_json=gr.JSON(label="Literature artifact metadata",visible=False)
             literature_artifact_status=gr.Markdown()
+            with gr.Row():
+                literature_return_reason=gr.Textbox(label="Return-for-revision rationale",placeholder="State the evidence, disposition, or contradiction correction required")
+                return_literature_btn=gr.Button("↩ Return approved literature manifest for revision")
             gr.Markdown("### Compiled HPC Knowledge Index")
             with gr.Row():rebuild_idx=gr.Button("Build / Refresh MMAP Index");status_idx=gr.Button("Check Index Status")
             index_message=gr.Markdown();index_json=gr.JSON(label="Index manifest / status")
@@ -1750,8 +1890,11 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
                 refresh_team_workspace_btn=gr.Button("Refresh team workspace",variant="primary")
                 team_workspace_status=gr.Markdown()
             with gr.Tabs():
+                with gr.Tab("Project health"):
+                    project_health_summary_md=gr.Markdown("Project health loads from the shared server after a project is opened.")
+                    project_health_table=gr.Dataframe(headers=["Severity","Kind","Finding","Details","Owner user ID","Workflow step","Due","Required action"],interactive=False,label="Authoritative active risks · recalculated from persisted project state")
                 with gr.Tab("Members & invitations"):
-                    team_members=gr.Dataframe(headers=["User ID","Name","Email","Project role","Joined","Last seen"],interactive=False,label="Authenticated project members")
+                    team_members=gr.Dataframe(headers=["User ID","Name","Email","Project role","Online","Joined","Last seen"],interactive=False,label="Authenticated project members · presence is advisory; edit safety uses version checks")
                     with gr.Row():
                         existing_member_user_id=gr.Textbox(label="Existing account user ID")
                         existing_member_role=gr.Dropdown(["owner","pi","contributor","reviewer","approver","research_administrator","viewer"],value="contributor",label="Project role")
@@ -1950,6 +2093,9 @@ Register the actual files that must travel with the proposal. Use a stable slot 
             section_update_banner=gr.Markdown()
             preview_box=gr.HTML('<div class="page-frame"><div style="background:white;padding:32px">Open a project and select a section.</div></div>')
             with gr.Row():edit=gr.Button("✎ Edit");approve_btn=gr.Button("✓ Approve Section",variant="primary")
+            with gr.Row():
+                section_return_reason=gr.Textbox(label="Return-for-revision rationale",placeholder="State the exact section correction required")
+                return_section_btn=gr.Button("↩ Return approved section for revision")
             editor=gr.Textbox(lines=20,label="Section text",visible=False)
             with gr.Row():save_btn=gr.Button("Save Edit",visible=False);cancel=gr.Button("Cancel Edit",visible=False)
             write_status=gr.Markdown("No section loaded.")
@@ -2066,25 +2212,38 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
     load_solicitation_btn.click(gateway_callback(load_solicitation_form),[project_id],solicitation_outputs)
     save_solicitation_btn.click(gateway_callback(save_solicitation_form),[project_id,wizard_owner_id,solicitation_version,solicitation_artifact_json]+solicitation_form,solicitation_outputs)
     approve_solicitation_btn.click(gateway_callback(approve_solicitation_form),[project_id,wizard_owner_id,solicitation_version,solicitation_artifact_json]+solicitation_form,solicitation_outputs+[workspace_workflow_status])
+    return_solicitation_btn.click(gateway_callback(lambda project,version,rationale:return_artifact_for_revision(project,"solicitation_profile",version,rationale)),[project_id,solicitation_version,solicitation_return_reason],[solicitation_status,solicitation_artifact_json,workspace_workflow_status,solicitation_return_reason])
     framework_outputs=[framework_argument,framework_nodes,framework_version,framework_status,framework_artifact_json,framework_references]
     load_framework_btn.click(gateway_callback(load_framework_form),[project_id],framework_outputs)
     generate_framework_btn.click(gateway_callback(generate_framework_form),[project_id,wizard_owner_id],framework_outputs)
     save_framework_btn.click(gateway_callback(lambda project,actor,version,metadata,argument,rows:save_framework_form(project,actor,version,metadata,argument,rows,False)),[project_id,wizard_owner_id,framework_version,framework_artifact_json,framework_argument,framework_nodes],framework_outputs)
     approve_framework_btn.click(gateway_callback(lambda project,actor,version,metadata,argument,rows:save_framework_form(project,actor,version,metadata,argument,rows,True)),[project_id,wizard_owner_id,framework_version,framework_artifact_json,framework_argument,framework_nodes],framework_outputs).then(gateway_callback(lambda project:api("GET",f"/api/projects/{project}/workflow/status")),[project_id],[workspace_workflow_status])
+    return_framework_btn.click(gateway_callback(lambda project,version,rationale:return_artifact_for_revision(project,"research_framework",version,rationale)),[project_id,framework_version,framework_return_reason],[framework_status,framework_artifact_json,workspace_workflow_status,framework_return_reason])
     aims_outputs=[aims_objective,aims_hypothesis,core_aims,aims_version,aims_status,aims_artifact_json,aims_references]
     load_aims_btn.click(gateway_callback(load_aims_form),[project_id],aims_outputs)
     generate_aims_btn.click(gateway_callback(generate_aims_form),[project_id,wizard_owner_id],aims_outputs)
     save_aims_btn.click(gateway_callback(lambda project,actor,version,metadata,objective,hypothesis,rows:save_aims_form(project,actor,version,metadata,objective,hypothesis,rows,False)),[project_id,wizard_owner_id,aims_version,aims_artifact_json,aims_objective,aims_hypothesis,core_aims],aims_outputs)
     approve_aims_btn.click(gateway_callback(lambda project,actor,version,metadata,objective,hypothesis,rows:save_aims_form(project,actor,version,metadata,objective,hypothesis,rows,True)),[project_id,wizard_owner_id,aims_version,aims_artifact_json,aims_objective,aims_hypothesis,core_aims],aims_outputs).then(gateway_callback(lambda project:api("GET",f"/api/projects/{project}/workflow/status")),[project_id],[workspace_workflow_status])
+    return_aims_btn.click(gateway_callback(lambda project,version,rationale:return_artifact_for_revision(project,"aim_set",version,rationale)),[project_id,aims_version,aims_return_reason],[aims_status,aims_artifact_json,workspace_workflow_status,aims_return_reason])
     generate_q.click(gateway_callback(generate_interview),[project_id],[interview_questions,current_question,question_card,answer,interview_status,interview_table])
     submit.click(gateway_callback(submit_answer),[project_id,interview_questions,current_question,answer,confidence,classification,answer_notes,answered_by],[interview_questions,current_question,question_card,answer,interview_status])
+    search_plan_outputs=[search_plan_upstream,search_plan_queries,search_plan_version,search_plan_status,search_plan_artifact_json,search_plan_references]
+    generate_search_plan_btn.click(gateway_callback(generate_search_plan_form),[project_id,max_queries],search_plan_outputs)
+    load_search_plan_btn.click(gateway_callback(load_search_plan_form),[project_id],search_plan_outputs)
+    save_search_plan_btn.click(gateway_callback(lambda project,actor,version,metadata,queries:save_search_plan_form(project,actor,version,metadata,queries,False)),[project_id,wizard_owner_id,search_plan_version,search_plan_artifact_json,search_plan_queries],search_plan_outputs)
+    approve_search_plan_btn.click(gateway_callback(lambda project,actor,version,metadata,queries:save_search_plan_form(project,actor,version,metadata,queries,True)),[project_id,wizard_owner_id,search_plan_version,search_plan_artifact_json,search_plan_queries],search_plan_outputs)
+    return_search_plan_btn.click(gateway_callback(lambda project,version,rationale:return_artifact_for_revision(project,"literature_search_plan",version,rationale)),[project_id,search_plan_version,search_plan_return_reason],[search_plan_status,search_plan_artifact_json,workspace_workflow_status,search_plan_return_reason])
     literature_outputs=[literature_manifest_summary,literature_queries,literature_needs,literature_contradictions,literature_version,literature_artifact_status,literature_artifact_json,literature_references]
-    research_btn.click(gateway_callback(run_research),[project_id,max_queries,results_per],[evidence_table,research_status]).then(gateway_callback(load_literature_form),[project_id],literature_outputs)
+    research_btn.click(gateway_callback(run_research),[project_id,search_plan_version,results_per],[evidence_table,research_status]).then(gateway_callback(load_literature_form),[project_id],literature_outputs)
     load_literature_btn.click(gateway_callback(load_literature_form),[project_id],literature_outputs)
     save_literature_btn.click(gateway_callback(lambda project,actor,version,metadata,queries,needs,contradictions:save_literature_form(project,actor,version,metadata,queries,needs,contradictions,False)),[project_id,wizard_owner_id,literature_version,literature_artifact_json,literature_queries,literature_needs,literature_contradictions],literature_outputs)
     approve_literature_btn.click(gateway_callback(lambda project,actor,version,metadata,queries,needs,contradictions:save_literature_form(project,actor,version,metadata,queries,needs,contradictions,True)),[project_id,wizard_owner_id,literature_version,literature_artifact_json,literature_queries,literature_needs,literature_contradictions],literature_outputs).then(gateway_callback(lambda project:api("GET",f"/api/projects/{project}/workflow/status")),[project_id],[workspace_workflow_status])
-    team_workspace_outputs=[team_members,team_activity,project_invites,team_tasks,team_notifications,approval_routing_table,task_owner,team_mentions,active_project_task,task_dependencies,active_project_invite,unread_notification_id,team_permissions,team_workspace_status,create_project_invite_btn,add_existing_member_btn,post_team_channel_btn,create_project_task_btn]
+    return_literature_btn.click(gateway_callback(lambda project,version,rationale:return_artifact_for_revision(project,"literature_manifest",version,rationale)),[project_id,literature_version,literature_return_reason],[literature_artifact_status,literature_artifact_json,workspace_workflow_status,literature_return_reason])
+    team_workspace_outputs=[team_members,team_activity,project_invites,team_tasks,team_notifications,approval_routing_table,project_health_table,project_health_summary_md,task_owner,team_mentions,active_project_task,task_dependencies,active_project_invite,unread_notification_id,team_permissions,team_workspace_status,create_project_invite_btn,add_existing_member_btn,post_team_channel_btn,create_project_task_btn]
     refresh_team_workspace_btn.click(gateway_callback(load_team_workspace),[project_id],team_workspace_outputs)
+    collaboration_update_timer.tick(gateway_callback(poll_team_workspace),[project_id],[team_members,team_activity,project_invites,team_tasks,team_notifications,approval_routing_table,project_health_table,project_health_summary_md,team_workspace_status],show_progress="hidden")
+    collaboration_update_timer.tick(gateway_callback(poll_team_channel),[project_id,team_channel_kind,team_channel_subject],[team_channel_html,team_messages,team_channel_status],show_progress="hidden")
+    collaboration_update_timer.tick(gateway_callback(poll_shared_artifact_versions),[project_id,search_plan_version,literature_version],[shared_literature_sync_status],show_progress="hidden")
     load_team_channel_btn.click(gateway_callback(load_team_channel),[project_id,team_channel_kind,team_channel_subject],[team_channel_html,team_messages,team_reply_message_id,team_channel_status])
     post_team_channel_btn.click(gateway_callback(post_team_channel_message),[project_id,team_channel_kind,team_channel_subject,team_message_body,team_reply_message_id,team_mentions],[team_channel_html,team_messages,team_reply_message_id,team_channel_status,team_message_body])
     create_project_invite_btn.click(gateway_callback(create_project_invite_ui),[project_id,project_invite_email,project_invite_role,project_invite_days],[project_invite_status]+team_workspace_outputs)
@@ -2126,6 +2285,7 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
     save_btn.click(gateway_callback(save_edit),[project_id,project_title,section,current_section_key,current_version,baseline_body,editor],[current_version,baseline_body,preview_box,write_status,editor,save_btn,cancel,current_competitive_update_event,section_update_banner]).then(gateway_callback(version_history),[project_id,current_section_key],[version_history_table,compare_from_version,compare_to_version,restore_version_id])
     cancel.click(gateway_callback(cancel_edit),[project_id,project_title,section,current_section_key,current_version,baseline_body],[preview_box,editor,save_btn,cancel,write_status])
     approve_btn.click(gateway_callback(approve_section),[project_id,project_title,section,current_section_key,current_version,baseline_body,editor,current_competitive_update_event],[current_version,baseline_body,preview_box,write_status,editor,save_btn,cancel,current_competitive_update_event,section_update_banner]).then(gateway_callback(version_history),[project_id,current_section_key],[version_history_table,compare_from_version,compare_to_version,restore_version_id])
+    return_section_btn.click(gateway_callback(return_section_for_revision),[project_id,current_section_key,current_version,section_return_reason],[write_status,workspace_workflow_status,section_return_reason]).then(gateway_callback(version_history),[project_id,current_section_key],[version_history_table,compare_from_version,compare_to_version,restore_version_id])
     refresh_version_history_btn.click(gateway_callback(version_history),[project_id,current_section_key],[version_history_table,compare_from_version,compare_to_version,restore_version_id])
     compare_versions_btn.click(gateway_callback(compare_versions),[project_id,current_section_key,compare_from_version,compare_to_version],[version_diff,version_history_status])
     restore_version_btn.click(gateway_callback(restore_version),[project_id,project_title,section,current_section_key,current_version,restore_version_id],[current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner,version_history_table,compare_from_version,compare_to_version,restore_version_id])
@@ -2134,6 +2294,9 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
     check_ready.click(gateway_callback(readiness),[project_id],[readiness_json,readiness_status,fmt,export_btn]);export_btn.click(gateway_callback(export),[project_id,fmt,project_title],[export_file,export_status])
     refresh_projects_btn.click(gateway_callback(refresh_projects),outputs=[recent])
     open_project_btn.click(gateway_callback(load_project),[recent],[project_id,project_title,sponsor,mechanism,project_status,agentic_global_notice,requirements_table,section,current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner]).then(gateway_callback(project_workflow_ui),[project_id],[workspace_workflow_summary,workspace_workflow_status,interview_tab,team_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab])
+    refresh_project_manager_btn.click(gateway_callback(project_catalog),[include_archived_projects],[recent,project_catalog_table,project_catalog_summary])
+    include_archived_projects.change(gateway_callback(project_catalog),[include_archived_projects],[recent,project_catalog_table,project_catalog_summary])
+    apply_project_management_btn.click(gateway_callback(update_project_manager),[recent,managed_project_title,managed_project_action,include_archived_projects],[recent,project_catalog_table,project_catalog_summary,project_management_status,managed_project_title,managed_project_action])
     system_info_btn.click(gateway_callback(system_diagnostics),outputs=[system_info_json,diagnostics_status])
     hpc_bench_btn.click(gateway_callback(run_hpc_diagnostics),outputs=[hpc_benchmark_json,diagnostics_status])
     refresh_accounts_btn.click(gateway_callback(account_rows),outputs=[accounts_table])
@@ -2142,6 +2305,8 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
     disable_account_btn.click(gateway_callback(lambda user_id:set_account_status(user_id,False)),[account_target_id],[accounts_table,account_admin_status])
     enable_account_btn.click(gateway_callback(lambda user_id:set_account_status(user_id,True)),[account_target_id],[accounts_table,account_admin_status])
     competitive_update_timer.tick(gateway_callback(poll_competitive_updates),[project_id],[agentic_global_notice],show_progress="hidden")
+    demo.load(gateway_callback(project_catalog),[include_archived_projects],[recent,project_catalog_table,project_catalog_summary],show_progress="hidden")
+    demo.load(gateway_callback(refresh_projects),outputs=[wizard_existing],show_progress="hidden")
 
 APP_THEME=gr.themes.Base(primary_hue=gr.themes.colors.purple,secondary_hue=gr.themes.colors.fuchsia,neutral_hue=gr.themes.colors.gray)
 

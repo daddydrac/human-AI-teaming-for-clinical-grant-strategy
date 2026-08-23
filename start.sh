@@ -13,8 +13,7 @@ if [[ ! -f .env ]]; then
     fi
   fi
   cp "$TEMPLATE" .env
-  echo "Created .env from $TEMPLATE. Review credentials and rerun ./start.sh."
-  exit 2
+  echo "Created .env from $TEMPLATE."
 fi
 set -a
 source .env
@@ -28,6 +27,8 @@ if [[ "${AUTH_MODE:-internal_accounts}" == "internal_accounts" && -z "${INITIAL_
   echo "Enter this token on the first-start setup screen: $INITIAL_ADMIN_SETUP_TOKEN"
 fi
 mkdir -p "${GRANT_EXPORT_HOME:-./exports}"
+
+./scripts/bootstrap_dependencies.sh
 
 ./scripts/configure_runtime.sh .runtime.env
 set -a
@@ -46,23 +47,14 @@ if [[ "$GRANT_RUNTIME_PROFILE" == "docker_cpu" ]]; then
     echo "Set ANTHROPIC_API_KEY in .env. Local OLMo 7B is intentionally disabled on this hardware profile." >&2
     exit 4
   fi
-elif [[ "$GRANT_RUNTIME_PROFILE" == "apple_ollama" ]]; then
-  "$ROOT/scripts/start_ollama.sh"
-else
-  LOG_DIR="$HOME/Library/Logs/GrantWriter"
-  RUNTIME_DIR="$HOME/Library/Application Support/GrantWriter/mlx-runtime"
-  mkdir -p "$LOG_DIR" "$RUNTIME_DIR"
-  if ! curl -fsS "http://127.0.0.1:${OLMO_PORT:-8000}/v1/models" >/dev/null 2>&1; then
-    echo "Starting native Apple MLX service..."
-    nohup "$ROOT/scripts/start_mlx.sh" >"$LOG_DIR/mlx.log" 2>&1 &
-    echo $! > "$RUNTIME_DIR/server.pid"
-    for _ in $(seq 1 90); do
-      curl -fsS "http://127.0.0.1:${OLMO_PORT:-8000}/v1/models" >/dev/null 2>&1 && break
-      sleep 2
-    done
-    curl -fsS "http://127.0.0.1:${OLMO_PORT:-8000}/v1/models" >/dev/null || {
-      echo "Native MLX failed to become ready. See $LOG_DIR/mlx.log" >&2; exit 5;
-    }
+elif [[ "$GRANT_RUNTIME_PROFILE" == "container_ollama" ]]; then
+  docker compose --profile local-model up -d ollama
+  for _ in $(seq 1 90); do docker compose exec -T ollama ollama list >/dev/null 2>&1 && break; sleep 2; done
+  docker compose exec -T ollama ollama list >/dev/null 2>&1 || { echo "Containerized Ollama failed to become ready." >&2; exit 5; }
+  MODEL="${LOCAL_LLM_API_MODEL:-${OLLAMA_MODEL:-qwen3:1.7b}}"
+  if ! docker compose exec -T ollama ollama show "$MODEL" >/dev/null 2>&1; then
+    echo "Downloading local model $MODEL into the Docker model volume..."
+    docker compose exec -T ollama ollama pull "$MODEL"
   fi
 fi
 

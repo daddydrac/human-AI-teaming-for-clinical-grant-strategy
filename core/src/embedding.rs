@@ -47,7 +47,7 @@ impl EmbeddingClient {
                 .timeout(Duration::from_secs(timeout))
                 .build()?,
             url: std::env::var("EMBEDDING_URL")
-                .unwrap_or_else(|_| "http://host.docker.internal:8000/v1/embeddings".to_string()),
+                .unwrap_or_else(|_| "http://embedding-cpu:8010/v1/embeddings".to_string()),
             model: std::env::var("EMBEDDING_MODEL")
                 .unwrap_or_else(|_| "grant-embedding".to_string()),
             batch_size,

@@ -58,7 +58,10 @@ use models::{ModelRouter, ModelTask};
 use research::ResearchClient;
 use retrieval::RetrievalService;
 use auth::{EmailSettings, PasswordPolicy};
-use storage::{IdempotencyClaim, Store};
+use storage::{
+    IdempotencyClaim, StagedResearchQuery, StagedResearchRun, StagedResearchSource, Store,
+};
+use workflow_artifacts::{LiteratureQueryRecord, LiteratureSearchPlan};
 use workflow::WorkflowConfig;
 
 #[derive(Clone)]
@@ -161,6 +164,10 @@ struct ProjectCreated {
     id: String,
     title: String,
 }
+#[derive(Deserialize,Default)]
+struct ProjectListQuery { #[serde(default)] include_archived:bool }
+#[derive(Deserialize)]
+struct UpdateProjectInput { title:Option<String>,archived:Option<bool> }
 #[derive(Deserialize)]
 struct SectionInput {
     title: String,
@@ -292,8 +299,12 @@ struct DraftSectionInput {
 }
 #[derive(Deserialize)]
 struct ResearchInput {
-    max_queries: Option<usize>,
+    search_plan_version: i64,
     results_per_query: Option<usize>,
+}
+#[derive(Deserialize)]
+struct ResearchPlanInput {
+    max_queries: Option<usize>,
 }
 #[derive(Deserialize)]
 struct RetrieveInput {
@@ -348,6 +359,11 @@ struct WorkflowArtifactInput {
 struct WorkflowArtifactApprovalInput {
     version: i64,
     approver: String,
+}
+#[derive(Deserialize)]
+struct ReturnForRevisionInput {
+    version: i64,
+    rationale: String,
 }
 #[derive(Deserialize)]
 struct WorkflowArtifactGenerateInput {
@@ -414,7 +430,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/project-imports",post(import_project))
         .route("/api/me",get(get_authenticated_user))
         .route("/api/workflow-definitions", get(get_workflow_definitions))
-        .route("/api/projects/{id}", get(get_project))
+        .route("/api/projects/{id}", get(get_project).patch(update_project))
         .route("/api/projects/{id}/portable-export",get(export_portable_project))
         .route(
             "/api/projects/{id}/workflow",
@@ -428,6 +444,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/projects/{id}/workflow/status",
             get(get_project_workflow_status),
         )
+        .route("/api/projects/{id}/health",get(get_project_health))
         .route(
             "/api/projects/{id}/workflow/editor-context",
             get(get_workflow_editor_context),
@@ -475,6 +492,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/projects/{id}/workflow/artifacts/{artifact_type}/approve",
             post(approve_workflow_artifact),
+        )
+        .route(
+            "/api/projects/{id}/workflow/artifacts/{artifact_type}/return-for-revision",
+            post(return_workflow_artifact_for_revision),
         )
         .route(
             "/api/projects/{id}/workflow/artifacts/{artifact_type}/generate",
@@ -577,6 +598,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/projects/{id}/interview", get(get_interview))
         .route("/api/projects/{id}/interview/answer", post(save_answer))
+        .route("/api/projects/{id}/research/plan", post(generate_research_plan))
         .route("/api/projects/{id}/research/run", post(run_research))
         .route("/api/projects/{id}/evidence", get(get_evidence))
         .route("/api/projects/{id}/index/rebuild", post(rebuild_index))
@@ -607,6 +629,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/projects/{id}/sections/{section}/approve",
             post(approve_section),
+        )
+        .route(
+            "/api/projects/{id}/sections/{section}/return-for-revision",
+            post(return_section_for_revision),
         )
         .route(
             "/api/projects/{id}/collaboration",
@@ -703,7 +729,7 @@ async fn authenticate_request(State(s):State<AppState>,mut req:Request,next:Next
     if segments.len()>=3&&segments[0]=="api"&&segments[1]=="projects"{
         let project_id=segments[2];
         if !project_id.is_empty(){
-            let role=if user.system_role=="system_admin"{Some("owner".to_owned())}else{match s.store.project_role(project_id,&user.id){Ok(role)=>role,Err(error)=>return ApiError::from(error).into_response()}};
+            let role=if user.system_role=="system_admin"{Some("owner".to_owned())}else{match s.store.ensure_organization_project_member(project_id,&user.id,&user.organization_id){Ok(role)=>role,Err(error)=>return ApiError::from(error).into_response()}};
             let Some(role)=role else{return ApiError::new(StatusCode::FORBIDDEN,"project membership is required").into_response();};
             if req.method()!=Method::GET&&role=="viewer"{return ApiError::new(StatusCode::FORBIDDEN,"viewer role cannot modify project state").into_response();}
             req.extensions_mut().insert(role);
@@ -899,8 +925,8 @@ async fn ready(State(s): State<AppState>) -> Result<Json<serde_json::Value>, Api
     ))
 }
 
-async fn list_projects(State(s): State<AppState>,Extension(user):Extension<AuthUser>) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(if user.system_role=="system_admin"{s.store.list_projects_json()?}else{s.store.list_projects_for_user_json(&user.id)?}))
+async fn list_projects(State(s): State<AppState>,Extension(user):Extension<AuthUser>,Query(query):Query<ProjectListQuery>) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(if user.system_role=="system_admin"{s.store.list_projects_json(query.include_archived)?}else{s.store.list_projects_for_user_json(&user.id,&user.organization_id,query.include_archived)?}))
 }
 async fn get_authenticated_user(Extension(user):Extension<AuthUser>)->Json<AuthUser>{Json(user)}
 async fn create_project(
@@ -937,6 +963,11 @@ async fn create_project(
         id,
         title: req.title,
     }))
+}
+async fn update_project(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path(id):Path<String>,Json(req):Json<UpdateProjectInput>)->Result<Json<serde_json::Value>,ApiError>{
+    require_roles(&role,&["owner","pi","research_administrator"])?;
+    if req.title.is_none()&&req.archived.is_none(){return Err(ApiError::bad_request("provide a title and/or archived state"));}
+    Ok(Json(s.store.update_project_metadata(&id,req.title.as_deref(),req.archived,&user.id).map_err(|error|ApiError::bad_request(error.to_string()))?))
 }
 async fn get_workflow_definitions(
     State(s): State<AppState>,
@@ -988,6 +1019,12 @@ async fn get_project_workflow_status(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(s.store.workflow_status_json(&id)?))
+}
+async fn get_project_health(
+    State(s):State<AppState>,
+    Path(id):Path<String>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    Ok(Json(s.store.project_health_json(&id)?))
 }
 async fn get_proposed_reviewer_roles(
     State(s): State<AppState>,
@@ -1439,6 +1476,19 @@ async fn approve_workflow_artifact(
     ))
 }
 
+async fn return_workflow_artifact_for_revision(
+    State(s):State<AppState>,
+    Extension(user):Extension<AuthUser>,
+    Extension(role):Extension<String>,
+    Path((id,artifact_type)):Path<(String,String)>,
+    Json(req):Json<ReturnForRevisionInput>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
+    Ok(Json(s.store.return_workflow_artifact_for_revision(
+        &id,&artifact_type,req.version,&user.id,&req.rationale,
+    ).map_err(ApiError::conflict_err)?))
+}
+
 async fn generate_workflow_artifact(
     State(s): State<AppState>,
     Extension(user):Extension<AuthUser>,
@@ -1774,7 +1824,7 @@ fn start_competitive_background_refresh(state: AppState) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(interval_seconds)).await;
-            let projects = match state.store.list_projects_json() {
+            let projects = match state.store.list_projects_json(false) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(error=%e,"competitive background refresh could not list projects");
@@ -2744,36 +2794,93 @@ fn require_compliance_profile_approved(store: &Store, id: &str) -> Result<(), Ap
     Ok(())
 }
 
-async fn run_research(
+async fn generate_research_plan(
     State(s): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Extension(role): Extension<String>,
     Path(id): Path<String>,
-    Json(req): Json<ResearchInput>,
+    Json(req): Json<ResearchPlanInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_roles(
+        &role,
+        &["owner", "pi", "contributor", "research_administrator"],
+    )?;
     require_interview_complete(&s.store, &id)?;
-    require_core_step_complete(&s.store,&id,"aims")?;
+    require_core_step_complete(&s.store, &id, "aims")?;
     let requirements = s.store.requirements_context(&id)?;
-    let solicitation = s.store.workflow_artifact_json(&id,"solicitation_profile")?;
-    let framework = s.store.workflow_artifact_json(&id,"research_framework")?;
-    let aims = s.store.workflow_artifact_json(&id,"aim_set")?;
-    for (name,artifact) in [("solicitation_profile",&solicitation),("research_framework",&framework),("aim_set",&aims)] {
-        if !artifact.get("approved").and_then(serde_json::Value::as_bool).unwrap_or(false){
-            return Err(ApiError::conflict(format!("workflow gate: approved {name} is required for literature research")));
+    let solicitation = s
+        .store
+        .workflow_artifact_json(&id, "solicitation_profile")?;
+    let framework = s
+        .store
+        .workflow_artifact_json(&id, "research_framework")?;
+    let aims = s.store.workflow_artifact_json(&id, "aim_set")?;
+    for (name, artifact) in [
+        ("solicitation_profile", &solicitation),
+        ("research_framework", &framework),
+        ("aim_set", &aims),
+    ] {
+        if !artifact
+            .get("approved")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || !s.store.workflow_artifact_is_fresh(&id, name)?
+        {
+            return Err(ApiError::conflict(format!(
+                "workflow gate: an approved and fresh {name} is required for literature planning"
+            )));
         }
     }
-    let solicitation_version=solicitation.get("version").and_then(serde_json::Value::as_i64).context("approved solicitation profile version missing")?;
-    let framework_version=framework.get("version").and_then(serde_json::Value::as_i64).context("approved research framework version missing")?;
-    let aim_set_version=aims.get("version").and_then(serde_json::Value::as_i64).context("approved aim set version missing")?;
-    let aim_ids:BTreeSet<String>=aims.get("body").and_then(|body|body.get("aims")).and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|aim|aim.get("id").and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
-    let criterion_ids:BTreeSet<String>=solicitation.get("body").and_then(|body|body.get("review_criteria")).and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|item|item.get("id").and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
-    let config=s.store.workflow_config(&id)?;
-    let interview = if config.enabled("investigator_interview"){s.store.interview_context(&id)?}else{"Not selected for this project.".into()};
-    let clinical = if config.enabled("clinical_design")&&s.store.clinical_study_typed(&id)?.is_some() {
+    let solicitation_version = solicitation
+        .get("version")
+        .and_then(serde_json::Value::as_i64)
+        .context("approved solicitation profile version missing")?;
+    let framework_version = framework
+        .get("version")
+        .and_then(serde_json::Value::as_i64)
+        .context("approved research framework version missing")?;
+    let aim_set_version = aims
+        .get("version")
+        .and_then(serde_json::Value::as_i64)
+        .context("approved aim set version missing")?;
+    let aim_ids: BTreeSet<String> = aims
+        .get("body")
+        .and_then(|body| body.get("aims"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|aim| {
+            aim.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    let criterion_ids: BTreeSet<String> = solicitation
+        .get("body")
+        .and_then(|body| body.get("review_criteria"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    let config = s.store.workflow_config(&id)?;
+    let interview = if config.enabled("investigator_interview") {
+        s.store.interview_context(&id)?
+    } else {
+        "Not selected for this project.".into()
+    };
+    let clinical = if config.enabled("clinical_design")
+        && s.store.clinical_study_typed(&id)?.is_some()
+    {
         s.store.clinical_context(&id)?
     } else {
         "Not selected for this project.".into()
     };
     let max_queries = req.max_queries.unwrap_or(8).clamp(1, 24);
-    let results_per = req.results_per_query.unwrap_or(5).clamp(1, 10);
     let prompt = format!(
         r#"Generate targeted external research queries only for unresolved evidence gaps in this grant. Return STRICT JSON only:
 {{"queries":[{{"requirement_id":"R-001","aim_ids":["aim_1"],"criterion_ids":["R-010"],"query":"precise web research query","preferred_domains":["nih.gov"],"rationale":"specific evidence gap"}}]}}
@@ -2850,11 +2957,20 @@ CLINICAL STUDY DESIGN / FEASIBILITY CONTEXT:
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase();
-        if normalized.is_empty() || !normalized_queries.insert(normalized) {
+        if normalized.is_empty() || !normalized_queries.insert(normalized.clone()) {
             failures.push(format!("ignored empty or duplicate research query: {}", query.query));
             continue;
         }
-        accepted_queries.push(query);
+        let digest = format!("{:x}", Sha256::digest(normalized.as_bytes()));
+        accepted_queries.push(LiteratureQueryRecord {
+            id: format!("query_{}", &digest[..16]),
+            query: query.query.trim().to_string(),
+            rationale: query.rationale.trim().to_string(),
+            aim_ids: query.aim_ids,
+            requirement_ids: vec![query.requirement_id],
+            criterion_ids: query.criterion_ids,
+            preferred_domains: query.preferred_domains,
+        });
     }
     if accepted_queries.is_empty() {
         return Err(ApiError::bad_request(format!(
@@ -2863,147 +2979,292 @@ CLINICAL STUDY DESIGN / FEASIBILITY CONTEXT:
         )));
     }
 
-    let mut saved = 0usize;
-    let mut query_manifest=Vec::new();
-    let mut evidence_needs=Vec::new();
-    let mut source_ids=BTreeSet::new();
-    let mut citation_ids=BTreeSet::new();
-    let mut contradictions=Vec::new();
-    let mut query_statuses=Vec::new();
-    let started_at=time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).map_err(anyhow::Error::from)?;
-    for (query_index,q) in accepted_queries.into_iter().enumerate() {
-        let query_key=format!("query_{}",query_index+1);
-        query_manifest.push(serde_json::json!({"id":query_key,"query":q.query,"rationale":q.rationale,"aim_ids":q.aim_ids,"requirement_ids":[q.requirement_id],"criterion_ids":q.criterion_ids,"preferred_domains":q.preferred_domains}));
-        let mut query_evidence_ids=Vec::new();
-        let qid = s.store.insert_research_query(
+    let body = serde_json::to_value(LiteratureSearchPlan {
+        schema_version: 1,
+        solicitation_profile_version: solicitation_version,
+        framework_version,
+        aim_set_version,
+        queries: accepted_queries,
+    })?;
+    let current = s
+        .store
+        .workflow_artifact_json(&id, "literature_search_plan")?;
+    let expected_version = current
+        .get("version")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let artifact = s
+        .store
+        .save_workflow_artifact(
             &id,
-            &q.requirement_id,
-            &q.query,
-            &q.preferred_domains,
-            &q.rationale,
-        )?;
-        match s
+            "literature_search_plan",
+            &body,
+            "model_research_planner",
+            Some(&user.id),
+            Some(expected_version),
+        )
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "artifact": artifact,
+        "model": out.model,
+        "provider": out.provider,
+        "generation_run_id": out.generation_run_id,
+        "planner_warnings": failures
+    })))
+}
+
+async fn run_research(
+    State(s): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Extension(role): Extension<String>,
+    Path(id): Path<String>,
+    Json(req): Json<ResearchInput>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_roles(
+        &role,
+        &["owner", "pi", "contributor", "research_administrator"],
+    )?;
+    require_interview_complete(&s.store, &id)?;
+    require_core_step_complete(&s.store, &id, "aims")?;
+    let artifact = s
+        .store
+        .workflow_artifact_json(&id, "literature_search_plan")?;
+    if artifact.get("version").and_then(serde_json::Value::as_i64)
+        != Some(req.search_plan_version)
+        || !artifact
+            .get("approved")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        || !s
+            .store
+            .workflow_artifact_is_fresh(&id, "literature_search_plan")?
+    {
+        return Err(ApiError::conflict(
+            "workflow gate: select an approved and fresh literature search plan",
+        ));
+    }
+    let plan: LiteratureSearchPlan = serde_json::from_value(
+        artifact
+            .get("body")
+            .cloned()
+            .context("approved literature search plan body missing")?,
+    )?;
+    let results_per = req.results_per_query.unwrap_or(5).clamp(1, 10);
+    let started_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(anyhow::Error::from)?;
+    let provider = s.research.provider_name().to_string();
+    let run_id = s
+        .store
+        .begin_research_run(
+            &id,
+            req.search_plan_version,
+            &provider,
+            &user.id,
+            &started_at,
+        )
+        .map_err(ApiError::conflict_err)?;
+    let mut staged_queries = Vec::with_capacity(plan.queries.len());
+    let mut failures = Vec::new();
+    let mut validation_models = BTreeSet::new();
+
+    for query in &plan.queries {
+        let hits = match s
             .research
-            .search(&q.query, &q.preferred_domains, results_per)
+            .search(&query.query, &query.preferred_domains, results_per)
             .await
         {
-            Ok(hits) => {
-                let fetched = s.research.fetch_many(hits).await;
-                let mut valid_sources = Vec::new();
-                for item in fetched {
-                    match item {
-                        Ok(src) => valid_sources.push(src),
-                        Err(e) => failures.push(e.to_string()),
+            Ok(hits) => hits,
+            Err(error) => {
+                failures.push(format!("{}: search failed: {error}", query.id));
+                staged_queries.push(StagedResearchQuery {
+                    query: query.clone(),
+                    terminal_status: "failed".into(),
+                    sources: Vec::new(),
+                });
+                continue;
+            }
+        };
+        let mut fetched_sources = Vec::new();
+        let mut fetched_source_keys = BTreeSet::new();
+        for fetched in s.research.fetch_many(hits).await {
+            match fetched {
+                Ok(source) => {
+                    if fetched_source_keys.insert((source.url.clone(), source.sha256.clone())) {
+                        fetched_sources.push(source);
                     }
                 }
-                if valid_sources.is_empty() {
-                    query_statuses.push((qid, "complete_no_sources".to_string()));
-                } else {
-                    let source_packet = valid_sources
-                    .iter()
-                    .enumerate()
-                    .map(|(i, src)| {
-                        let excerpt = src.text.chars().take(6000).collect::<String>();
-                        format!(
-                            "\n--- SOURCE {i} ---\nTITLE: {}\nURL: {}\nTEXT:\n{}",
-                            src.title, src.url, excerpt
-                        )
-                    })
-                    .collect::<String>();
-                    let validation_prompt = format!(
-                    r#"Validate whether each supplied source supports the stated evidence need. Return STRICT JSON only:
+                Err(error) => failures.push(format!("{}: source fetch failed: {error}", query.id)),
+            }
+        }
+        if fetched_sources.is_empty() {
+            staged_queries.push(StagedResearchQuery {
+                query: query.clone(),
+                terminal_status: "complete_no_sources".into(),
+                sources: Vec::new(),
+            });
+            continue;
+        }
+        let source_packet = fetched_sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let excerpt = source.text.chars().take(6000).collect::<String>();
+                format!(
+                    "\n--- SOURCE {index} ---\nTITLE: {}\nURL: {}\nTEXT:\n{}",
+                    source.title, source.url, excerpt
+                )
+            })
+            .collect::<String>();
+        let validation_prompt = format!(
+            r#"Validate whether each supplied source supports the stated evidence need. Return STRICT JSON only:
 {{"validations":[{{"source_index":0,"status":"supported|partially_supported|contradicted|irrelevant","confidence":0.0,"supporting_excerpt":"an exact verbatim excerpt copied from the source text, or empty if none","explanation":"brief reason"}}]}}
-The supporting_excerpt MUST be copied exactly from the supplied source. Never manufacture a quote. A source being topically related is not enough; it must actually support or contradict the evidence need.
+The supporting_excerpt MUST be copied exactly from the supplied source. Never manufacture a quote. A source being topically related is not enough; it must actually support or contradict the evidence need. Return one assessment per useful supplied source and do not repeat a source index.
 
-REQUIREMENT: {}
+REQUIREMENTS: {}
+AIMS: {}
+REVIEW CRITERIA: {}
 EVIDENCE NEED: {}
 RESEARCH QUERY: {}
 {}"#,
-                    q.requirement_id, q.rationale, q.query, source_packet
-                );
-                    let validation_out = s
-                    .router
-                    .generate_for_project(
-                        s.store.as_ref(),
-                        &id,
-                        ModelTask::structured::<EvidenceValidationEnvelope>(
-                            "evidence_validation",validation_prompt,false,"evidence_validation_envelope",1,
-                        )?,
-                    )
-                    .await?;
-                    let validations: EvidenceValidationEnvelope =
-                        parse_json_from_model(&validation_out.text)?;
-                    for v in validations.validations {
-                    if v.source_index >= valid_sources.len() {
-                        continue;
-                    }
-                    let src = &valid_sources[v.source_index];
-                    let exact = !v.supporting_excerpt.trim().is_empty()
-                        && src.text.contains(&v.supporting_excerpt);
-                    let status = match v.status.as_str() {
-                        "supported" | "partially_supported" | "contradicted" | "irrelevant" => {
-                            v.status.as_str()
-                        }
-                        _ => "candidate",
-                    };
-                    let source_id = s.store.add_research_source(&id, qid, src)?.unwrap_or(0);
-                    if source_id == 0 || status == "irrelevant" {
-                        continue;
-                    }
-                    source_ids.insert(source_id);
-                    let passage = if exact {
-                        v.supporting_excerpt.clone()
-                    } else {
-                        src.text.chars().take(1800).collect::<String>()
-                    };
-                    let effective_status = if exact { status } else { "candidate" };
-                    let confidence = v.confidence.clamp(0.0, 1.0);
-                    let ev = s.store.add_evidence(
-                        &id,
-                        Some(&q.requirement_id),
-                        "external_research",
-                        &format!("research_source:{source_id}"),
-                        &q.rationale,
-                        &passage,
-                        Some(&src.url),
-                        None,
-                        confidence,
-                        effective_status,
-                    )?;
-                    if matches!(effective_status,"supported"|"partially_supported") {
-                        query_evidence_ids.push(ev);
-                    }
-                    if status=="contradicted"{contradictions.push(format!("{}: {}",q.rationale,v.explanation));}
-                    let citation_id=s.store.add_citation(
-                        &id,
-                        ev,
-                        &format!("SRC-{source_id}"),
-                        &src.title,
-                        Some(&src.url),
-                        &passage,
-                        &src.sha256,
-                        exact,
-                    )?;
-                    citation_ids.insert(citation_id);
-                    saved += 1;
-                    }
-                    query_statuses.push((qid, "complete".to_string()));
+            query.requirement_ids.join(", "),
+            query.aim_ids.join(", "),
+            query.criterion_ids.join(", "),
+            query.rationale,
+            query.query,
+            source_packet
+        );
+        let validation_out = match s
+            .router
+            .generate_for_project(
+                s.store.as_ref(),
+                &id,
+                ModelTask::structured::<EvidenceValidationEnvelope>(
+                    "evidence_validation",
+                    validation_prompt,
+                    false,
+                    "evidence_validation_envelope",
+                    1,
+                )?,
+            )
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                failures.push(format!("{}: evidence validation failed: {error}", query.id));
+                staged_queries.push(StagedResearchQuery {
+                    query: query.clone(),
+                    terminal_status: "failed".into(),
+                    sources: Vec::new(),
+                });
+                continue;
+            }
+        };
+        validation_models.insert(format!(
+            "{}:{}",
+            validation_out.provider, validation_out.model
+        ));
+        let validations: EvidenceValidationEnvelope =
+            match parse_json_from_model(&validation_out.text) {
+                Ok(value) => value,
+                Err(error) => {
+                    failures.push(format!(
+                        "{}: evidence validation response was invalid: {error}",
+                        query.id
+                    ));
+                    staged_queries.push(StagedResearchQuery {
+                        query: query.clone(),
+                        terminal_status: "failed".into(),
+                        sources: Vec::new(),
+                    });
+                    continue;
                 }
+            };
+        let mut staged_sources = Vec::new();
+        let mut assessed_indices = BTreeSet::new();
+        for validation in validations.validations {
+            if validation.source_index >= fetched_sources.len() {
+                failures.push(format!(
+                    "{}: validator returned unknown source index {}",
+                    query.id, validation.source_index
+                ));
+                continue;
             }
-            Err(e) => {
-                query_statuses.push((qid, "failed".to_string()));
-                failures.push(e.to_string());
+            if !assessed_indices.insert(validation.source_index) {
+                failures.push(format!(
+                    "{}: validator repeated source index {}",
+                    query.id, validation.source_index
+                ));
+                continue;
             }
+            if !matches!(
+                validation.status.as_str(),
+                "supported" | "partially_supported" | "contradicted" | "irrelevant"
+            ) {
+                failures.push(format!(
+                    "{}: validator returned unsupported status {}",
+                    query.id, validation.status
+                ));
+                continue;
+            }
+            staged_sources.push(StagedResearchSource {
+                source: fetched_sources[validation.source_index].clone(),
+                validation_status: validation.status,
+                confidence: validation.confidence.clamp(0.0, 1.0),
+                supporting_excerpt: validation.supporting_excerpt,
+                explanation: validation.explanation,
+            });
         }
-        let disposition=if query_evidence_ids.is_empty(){"unresolved_risk"}else{"supported"};
-        evidence_needs.push(serde_json::json!({"evidence_need_id":query_key,"disposition":disposition,"evidence_ids":query_evidence_ids,"rationale":q.rationale}));
+        let terminal_status = if staged_sources.is_empty() {
+            failures.push(format!(
+                "{}: no fetched source received a valid evidence assessment",
+                query.id
+            ));
+            "failed"
+        } else {
+            "complete"
+        };
+        staged_queries.push(StagedResearchQuery {
+            query: query.clone(),
+            terminal_status: terminal_status.into(),
+            sources: staged_sources,
+        });
     }
-    let completed_at=time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).map_err(anyhow::Error::from)?;
-    let manifest=serde_json::json!({"schema_version":1,"run_id":Uuid::new_v4().to_string(),"solicitation_profile_version":solicitation_version,"framework_version":framework_version,"aim_set_version":aim_set_version,"started_at":started_at,"completed_at":completed_at,"search_provider":s.research.provider_name(),"queries":query_manifest,"evidence_needs":evidence_needs,"source_ids":source_ids,"citation_ids":citation_ids,"contradictions":contradictions});
-    let manifest_state=s.store.finalize_research_run(&id,&query_statuses,&manifest)?;
-    Ok(Json(
-        serde_json::json!({"model":out.model,"sources_saved":saved,"failures":failures,"evidence":s.store.evidence_json(&id)?,"literature_manifest":manifest_state}),
-    ))
+    let completed_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(anyhow::Error::from)?;
+    let staged_run = StagedResearchRun {
+        id: run_id.clone(),
+        search_plan_version: req.search_plan_version,
+        solicitation_profile_version: plan.solicitation_profile_version,
+        framework_version: plan.framework_version,
+        aim_set_version: plan.aim_set_version,
+        search_provider: provider,
+        started_at,
+        completed_at: completed_at.clone(),
+        queries: staged_queries,
+        failures: failures.clone(),
+    };
+    let manifest_state = match s.store.finalize_research_run_atomic(&id, &staged_run) {
+        Ok(state) => state,
+        Err(error) => {
+            let finalization_failure = format!("atomic research finalization failed: {error}");
+            failures.push(finalization_failure.clone());
+            let _ = s
+                .store
+                .fail_research_run(&id, &run_id, &failures, &completed_at);
+            return Err(ApiError::conflict(finalization_failure));
+        }
+    };
+    Ok(Json(serde_json::json!({
+        "run_id": run_id,
+        "search_plan_version": req.search_plan_version,
+        "validation_models": validation_models,
+        "sources_saved": manifest_state.get("sources_saved"),
+        "failures": failures,
+        "evidence": s.store.evidence_json(&id)?,
+        "literature_manifest": manifest_state
+    })))
 }
 async fn get_evidence(
     State(s): State<AppState>,
@@ -3131,7 +3392,6 @@ async fn get_collaboration(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_module_enabled(&s.store,&id,"team_collaboration")?;
     let _ = s.store.project_json(&id)?;
     Ok(Json(s.store.collaboration_json(&id)?))
 }
@@ -3143,7 +3403,6 @@ async fn join_collaboration(
     Json(req): Json<ProjectMemberInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_roles(&role, &["owner", "pi", "research_administrator"])?;
-    require_module_enabled(&s.store,&id,"team_collaboration")?;
     let _ = s.store.project_json(&id)?;
     s.store
         .add_project_member(&id, &req.user_id, &req.role, Some(&user.id))
@@ -3158,7 +3417,6 @@ async fn post_collaboration_message(
     Json(req): Json<CollaborationMessageInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
-    require_module_enabled(&s.store,&id,"team_collaboration")?;
     let _ = s.store.project_json(&id)?;
     s.store
         .post_channel_message(&id,req.channel_kind.as_deref().unwrap_or("general"),req.subject_key.as_deref(),&user.id,&req.body,req.parent_message_id,&req.mentioned_user_ids)
@@ -3166,7 +3424,6 @@ async fn post_collaboration_message(
     Ok(Json(s.store.collaboration_json(&id)?))
 }
 async fn get_collaboration_workspace(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path(id):Path<String>)->Result<Json<serde_json::Value>,ApiError>{
-    require_module_enabled(&s.store,&id,"team_collaboration")?;
     let collaboration=s.store.collaboration_json(&id)?;
     let can_manage_members=matches!(role.as_str(),"owner"|"pi"|"research_administrator");
     let can_post=role!="viewer";
@@ -3179,11 +3436,12 @@ async fn get_collaboration_workspace(State(s):State<AppState>,Extension(user):Ex
         "notifications":s.store.notifications_json(&user.id,Some(&id))?,
         "invites":invites,
         "approval_routing":s.store.approval_routing_status_json(&id)?,
+        "health":s.store.project_health_json(&id)?,
         "permissions":{"role":role,"can_manage_members":can_manage_members,"can_post":can_post,"can_create_tasks":can_create_tasks}
     })))
 }
 async fn create_invite(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path(id):Path<String>,Json(req):Json<InviteInput>)->Result<Json<serde_json::Value>,ApiError>{
-    require_roles(&role,&["owner","pi","research_administrator"])?;require_module_enabled(&s.store,&id,"team_collaboration")?;
+    require_roles(&role,&["owner","pi","research_administrator"])?;
     let days=req.expires_in_days.unwrap_or(7).clamp(1,30);
     let mut invite=s.store.create_project_invite(&id,&req.email,&req.role,&user.id,days).map_err(|e|ApiError::bad_request(e.to_string()))?;
     let token=invite.get("token").and_then(serde_json::Value::as_str).context("created invite token is missing")?.to_owned();
@@ -3201,14 +3459,14 @@ async fn create_invite(State(s):State<AppState>,Extension(user):Extension<AuthUs
 async fn list_invites(State(s):State<AppState>,Extension(role):Extension<String>,Path(id):Path<String>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","research_administrator"])?;Ok(Json(s.store.project_invites_json(&id)?))}
 async fn revoke_invite(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,invite)):Path<(String,String)>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","research_administrator"])?;s.store.revoke_project_invite(&id,&invite,&user.id).map_err(|e|ApiError::bad_request(e.to_string()))?;Ok(Json(serde_json::json!({"revoked":true,"invite_id":invite})))}
 async fn accept_invite(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Json(req):Json<AcceptInviteInput>)->Result<Json<serde_json::Value>,ApiError>{Ok(Json(s.store.accept_project_invite(&req.token,&user.id,user.email.as_deref()).map_err(|e|ApiError::bad_request(e.to_string()))?))}
-async fn get_channel_messages(State(s):State<AppState>,Path((id,kind)):Path<(String,String)>,Query(query):Query<ChannelQuery>)->Result<Json<serde_json::Value>,ApiError>{require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.channel_messages_json(&id,&kind,query.subject_key.as_deref())?))}
-async fn post_channel_message(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,kind)):Path<(String,String)>,Query(query):Query<ChannelQuery>,Json(req):Json<CollaborationMessageInput>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.post_channel_message(&id,&kind,query.subject_key.as_deref(),&user.id,&req.body,req.parent_message_id,&req.mentioned_user_ids).map_err(|e|ApiError::bad_request(e.to_string()))?))}
-async fn get_comments(State(s):State<AppState>,Path((id,artifact_type,artifact_key)):Path<(String,String,String)>,Query(query):Query<CommentQuery>)->Result<Json<serde_json::Value>,ApiError>{require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.comments_json(&id,&artifact_type,&artifact_key,query.version_id)?))}
-async fn post_comment(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,artifact_type,artifact_key)):Path<(String,String,String)>,Json(req):Json<CommentInput>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.add_comment(&id,&artifact_type,&artifact_key,req.version_id,req.start_offset,req.end_offset,req.quoted_text.as_deref(),&user.id,&req.body,req.parent_comment_id,&req.mentioned_user_ids).map_err(|e|ApiError::bad_request(e.to_string()))?))}
-async fn resolve_comment(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,comment_id)):Path<(String,i64)>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;require_module_enabled(&s.store,&id,"team_collaboration")?;s.store.resolve_comment(&id,comment_id,&user.id).map_err(|e|ApiError::bad_request(e.to_string()))?;Ok(Json(serde_json::json!({"resolved":true,"comment_id":comment_id})))}
-async fn get_tasks(State(s):State<AppState>,Path(id):Path<String>)->Result<Json<serde_json::Value>,ApiError>{require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.tasks_json(&id)?))}
-async fn create_task(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path(id):Path<String>,Json(req):Json<TaskInput>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","contributor","research_administrator"])?;require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.create_task(&id,&req.title,&req.description,&req.owner_user_id,&req.source,&req.priority,req.due_at.as_deref(),&user.id,&req.dependencies).map_err(|e|ApiError::bad_request(e.to_string()))?))}
-async fn update_task_status(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,task_id)):Path<(String,String)>,Json(req):Json<TaskStatusInput>)->Result<Json<serde_json::Value>,ApiError>{require_module_enabled(&s.store,&id,"team_collaboration")?;s.store.update_task_status(&id,&task_id,&req.status,&user.id,&role).map_err(|e|ApiError::bad_request(e.to_string()))?;Ok(Json(serde_json::json!({"task_id":task_id,"status":req.status})))}
+async fn get_channel_messages(State(s):State<AppState>,Path((id,kind)):Path<(String,String)>,Query(query):Query<ChannelQuery>)->Result<Json<serde_json::Value>,ApiError>{Ok(Json(s.store.channel_messages_json(&id,&kind,query.subject_key.as_deref())?))}
+async fn post_channel_message(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,kind)):Path<(String,String)>,Query(query):Query<ChannelQuery>,Json(req):Json<CollaborationMessageInput>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;Ok(Json(s.store.post_channel_message(&id,&kind,query.subject_key.as_deref(),&user.id,&req.body,req.parent_message_id,&req.mentioned_user_ids).map_err(|e|ApiError::bad_request(e.to_string()))?))}
+async fn get_comments(State(s):State<AppState>,Path((id,artifact_type,artifact_key)):Path<(String,String,String)>,Query(query):Query<CommentQuery>)->Result<Json<serde_json::Value>,ApiError>{Ok(Json(s.store.comments_json(&id,&artifact_type,&artifact_key,query.version_id)?))}
+async fn post_comment(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,artifact_type,artifact_key)):Path<(String,String,String)>,Json(req):Json<CommentInput>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;Ok(Json(s.store.add_comment(&id,&artifact_type,&artifact_key,req.version_id,req.start_offset,req.end_offset,req.quoted_text.as_deref(),&user.id,&req.body,req.parent_comment_id,&req.mentioned_user_ids).map_err(|e|ApiError::bad_request(e.to_string()))?))}
+async fn resolve_comment(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,comment_id)):Path<(String,i64)>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;s.store.resolve_comment(&id,comment_id,&user.id).map_err(|e|ApiError::bad_request(e.to_string()))?;Ok(Json(serde_json::json!({"resolved":true,"comment_id":comment_id})))}
+async fn get_tasks(State(s):State<AppState>,Path(id):Path<String>)->Result<Json<serde_json::Value>,ApiError>{Ok(Json(s.store.tasks_json(&id)?))}
+async fn create_task(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path(id):Path<String>,Json(req):Json<TaskInput>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","contributor","research_administrator"])?;Ok(Json(s.store.create_task(&id,&req.title,&req.description,&req.owner_user_id,&req.source,&req.priority,req.due_at.as_deref(),&user.id,&req.dependencies).map_err(|e|ApiError::bad_request(e.to_string()))?))}
+async fn update_task_status(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,task_id)):Path<(String,String)>,Json(req):Json<TaskStatusInput>)->Result<Json<serde_json::Value>,ApiError>{s.store.update_task_status(&id,&task_id,&req.status,&user.id,&role).map_err(|e|ApiError::bad_request(e.to_string()))?;Ok(Json(serde_json::json!({"task_id":task_id,"status":req.status})))}
 async fn get_notifications(State(s):State<AppState>,Extension(user):Extension<AuthUser>)->Result<Json<serde_json::Value>,ApiError>{Ok(Json(s.store.notifications_json(&user.id,None)?))}
 async fn read_notification(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Path(notification_id):Path<i64>)->Result<Json<serde_json::Value>,ApiError>{s.store.mark_notification_read(&user.id,notification_id).map_err(|e|ApiError::bad_request(e.to_string()))?;Ok(Json(serde_json::json!({"read":true,"notification_id":notification_id})))}
 async fn save_section(
@@ -3277,6 +3535,19 @@ async fn approve_section(
     }
     response["stage"]=serde_json::json!(s.store.compatibility_stage(&id)?);
     Ok(Json(response))
+}
+
+async fn return_section_for_revision(
+    State(s):State<AppState>,
+    Extension(user):Extension<AuthUser>,
+    Extension(role):Extension<String>,
+    Path((id,section)):Path<(String,String)>,
+    Json(req):Json<ReturnForRevisionInput>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
+    Ok(Json(s.store.return_section_for_revision(
+        &id,&section,req.version,&user.id,&req.rationale,
+    ).map_err(ApiError::conflict_err)?))
 }
 async fn approved_sections(
     State(s): State<AppState>,

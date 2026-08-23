@@ -297,7 +297,7 @@ impl ModelRouter {
             .unwrap_or(300u64);
         Ok(Self{
             client:Client::builder().timeout(Duration::from_secs(timeout)).build().expect("HTTP client"),
-            local_url:std::env::var("LOCAL_LLM_URL").or_else(|_|std::env::var("OLMO_URL")).unwrap_or_else(|_|"http://host.docker.internal:8000/v1/chat/completions".into()),
+            local_url:std::env::var("LOCAL_LLM_URL").or_else(|_|std::env::var("OLMO_URL")).unwrap_or_else(|_|"http://ollama:11434/v1/chat/completions".into()),
             local_model:std::env::var("LOCAL_LLM_MODEL").or_else(|_|std::env::var("OLMO_MODEL")).unwrap_or_else(|_|"grant-olmo".into()),
             local_prompt_prefix:std::env::var("LOCAL_LLM_PROMPT_PREFIX").unwrap_or_default(),
             local_backend:LocalBackend::from_env()?,

@@ -1,4 +1,31 @@
 services:
+  ollama:
+    profiles: ["local-model"]
+    image: ollama/ollama:0.32.14
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-4096}
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-1}
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-10m}
+    volumes:
+      - grant-ollama-models:/root/.ollama
+    ports: ["127.0.0.1:11434:11434"]
+    mem_limit: ${OLLAMA_MEMORY_LIMIT:-3g}
+    cpus: ${OLLAMA_CPU_LIMIT:-4.0}
+    pids_limit: 512
+    init: true
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 8s
+      retries: 30
+      start_period: 20s
+
   embedding-cpu:
     profiles: ["cpu-embedding"]
     build:
@@ -96,16 +123,16 @@ services:
       APP_PUBLIC_URL: ${APP_PUBLIC_URL:-http://127.0.0.1:7860}
       MODEL_ROUTING_MODE: ${MODEL_ROUTING_MODE:-hybrid}
       REQUIRE_CLAUDE_IN_HYBRID: ${REQUIRE_CLAUDE_IN_HYBRID:-false}
-      LOCAL_LLM_PROVIDER: ${LOCAL_LLM_PROVIDER:-mlx}
-      LOCAL_LLM_URL: ${LOCAL_LLM_URL:-${OLMO_URL:-http://host.docker.internal:8000/v1/chat/completions}}
-      LOCAL_LLM_MODEL: ${LOCAL_LLM_API_MODEL:-${OLMO_API_MODEL:-grant-olmo}}
+      LOCAL_LLM_PROVIDER: ${LOCAL_LLM_PROVIDER:-ollama}
+      LOCAL_LLM_URL: ${LOCAL_LLM_URL:-${OLMO_URL:-http://ollama:11434/v1/chat/completions}}
+      LOCAL_LLM_MODEL: ${LOCAL_LLM_API_MODEL:-${OLMO_API_MODEL:-qwen3:1.7b}}
       LOCAL_LLM_MAX_TOKENS: ${LOCAL_LLM_MAX_TOKENS:-${OLMO_MAX_TOKENS:-4096}}
       LOCAL_LLM_PROMPT_PREFIX: ${LOCAL_LLM_PROMPT_PREFIX:-}
       # OLMO_* remains populated for backward compatibility with older releases.
-      OLMO_URL: ${OLMO_URL:-http://host.docker.internal:8000/v1/chat/completions}
-      OLMO_MODEL: ${OLMO_API_MODEL:-grant-olmo}
+      OLMO_URL: ${OLMO_URL:-http://ollama:11434/v1/chat/completions}
+      OLMO_MODEL: ${OLMO_API_MODEL:-qwen3:1.7b}
       OLMO_MAX_TOKENS: ${OLMO_MAX_TOKENS:-4096}
-      EMBEDDING_URL: ${EMBEDDING_URL:-http://host.docker.internal:8000/v1/embeddings}
+      EMBEDDING_URL: ${EMBEDDING_URL:-http://embedding-cpu:8010/v1/embeddings}
       EMBEDDING_MODEL: ${EMBEDDING_API_MODEL:-grant-embedding}
       EMBEDDING_DOCUMENT_PREFIX: "${EMBEDDING_DOCUMENT_PREFIX:-}"
       EMBEDDING_QUERY_PREFIX: "${EMBEDDING_QUERY_PREFIX:-}"
@@ -235,6 +262,7 @@ services:
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1}
       GRANT_SECTIONS: ${GRANT_SECTIONS:-}
       COMPETITIVE_UI_POLL_SECONDS: ${COMPETITIVE_UI_POLL_SECONDS:-14400}
+      COLLABORATION_UI_POLL_SECONDS: ${COLLABORATION_UI_POLL_SECONDS:-5}
       COMPETITIVE_UPDATE_LABEL: ${COMPETITIVE_UPDATE_LABEL:-Competitive Edge Auto-Update}
       PYTHONDONTWRITEBYTECODE: "1"
       HOME: /tmp
@@ -264,3 +292,4 @@ services:
 volumes:
   grant-data:
   grant-embedding-models:
+  grant-ollama-models:

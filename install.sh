@@ -20,17 +20,16 @@ set -a; source .env; set +a
 mkdir -p "${GRANT_EXPORT_HOME:-$ROOT/exports}" "${BACKUP_DIR:-$ROOT/backups}" "${BENCHMARK_OUTPUT_DIR:-$ROOT/benchmarks}" "${RELEASE_DIR:-$ROOT/releases}"
 FREE_KB="$(df -Pk "$ROOT" | awk 'NR==2{print $4}')"
 if [[ "${FREE_KB:-0}" -lt 10485760 ]]; then echo "WARNING: less than 10 GB free disk space is available; model/container installation may fail." >&2; fi
+./scripts/bootstrap_dependencies.sh
 ./scripts/configure_runtime.sh .runtime.env
 set -a; source .runtime.env; set +a
-command -v docker >/dev/null 2>&1 || { echo "ERROR: Docker Desktop is required." >&2; exit 3; }
+command -v docker >/dev/null 2>&1 || { echo "ERROR: automatic Docker Desktop installation did not provide the Docker CLI." >&2; exit 3; }
 docker info >/dev/null 2>&1 || { echo "ERROR: Docker Desktop is installed but its daemon is not running." >&2; exit 4; }
-if [[ "$GRANT_RUNTIME_PROFILE" == "apple_mlx" ]]; then command -v uv >/dev/null 2>&1 || { echo "ERROR: Apple-Silicon MLX mode requires uv." >&2; exit 5; }; fi
-if [[ "$GRANT_RUNTIME_PROFILE" == "apple_ollama" ]]; then command -v ollama >/dev/null 2>&1 || { echo "ERROR: The 8 GB Apple-Silicon profile requires Ollama. Install it from https://ollama.com/download/mac." >&2; exit 6; }; fi
 ./scripts/validate.sh
 echo
 printf 'Installation/bootstrap complete.\nRuntime profile: %s\n' "$GRANT_RUNTIME_PROFILE"
-if [[ "${MODEL_ROUTING_MODE:-}" == "local_only" ]]; then
-  echo "Next: review .env, then run ./start.sh (no cloud model credential is required)."
-else
-  echo "Next: edit .env with required provider credentials, then run ./start.sh"
+if [[ "${START_AFTER_INSTALL:-true}" == "true" ]]; then
+  echo "Starting the model runtime and application containers..."
+  exec "$ROOT/start.sh"
 fi
+echo "Automatic startup was disabled with START_AFTER_INSTALL=false. Run ./start.sh when ready."

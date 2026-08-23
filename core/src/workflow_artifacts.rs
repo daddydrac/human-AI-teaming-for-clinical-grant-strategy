@@ -152,7 +152,7 @@ pub struct AimSet {
     pub aims: Vec<ResearchAim>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct LiteratureQueryRecord {
     pub id: String,
     pub query: String,
@@ -167,7 +167,16 @@ pub struct LiteratureQueryRecord {
     pub preferred_domains: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LiteratureSearchPlan {
+    pub schema_version: u32,
+    pub solicitation_profile_version: i64,
+    pub framework_version: i64,
+    pub aim_set_version: i64,
+    pub queries: Vec<LiteratureQueryRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceNeedDisposition {
     Supported,
@@ -175,7 +184,7 @@ pub enum EvidenceNeedDisposition {
     UnresolvedRisk,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EvidenceNeedResolution {
     pub evidence_need_id: String,
     pub disposition: EvidenceNeedDisposition,
@@ -184,10 +193,12 @@ pub struct EvidenceNeedResolution {
     pub rationale: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LiteratureManifest {
     pub schema_version: u32,
     pub run_id: String,
+    #[serde(default)]
+    pub search_plan_version: Option<i64>,
     pub solicitation_profile_version: i64,
     pub framework_version: i64,
     pub aim_set_version: i64,
@@ -454,6 +465,7 @@ pub fn validate_artifact_document(artifact_type: &str, body: &Value, approval: b
         "solicitation_profile" => validate_solicitation(parse(body, artifact_type)?, approval),
         "research_framework" => validate_framework(parse(body, artifact_type)?, approval),
         "aim_set" => validate_aims(parse(body, artifact_type)?, approval),
+        "literature_search_plan" => validate_literature_search_plan(parse(body, artifact_type)?, approval),
         "literature_manifest" => validate_literature(parse(body, artifact_type)?, approval),
         "proposal_snapshot" => validate_proposal_snapshot(parse(body, artifact_type)?, approval),
         "opportunity_fit" => validate_opportunity_fit(parse(body, artifact_type)?, approval),
@@ -664,9 +676,44 @@ fn validate_aims(aim_set: AimSet, approval: bool) -> Result<()> {
     Ok(())
 }
 
+fn validate_literature_search_plan(plan: LiteratureSearchPlan, approval: bool) -> Result<()> {
+    if plan.schema_version != 1 {
+        bail!("unsupported literature search-plan schema version");
+    }
+    if plan.solicitation_profile_version <= 0
+        || plan.framework_version <= 0
+        || plan.aim_set_version <= 0
+    {
+        bail!("literature search-plan input versions must be positive");
+    }
+    if plan.queries.is_empty() {
+        bail!("literature search plan requires at least one query");
+    }
+    unique_non_empty(plan.queries.iter().map(|query| query.id.as_str()), "literature query id")?;
+    let mut normalized_queries = BTreeSet::new();
+    for query in &plan.queries {
+        required(&query.query, "literature query")?;
+        required(&query.rationale, "literature query rationale")?;
+        if approval && query.aim_ids.is_empty() {
+            bail!("approved literature query {} must map to at least one aim", query.id);
+        }
+        if approval && query.requirement_ids.is_empty() {
+            bail!("approved literature query {} must map to at least one solicitation requirement", query.id);
+        }
+        let normalized = query.query.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        if !normalized_queries.insert(normalized) {
+            bail!("literature search plan contains duplicate queries");
+        }
+    }
+    Ok(())
+}
+
 fn validate_literature(manifest: LiteratureManifest, approval: bool) -> Result<()> {
-    if manifest.schema_version != 1 {
+    if !matches!(manifest.schema_version, 1 | 2) {
         bail!("unsupported literature manifest schema version");
+    }
+    if manifest.schema_version >= 2 && manifest.search_plan_version.unwrap_or_default() <= 0 {
+        bail!("literature manifest schema v2 requires a positive approved search-plan version");
     }
     if manifest.solicitation_profile_version <= 0
         || manifest.framework_version <= 0

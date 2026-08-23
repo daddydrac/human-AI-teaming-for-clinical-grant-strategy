@@ -149,6 +149,7 @@ grep -q '@app.post("/package")' "$ROOT/renderer/app.py"
 grep -q '^COMPETITIVE_REFRESH_TTL_SECONDS=14400$' "$ROOT/.env.example"
 grep -q '^COMPETITIVE_BACKGROUND_REFRESH_SECONDS=14400$' "$ROOT/.env.example"
 grep -q '^COMPETITIVE_UI_POLL_SECONDS=14400$' "$ROOT/.env.example"
+grep -q '^COLLABORATION_UI_POLL_SECONDS=5$' "$ROOT/.env.example"
 if [[ "$PYTHON_RUNTIME_IMPORTS_READY" == "1" ]]; then
 python3 - "$ROOT" <<'PYPH7'
 import importlib.util,sys
@@ -175,35 +176,37 @@ grep -q '^COMPOSE_PROFILES=cpu-embedding$' "$TMP"
 grep -q '^MODEL_ROUTING_MODE=claude_only$' "$TMP"
 grep -q '^EMBEDDING_URL=http://embedding-cpu:8010/v1/embeddings$' "$TMP"
 grep -q '^OMP_NUM_THREADS=' "$TMP"
-GRANT_RUNTIME_PROFILE=apple_mlx "$ROOT/scripts/configure_runtime.sh" "$TMP_M4" >/dev/null
+GRANT_RUNTIME_PROFILE=container_ollama LOCAL_LLM_API_MODEL=olmo-3:7b-instruct-q4_K_M "$ROOT/scripts/configure_runtime.sh" "$TMP_M4" >/dev/null
 python3 - "$ROOT/env.m4Mac.txt" "$ROOT/env.m4Mac.qwen3.txt" "$TMP_M4" <<'PYM4'
 import sys
 def values(path):
     return dict(line.strip().split('=',1) for line in open(path) if '=' in line and not line.lstrip().startswith('#'))
 template,qwen,runtime=map(values,sys.argv[1:])
-assert template['GRANT_RUNTIME_PROFILE']=='apple_mlx'
+assert template['GRANT_RUNTIME_PROFILE']=='container_ollama'
 assert template['MODEL_ROUTING_MODE']=='hybrid'
 assert template['REQUIRE_CLAUDE_IN_HYBRID']=='true'
 assert template['OMP_NUM_THREADS']==template['RAYON_NUM_THREADS']=='8'
 assert float(template['CORE_CPU_LIMIT'])>=int(template['OMP_NUM_THREADS'])
-assert qwen['GRANT_RUNTIME_PROFILE']=='apple_mlx'
+assert qwen['GRANT_RUNTIME_PROFILE']=='container_ollama'
 assert qwen['MODEL_ROUTING_MODE']=='hybrid'
 assert qwen['REQUIRE_CLAUDE_IN_HYBRID']=='true'
-assert qwen['LOCAL_LLM_MODEL_REPO']=='mlx-community/Qwen3-8B-4bit'
+assert qwen['LOCAL_LLM_PROVIDER']=='ollama' and qwen['LOCAL_LLM_API_MODEL']=='qwen3:8b'
+assert runtime['COMPOSE_PROFILES']=='cpu-embedding,local-model'
+assert runtime['LOCAL_LLM_URL']=='http://ollama:11434/v1/chat/completions'
 assert runtime['OMP_NUM_THREADS']==runtime['RAYON_NUM_THREADS']
 assert float(runtime['CORE_CPU_LIMIT'])>=int(runtime['OMP_NUM_THREADS'])
 PYM4
-GRANT_RUNTIME_PROFILE=apple_ollama MODEL_ROUTING_MODE=local_only LOCAL_LLM_API_MODEL=qwen3:1.7b "$ROOT/scripts/configure_runtime.sh" "$TMP_M2" >/dev/null
+GRANT_RUNTIME_PROFILE=container_ollama MODEL_ROUTING_MODE=local_only LOCAL_LLM_API_MODEL=qwen3:1.7b "$ROOT/scripts/configure_runtime.sh" "$TMP_M2" >/dev/null
 python3 - "$ROOT/env.m2Mac.8gb.txt" "$TMP_M2" <<'PYM2'
 import sys
 def values(path):
     return dict(line.strip().split('=',1) for line in open(path) if '=' in line and not line.lstrip().startswith('#'))
 template,runtime=map(values,sys.argv[1:])
-assert template['GRANT_RUNTIME_PROFILE']=='apple_ollama'
+assert template['GRANT_RUNTIME_PROFILE']=='container_ollama'
 assert template['MODEL_ROUTING_MODE']=='local_only'
 assert template['LOCAL_LLM_API_MODEL']=='qwen3:1.7b'
 assert template['OLLAMA_CONTEXT_LENGTH']=='4096'
-assert runtime['COMPOSE_PROFILES']=='cpu-embedding'
+assert runtime['COMPOSE_PROFILES']=='cpu-embedding,local-model'
 assert runtime['LOCAL_LLM_PROVIDER']=='ollama'
 assert runtime['LOCAL_LLM_API_MODEL']=='qwen3:1.7b'
 assert int(runtime['CONTEXT_MAX_CHARS'])<=8000
@@ -211,20 +214,24 @@ assert int(runtime['OMP_NUM_THREADS'])<=2
 PYM2
 
 if command -v docker >/dev/null 2>&1; then
-  (cd "$ROOT" && docker compose config >/dev/null && docker compose --profile cpu-embedding config >/dev/null && docker build --target test -f Dockerfile.core . && docker compose build)
+  (cd "$ROOT" && docker compose config >/dev/null && docker compose --profile cpu-embedding --profile local-model config >/dev/null && docker build --target test -f Dockerfile.core . && docker compose build)
   (cd "$ROOT" && docker compose run --rm --no-deps -e AUTH_MODE=local_single_user ui python - <<'PYCOLLAB'
 import app,inspect
 assert hasattr(app,'load_team_workspace') and hasattr(app,'post_artifact_comment')
+assert hasattr(app,'poll_team_workspace') and hasattr(app,'poll_team_channel') and hasattr(app,'poll_shared_artifact_versions')
 assert hasattr(app,'version_history') and hasattr(app,'compare_versions') and hasattr(app,'restore_version')
+assert hasattr(app,'return_artifact_for_revision') and hasattr(app,'return_section_for_revision')
 assert hasattr(app,'_editor_context') and hasattr(app,'_reference_rows')
 sample={
   'members':[{'user_id':'u1','name':'Owner','email':'owner@example.org','role':'owner'}],
   'tasks':[{'id':'t2','priority':'high','status':'blocked','title':'Dependent task','owner_user_id':'u1','source':'human','dependencies':['t1']}],
   'notifications':[{'id':3,'kind':'task_assigned','payload':{'task_id':'t2'}}],
-  'approval_routing':{'routes':[{'title':'Specific Aims','current_version':7,'owner_user_id':'u1','approver_user_ids':['u1'],'approvals':1,'minimum_approvals':1,'threshold_met':True,'approved':True}]}
+  'approval_routing':{'routes':[{'title':'Specific Aims','current_version':7,'owner_user_id':'u1','approver_user_ids':['u1'],'approvals':1,'minimum_approvals':1,'threshold_met':True,'approved':True}]},
+  'health':{'state':'at_risk','summary':{'critical':0,'high':1,'medium':0,'total':1},'issues':[{'severity':'high','kind':'blocked_task','title':'Blocked task','detail':'Waiting','owner_user_id':'u1','step_key':None,'due_at':None,'remediation':'Resolve it'}]}
 }
 rows=app.team_workspace_rows(sample)
-assert rows[3][0][7]=='t1' and rows[4][0][0]==3 and rows[5][0][6] is True
+assert rows[0][0][4] is False and rows[3][0][7]=='t1' and rows[4][0][0]==3 and rows[5][0][6] is True and rows[6][0][0]=='high'
+assert 'at risk' in app.project_health_summary(sample) and 'High **1**' in app.project_health_summary(sample)
 def variadic(value,*items):return value,items
 signature=inspect.signature(app.gateway_callback(variadic))
 assert signature.parameters['request'].kind==inspect.Parameter.KEYWORD_ONLY
@@ -234,6 +241,9 @@ assert {row[1] for row in references}=={'R1','C1','u1','aims','A1',7}
 metadata={'body':{},'editor_context':context}
 assert app.framework_body(metadata,'Argument',[])['solicitation_profile_version']==3
 assert app.aims_body(metadata,'Objective','Hypothesis',[])['framework_version']==2
+plan=app.search_plan_body(metadata,[['query_1','primary study','evidence gap','A1','R1','C1','nih.gov']])
+assert plan['solicitation_profile_version']==3 and plan['framework_version']==2 and plan['aim_set_version']==1
+assert plan['queries'][0]['requirement_ids']==['R1'] and app.COLLABORATION_UI_POLL_SECONDS==5
 print('Collaboration and version-reconciliation UI construction validation passed.')
 PYCOLLAB
   )
@@ -244,6 +254,8 @@ elif command -v cargo >/dev/null 2>&1; then
 else
   echo "Docker and Cargo are unavailable; Rust compilation is deferred to the target environment."
 fi
+grep -q '/return-for-revision' "$ROOT/core/src/main.rs"
+grep -q 'artifact_approval_events' "$ROOT/core/src/storage.rs"
 echo "Validation completed."
 
 # Phase 8 production hardening / release engineering
