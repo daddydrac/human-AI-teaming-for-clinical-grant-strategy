@@ -1,15 +1,109 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
-use serde_json::json;
+use schemars::JsonSchema;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, time::Duration};
 
 use crate::workflow::WorkflowConfig;
 
+#[derive(Debug, Clone)]
+pub struct StructuredOutputContract {
+    pub name: String,
+    pub version: u32,
+    pub schema: Value,
+    pub schema_sha256: String,
+}
+
+impl StructuredOutputContract {
+    pub fn for_type<T: JsonSchema>(name: &str, version: u32) -> Result<Self> {
+        if version == 0
+            || name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            anyhow::bail!("structured output contract requires a provider-safe name and positive version");
+        }
+        let mut schema = serde_json::to_value(schemars::schema_for!(T))?;
+        harden_object_schemas(&mut schema);
+        let schema_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&schema)?));
+        Ok(Self {
+            name: name.to_owned(),
+            version,
+            schema,
+            schema_sha256,
+        })
+    }
+
+    pub fn validate_text(&self, text: &str) -> Result<Value> {
+        let value: Value = serde_json::from_str(text).with_context(|| {
+            format!(
+                "model response is not JSON for contract {} v{}",
+                self.name, self.version
+            )
+        })?;
+        let validator = jsonschema::validator_for(&self.schema).with_context(|| {
+            format!("invalid JSON Schema for contract {} v{}", self.name, self.version)
+        })?;
+        if let Err(error) = validator.validate(&value) {
+            anyhow::bail!(
+                "model response violates contract {} v{} at {}: {}",
+                self.name,
+                self.version,
+                error.instance_path,
+                error
+            );
+        }
+        Ok(value)
+    }
+}
+
+fn harden_object_schemas(value: &mut Value) {
+    match value {
+        Value::Array(items) => items.iter_mut().for_each(harden_object_schemas),
+        Value::Object(object) => {
+            for child in object.values_mut() {
+                harden_object_schemas(child);
+            }
+            if object.get("type").and_then(Value::as_str) == Some("object")
+                && object.contains_key("properties")
+                && !object.contains_key("additionalProperties")
+            {
+                object.insert("additionalProperties".into(), Value::Bool(false));
+            }
+        }
+        _ => {}
+    }
+}
+
 pub struct ModelTask {
     pub kind: String,
     pub prompt: String,
     pub high_value: bool,
+    pub output_contract: Option<StructuredOutputContract>,
+}
+
+impl ModelTask {
+    pub fn text(kind: impl Into<String>, prompt: impl Into<String>, high_value: bool) -> Self {
+        Self { kind: kind.into(), prompt: prompt.into(), high_value, output_contract: None }
+    }
+
+    pub fn structured<T: JsonSchema>(
+        kind: impl Into<String>,
+        prompt: impl Into<String>,
+        high_value: bool,
+        contract_name: &str,
+        contract_version: u32,
+    ) -> Result<Self> {
+        Ok(Self {
+            kind: kind.into(),
+            prompt: prompt.into(),
+            high_value,
+            output_contract: Some(StructuredOutputContract::for_type::<T>(contract_name, contract_version)?),
+        })
+    }
 }
 #[derive(Debug, Clone)]
 pub struct ModelOutput {
@@ -32,6 +126,7 @@ pub trait GenerationAudit: Send + Sync {
         model: &str,
         prompt_sha256: &str,
         high_value: bool,
+        output_contract: Option<&StructuredOutputContract>,
     ) -> Result<String>;
     fn complete_generation(
         &self,
@@ -85,21 +180,20 @@ fn parse_claude_wire_response(
     v: &serde_json::Value,
     model: &str,
     max_tokens: usize,
+    structured: bool,
 ) -> Result<ModelOutput> {
     if v.get("stop_reason").and_then(|x| x.as_str()) == Some("max_tokens") {
         anyhow::bail!(
             "Claude response reached CLAUDE_MAX_TOKENS={max_tokens}; increase the limit and retry"
         );
     }
-    let text = v
-        .get("content")
-        .and_then(|x| x.as_array())
-        .and_then(|a| {
-            a.iter()
-                .find_map(|x| x.get("text").and_then(|t| t.as_str()))
-        })
-        .context("missing Claude response")?
-        .to_string();
+    let content=v.get("content").and_then(Value::as_array).context("missing Claude response content")?;
+    let text=if structured {
+        let input=content.iter().find(|item|item.get("type").and_then(Value::as_str)==Some("tool_use")&&item.get("name").and_then(Value::as_str)==Some("submit_structured_output")).and_then(|item|item.get("input")).context("Claude did not return the required structured-output tool call")?;
+        serde_json::to_string(input)?
+    } else {
+        content.iter().find_map(|item|item.get("text").and_then(Value::as_str)).context("missing Claude text response")?.to_owned()
+    };
     Ok(ModelOutput {
         model: model.to_string(),
         provider: "anthropic".into(),
@@ -108,6 +202,49 @@ fn parse_claude_wire_response(
         generation_run_id: String::new(),
         text,
     })
+}
+
+fn parse_ollama_wire_response(v:&Value,model:&str,max_tokens:usize)->Result<ModelOutput>{
+    if v.get("done_reason").and_then(Value::as_str)==Some("length"){
+        anyhow::bail!("Ollama response reached LOCAL_LLM_MAX_TOKENS={max_tokens}; increase the limit or reduce context and retry");
+    }
+    let text=v.pointer("/message/content").and_then(Value::as_str).context("missing Ollama response")?.to_owned();
+    Ok(ModelOutput{model:model.to_owned(),provider:"local".into(),routing_mode:String::new(),task_kind:String::new(),generation_run_id:String::new(),text})
+}
+
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+enum LocalBackend { Vllm, Ollama }
+
+impl LocalBackend {
+    fn from_env()->Result<Self>{
+        match std::env::var("LOCAL_LLM_PROVIDER").unwrap_or_else(|_|"vllm".into()).trim().to_ascii_lowercase().as_str(){
+            "ollama"=>Ok(Self::Ollama),
+            "vllm"|"vllm_mlx"|"mlx"|"openai_compatible"=>Ok(Self::Vllm),
+            other=>anyhow::bail!("unsupported LOCAL_LLM_PROVIDER: {other}"),
+        }
+    }
+    fn as_str(self)->&'static str{match self{Self::Vllm=>"vllm",Self::Ollama=>"ollama"}}
+}
+
+fn vllm_request_body(model:&str,system:&str,prompt:&str,max_tokens:usize,contract:Option<&StructuredOutputContract>)->Value{
+    let mut body=json!({"model":model,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"temperature":0.1,"max_tokens":max_tokens});
+    if let Some(contract)=contract{body["response_format"]=json!({"type":"json_schema","json_schema":{"name":contract.name,"schema":contract.schema}});}
+    body
+}
+
+fn ollama_request_body(model:&str,system:&str,prompt:&str,max_tokens:usize,contract:Option<&StructuredOutputContract>)->Value{
+    let mut body=json!({"model":model,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"stream":false,"options":{"temperature":0.1,"num_predict":max_tokens}});
+    if let Some(contract)=contract{body["format"]=contract.schema.clone();}
+    body
+}
+
+fn claude_request_body(model:&str,prompt:&str,max_tokens:usize,contract:Option<&StructuredOutputContract>)->Value{
+    let mut body=json!({"model":model,"max_tokens":max_tokens,"temperature":0.1,"system":"You are the senior scientific grant strategist. Never fabricate evidence or citations. Preserve uncertainty and distinguish facts, investigator estimates, assumptions, and unknowns. When strict JSON is requested, return strict JSON only.","messages":[{"role":"user","content":prompt}]});
+    if let Some(contract)=contract{
+        body["tools"]=json!([{"name":"submit_structured_output","description":format!("Return the final result for {} version {}. Call this tool exactly once and do not emit a separate narrative answer.",contract.name,contract.version),"input_schema":contract.schema}]);
+        body["tool_choice"]=json!({"type":"tool","name":"submit_structured_output","disable_parallel_tool_use":true});
+    }
+    body
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,29 +283,31 @@ pub struct ModelRouter {
     local_url: String,
     local_model: String,
     local_prompt_prefix: String,
+    local_backend: LocalBackend,
     anthropic_key: Option<String>,
     claude_model: String,
     claude_task_kinds: HashSet<String>,
     routing_mode: RoutingMode,
 }
 impl ModelRouter {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self> {
         let timeout = std::env::var("MODEL_HTTP_TIMEOUT_SECONDS")
             .ok()
             .and_then(|x| x.parse().ok())
             .unwrap_or(300u64);
-        Self{
+        Ok(Self{
             client:Client::builder().timeout(Duration::from_secs(timeout)).build().expect("HTTP client"),
             local_url:std::env::var("LOCAL_LLM_URL").or_else(|_|std::env::var("OLMO_URL")).unwrap_or_else(|_|"http://host.docker.internal:8000/v1/chat/completions".into()),
             local_model:std::env::var("LOCAL_LLM_MODEL").or_else(|_|std::env::var("OLMO_MODEL")).unwrap_or_else(|_|"grant-olmo".into()),
             local_prompt_prefix:std::env::var("LOCAL_LLM_PROMPT_PREFIX").unwrap_or_default(),
+            local_backend:LocalBackend::from_env()?,
             anthropic_key:std::env::var("ANTHROPIC_API_KEY").ok().filter(|s|!s.trim().is_empty()),
             claude_model:std::env::var("CLAUDE_MODEL").unwrap_or_else(|_|"claude-sonnet-4-5".into()),
             claude_task_kinds:std::env::var("CLAUDE_TASK_KINDS")
                 .unwrap_or_else(|_|"requirement_decomposition,sponsor_compliance_compilation,investigator_interview,research_planning,evidence_validation,competitor_profile,competitive_positioning,complex_scientific_synthesis".into())
                 .split(',').map(str::trim).filter(|x|!x.is_empty()).map(str::to_owned).collect(),
             routing_mode:RoutingMode::from_env(),
-        }
+        })
     }
 
     pub async fn health(&self) -> Result<serde_json::Value> {
@@ -195,14 +334,8 @@ impl ModelRouter {
                 serde_json::json!({"ok":true,"model":self.claude_model,"provider":"anthropic","routing_mode":self.routing_mode.as_str()}),
             );
         }
-        let models_url = self
-            .local_url
-            .split("/v1/")
-            .next()
-            .unwrap_or(&self.local_url)
-            .trim_end_matches('/')
-            .to_string()
-            + "/v1/models";
+        let base=self.local_url.split("/v1/").next().unwrap_or(&self.local_url).split("/api/").next().unwrap_or(&self.local_url).trim_end_matches('/');
+        let models_url=match self.local_backend{LocalBackend::Vllm=>format!("{base}/v1/models"),LocalBackend::Ollama=>format!("{base}/api/tags")};
         let r = self
             .client
             .get(models_url)
@@ -211,11 +344,12 @@ impl ModelRouter {
             .error_for_status()?;
         let v: serde_json::Value = r.json().await?;
         let found = v
-            .get("data")
-            .and_then(|x| x.as_array())
+            .get(match self.local_backend{LocalBackend::Vllm=>"data",LocalBackend::Ollama=>"models"})
+            .and_then(Value::as_array)
             .map(|a| {
                 a.iter().any(|m| {
-                    m.get("id").and_then(|x| x.as_str()) == Some(self.local_model.as_str())
+                    m.get(match self.local_backend{LocalBackend::Vllm=>"id",LocalBackend::Ollama=>"name"}).and_then(Value::as_str) == Some(self.local_model.as_str())
+                        || m.get("model").and_then(Value::as_str)==Some(self.local_model.as_str())
                 })
             })
             .unwrap_or(false);
@@ -226,7 +360,7 @@ impl ModelRouter {
             );
         }
         Ok(
-            serde_json::json!({"ok":true,"model":self.local_model,"provider":"local","routing_mode":self.routing_mode.as_str(),"claude_configured":self.anthropic_key.is_some()}),
+            serde_json::json!({"ok":true,"model":self.local_model,"provider":self.local_backend.as_str(),"routing_mode":self.routing_mode.as_str(),"claude_configured":self.anthropic_key.is_some()}),
         )
     }
 
@@ -252,6 +386,10 @@ impl ModelRouter {
                     self.local_model
                 );
             }
+        }
+        if let Some(provider)=config.local_model_provider.as_deref().filter(|value|!value.trim().is_empty()&&*value!="local"){
+            let configured=match provider.trim().to_ascii_lowercase().as_str(){"mlx"|"vllm_mlx"|"vllm"|"openai_compatible"=>"vllm","ollama"=>"ollama",other=>anyhow::bail!("unsupported project local model provider: {other}")};
+            if configured!=self.local_backend.as_str(){anyhow::bail!("project local provider '{}' is unavailable; this deployment provides '{}'",provider,self.local_backend.as_str());}
         }
         if let Some(model) = config.cloud_model.as_deref().filter(|value| !value.trim().is_empty()) {
             if model != self.claude_model {
@@ -327,7 +465,7 @@ impl ModelRouter {
         cloud_task_kinds.sort();
         Ok(json!({
             "routing_mode": policy.mode.as_str(),
-            "local_provider": "local",
+            "local_provider": self.local_backend.as_str(),
             "local_model": self.local_model,
             "cloud_provider": "anthropic",
             "cloud_model": self.claude_model,
@@ -355,8 +493,10 @@ impl ModelRouter {
             &decision.model,
             &prompt_sha256,
             task.high_value,
+            task.output_contract.as_ref(),
         )?;
         let task_kind = task.kind.clone();
+        let output_contract=task.output_contract.clone();
         let generated = match decision.provider.as_str() {
             "anthropic" => self.claude(task).await,
             "local" => self.local(task).await,
@@ -364,6 +504,12 @@ impl ModelRouter {
         };
         match generated {
             Ok(mut output) => {
+                if let Some(contract)=&output_contract{
+                    if let Err(error)=contract.validate_text(&output.text){
+                        audit.fail_generation(&run_id,&error.to_string())?;
+                        return Err(error);
+                    }
+                }
                 let response_sha256 = hex::encode(Sha256::digest(output.text.as_bytes()));
                 audit.complete_generation(&run_id, &response_sha256)?;
                 output.provider = decision.provider;
@@ -389,9 +535,19 @@ impl ModelRouter {
         } else {
             format!("{}\n{}", self.local_prompt_prefix.trim(), t.prompt)
         };
-        let r=self.client.post(&self.local_url).json(&json!({"model":self.local_model,"messages":[{"role":"system","content":"You are a rigorous enterprise oncology grant-writing system. Obey output schemas exactly. Never invent evidence, citations, approvals, clinical results, or institutional capabilities. Explicitly preserve uncertainty."},{"role":"user","content":prompt}],"temperature":0.1,"max_tokens":max_tokens})).send().await?.error_for_status()?;
+        let system="You are a rigorous enterprise oncology grant-writing system. Obey output schemas exactly. Never invent evidence, citations, approvals, clinical results, or institutional capabilities. Explicitly preserve uncertainty.";
+        let (url,payload)=match self.local_backend{
+            LocalBackend::Vllm=>{
+                (self.local_url.clone(),vllm_request_body(&self.local_model,system,&prompt,max_tokens,t.output_contract.as_ref()))
+            }
+            LocalBackend::Ollama=>{
+                let base=self.local_url.split("/v1/").next().unwrap_or(&self.local_url).split("/api/").next().unwrap_or(&self.local_url).trim_end_matches('/');
+                (format!("{base}/api/chat"),ollama_request_body(&self.local_model,system,&prompt,max_tokens,t.output_contract.as_ref()))
+            }
+        };
+        let r=self.client.post(url).json(&payload).send().await?.error_for_status()?;
         let v: serde_json::Value = r.json().await?;
-        parse_olmo_wire_response(&v, &self.local_model, max_tokens)
+        match self.local_backend{LocalBackend::Vllm=>parse_olmo_wire_response(&v,&self.local_model,max_tokens),LocalBackend::Ollama=>parse_ollama_wire_response(&v,&self.local_model,max_tokens)}
     }
     async fn claude(&self, t: ModelTask) -> Result<ModelOutput> {
         let key = self
@@ -402,12 +558,13 @@ impl ModelRouter {
             .ok()
             .and_then(|x| x.parse().ok())
             .unwrap_or(6000usize);
+        let body=claude_request_body(&self.claude_model,&t.prompt,max_tokens,t.output_contract.as_ref());
         let r=self.client.post("https://api.anthropic.com/v1/messages")
             .header("x-api-key",key).header("anthropic-version","2023-06-01")
-            .json(&json!({"model":self.claude_model,"max_tokens":max_tokens,"temperature":0.1,"system":"You are the senior scientific grant strategist. Never fabricate evidence or citations. Preserve uncertainty and distinguish facts, investigator estimates, assumptions, and unknowns. When strict JSON is requested, return strict JSON only.","messages":[{"role":"user","content":t.prompt}]}))
+            .json(&body)
             .send().await?.error_for_status()?;
         let v: serde_json::Value = r.json().await?;
-        parse_claude_wire_response(&v, &self.claude_model, max_tokens)
+        parse_claude_wire_response(&v, &self.claude_model, max_tokens,t.output_contract.is_some())
     }
 }
 
@@ -417,12 +574,16 @@ mod contract_mock_tests {
     use crate::source_locator::{compile_model_output, SourceDocument};
     use sha2::Digest;
 
+    #[derive(JsonSchema)]
+    struct ContractFixture { name:String, count:u32 }
+
     fn router(mode: RoutingMode, anthropic_key: Option<&str>) -> ModelRouter {
         ModelRouter {
             client: Client::new(),
             local_url: "http://127.0.0.1:1/v1/chat/completions".into(),
             local_model: "local-test-model".into(),
             local_prompt_prefix: String::new(),
+            local_backend: LocalBackend::Vllm,
             anthropic_key: anthropic_key.map(str::to_owned),
             claude_model: "claude-test-model".into(),
             claude_task_kinds: ["evidence_validation".to_string()].into_iter().collect(),
@@ -467,7 +628,7 @@ mod contract_mock_tests {
         let claude = json!({"id":"msg_mock","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":contract}],"stop_reason":"end_turn"});
         let olmo = json!({"id":"chatcmpl-mock","object":"chat.completion","model":"grant-olmo","choices":[{"index":0,"message":{"role":"assistant","content":compliance_contract()},"finish_reason":"stop"}]});
         let claude_output =
-            parse_claude_wire_response(&claude, "claude-sonnet-4-5", 16000).unwrap();
+            parse_claude_wire_response(&claude, "claude-sonnet-4-5", 16000, false).unwrap();
         let olmo_output = parse_olmo_wire_response(&olmo, "grant-olmo", 16000).unwrap();
         let documents = source();
         let claude_profile = compile_model_output(&claude_output.text, &documents).unwrap();
@@ -497,6 +658,34 @@ mod contract_mock_tests {
     }
 
     #[test]
+    fn provider_adapters_receive_the_same_versioned_schema_and_common_validator() {
+        let contract=StructuredOutputContract::for_type::<ContractFixture>("contract_fixture",1).unwrap();
+        assert_eq!(contract.schema_sha256.len(),64);
+        assert!(contract.validate_text(r#"{"name":"valid","count":2}"#).is_ok());
+        assert!(contract.validate_text(r#"{"name":"invalid","count":"two"}"#).is_err());
+        assert!(contract.validate_text(r#"{"name":"invalid","count":2,"unexpected":true}"#).is_err());
+
+        let vllm=vllm_request_body("local","system","prompt",512,Some(&contract));
+        assert_eq!(vllm.pointer("/response_format/type").and_then(Value::as_str),Some("json_schema"));
+        assert_eq!(vllm.pointer("/response_format/json_schema/name").and_then(Value::as_str),Some("contract_fixture"));
+        assert_eq!(vllm.pointer("/response_format/json_schema/schema"),Some(&contract.schema));
+
+        let ollama=ollama_request_body("qwen3:1.7b","system","prompt",512,Some(&contract));
+        assert_eq!(ollama.get("format"),Some(&contract.schema));
+        assert_eq!(ollama.pointer("/options/num_predict").and_then(Value::as_u64),Some(512));
+
+        let claude=claude_request_body("claude-test","prompt",512,Some(&contract));
+        assert_eq!(claude.pointer("/tools/0/input_schema"),Some(&contract.schema));
+        assert_eq!(claude.pointer("/tool_choice/name").and_then(Value::as_str),Some("submit_structured_output"));
+        let wire=json!({"content":[{"type":"tool_use","name":"submit_structured_output","input":{"name":"valid","count":2}}],"stop_reason":"tool_use"});
+        let output=parse_claude_wire_response(&wire,"claude-test",512,true).unwrap();
+        assert!(contract.validate_text(&output.text).is_ok());
+        let native=json!({"message":{"role":"assistant","content":"{\"name\":\"valid\",\"count\":2}"},"done":true,"done_reason":"stop"});
+        let output=parse_ollama_wire_response(&native,"qwen3:1.7b",512).unwrap();
+        assert!(contract.validate_text(&output.text).is_ok());
+    }
+
+    #[test]
     fn local_only_project_cannot_route_high_value_content_to_claude() {
         let router = router(RoutingMode::Hybrid, Some("configured"));
         let policy = router.project_policy(&workflow("local_only")).unwrap();
@@ -507,6 +696,7 @@ mod contract_mock_tests {
                     kind: "evidence_validation".into(),
                     prompt: "private proposal".into(),
                     high_value: true,
+                    output_contract: None,
                 },
             )
             .unwrap();
@@ -525,6 +715,7 @@ mod contract_mock_tests {
                     kind: "evidence_validation".into(),
                     prompt: "private proposal".into(),
                     high_value: false,
+                    output_contract: None,
                 },
             )
             .unwrap_err();

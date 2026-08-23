@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use futures::{stream, StreamExt};
 use reqwest::Client;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -97,7 +98,7 @@ pub struct CompetitiveUpdateConfig {
     pub section_refresh_high_value: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CapabilityDimension {
     pub id: String,
     pub label: String,
@@ -105,7 +106,7 @@ pub struct CapabilityDimension {
     pub weight: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CompetitiveSearchSpec {
     pub dimension_id: String,
     pub query: String,
@@ -113,7 +114,7 @@ pub struct CompetitiveSearchSpec {
     pub source_types: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CompetitiveProfile {
     pub summary: String,
     #[serde(default)]
@@ -134,7 +135,7 @@ pub struct CompetitiveProfile {
     pub search_queries: Vec<CompetitiveSearchSpec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CompetitiveProfileEnvelope {
     pub profile: CompetitiveProfile,
 }
@@ -190,7 +191,7 @@ pub struct ProviderStatus {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CompetitiveStrategy {
     pub market_summary: String,
     #[serde(default)]
@@ -206,11 +207,11 @@ pub struct CompetitiveStrategy {
     #[serde(default)]
     pub section_guidance: Vec<SectionGuidance>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CompetitiveStrategyEnvelope {
     pub strategy: CompetitiveStrategy,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StrategyDifferentiator {
     pub theme: String,
     pub our_advantage: String,
@@ -223,7 +224,7 @@ pub struct StrategyDifferentiator {
     #[serde(default)]
     pub section_targets: Vec<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StrategyGap {
     pub gap: String,
     pub why_it_matters: String,
@@ -233,7 +234,7 @@ pub struct StrategyGap {
     #[serde(default)]
     pub asset_keys: Vec<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CandidateNote {
     pub candidate_key: String,
     pub why_relevant: String,
@@ -241,7 +242,7 @@ pub struct CandidateNote {
     #[serde(default)]
     pub asset_keys: Vec<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SectionGuidance {
     pub section_key: String,
     pub guidance: String,
@@ -368,11 +369,9 @@ PROJECT CONTEXT:
             .generate_for_project(
                 audit,
                 project_id,
-                ModelTask {
-                    kind: "competitor_profile".into(),
-                    prompt,
-                    high_value: false,
-                },
+                ModelTask::structured::<CompetitiveProfileEnvelope>(
+                    "competitor_profile",prompt,false,"competitive_profile",1,
+                )?,
             )
             .await?;
         let mut env: CompetitiveProfileEnvelope = parse_json_from_model(&out.text)?;
@@ -1004,11 +1003,9 @@ PUBLIC COMPETITIVE INTELLIGENCE:
             .generate_for_project(
                 audit,
                 project_id,
-                ModelTask {
-                    kind: "competitive_positioning".into(),
-                    prompt,
-                    high_value: true,
-                },
+                ModelTask::structured::<CompetitiveStrategyEnvelope>(
+                    "competitive_positioning",prompt,true,"competitive_strategy",1,
+                )?,
             )
             .await?;
         let mut env: CompetitiveStrategyEnvelope = parse_json_from_model(&out.text)?;

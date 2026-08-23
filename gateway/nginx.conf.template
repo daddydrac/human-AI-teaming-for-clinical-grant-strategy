@@ -1,0 +1,89 @@
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen 8443 ssl;
+    server_name ${OIDC_PUBLIC_HOST};
+
+    ssl_certificate /run/tls/tls.crt;
+    ssl_certificate_key /run/tls/tls.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:TLS:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
+    client_max_body_size 128m;
+    proxy_buffer_size 16k;
+    proxy_buffers 8 16k;
+    proxy_busy_buffers_size 32k;
+
+    location = /gateway-health {
+        access_log off;
+        default_type application/json;
+        return 200 '{"status":"ok"}';
+    }
+
+    location /oauth2/ {
+        proxy_pass http://oauth2-proxy:4180;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Uri $request_uri;
+    }
+
+    location = /oauth2/auth {
+        internal;
+        proxy_pass http://oauth2-proxy:4180;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $host;
+    }
+
+    location @oidc_sign_in {
+        return 302 /oauth2/start?rd=https://${OIDC_PUBLIC_HOST}:${OIDC_HTTPS_PORT}$request_uri;
+    }
+
+    location / {
+        auth_request /oauth2/auth;
+        error_page 401 = @oidc_sign_in;
+
+        auth_request_set $grantspace_user_id $upstream_http_x_auth_request_user;
+        auth_request_set $grantspace_user_email $upstream_http_x_auth_request_email;
+        auth_request_set $grantspace_user_name $upstream_http_x_auth_request_preferred_username;
+        auth_request_set $grantspace_gateway_secret $upstream_http_x_auth_request_grantspace_gateway_secret;
+        auth_request_set $oauth2_cookie $upstream_http_set_cookie;
+        add_header Set-Cookie $oauth2_cookie always;
+
+        # Always overwrite identity headers. Browser-supplied values never reach the UI.
+        proxy_set_header X-Grantspace-User-Id $grantspace_user_id;
+        proxy_set_header X-Grantspace-Organization-Id "${OIDC_ORGANIZATION_ID}";
+        proxy_set_header X-Grantspace-User-Email $grantspace_user_email;
+        proxy_set_header X-Grantspace-User-Name $grantspace_user_name;
+        proxy_set_header X-Grantspace-Gateway-Secret $grantspace_gateway_secret;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_http_version 1.1;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_pass http://ui:7860;
+    }
+}

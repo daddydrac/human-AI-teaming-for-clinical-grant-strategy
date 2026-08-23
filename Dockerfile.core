@@ -14,12 +14,15 @@ WORKDIR /src/core
 # can persist before a release artifact is created.
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/core/target \
-    if [ -f Cargo.lock ]; then cargo build --release --locked; else cargo generate-lockfile && cargo build --release --locked; fi \
+    touch build.rs src/*.rs ../hpc/hpc_kernels.cpp \
+    && if [ -f Cargo.lock ]; then cargo build --release --locked; else cargo generate-lockfile && cargo build --release --locked; fi \
     && cp target/release/grant-core /tmp/grant-core
 
 FROM build AS test
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/src/core/target cargo test --release --locked
+    --mount=type=cache,target=/src/core/target \
+    touch build.rs src/*.rs ../hpc/hpc_kernels.cpp \
+    && cargo test --release --locked
 
 FROM debian:bookworm-slim
 ARG APP_VERSION

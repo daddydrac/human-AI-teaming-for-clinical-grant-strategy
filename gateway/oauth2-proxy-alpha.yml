@@ -1,0 +1,46 @@
+server:
+  bindAddress: 0.0.0.0:4180
+
+providers:
+  - id: grantspace-oidc
+    name: Institutional sign-in
+    provider: oidc
+    clientID: ${OIDC_CLIENT_ID}
+    clientSecretFile: /run/secrets/oidc_client_secret
+    scope: ${OIDC_SCOPES}
+    code_challenge_method: S256
+    oidcConfig:
+      issuerURL: ${OIDC_ISSUER_URL}
+      insecureAllowUnverifiedEmail: false
+      insecureSkipIssuerVerification: false
+      insecureSkipNonce: false
+      emailClaim: ${OIDC_EMAIL_CLAIM}
+      groupsClaim: groups
+      userIDClaim: ${OIDC_USER_ID_CLAIM}
+      audienceClaims:
+        - aud
+
+upstreamConfig:
+  upstreams:
+    - id: authenticated
+      path: /
+      static: true
+      staticCode: 202
+
+injectResponseHeaders:
+  - name: X-Auth-Request-User
+    values:
+      - claimSource:
+          claim: user
+  - name: X-Auth-Request-Email
+    values:
+      - claimSource:
+          claim: email
+  - name: X-Auth-Request-Preferred-Username
+    values:
+      - claimSource:
+          claim: preferred_username
+  - name: X-Auth-Request-Grantspace-Gateway-Secret
+    values:
+      - secretSource:
+          fromFile: /run/secrets/gateway_shared_secret

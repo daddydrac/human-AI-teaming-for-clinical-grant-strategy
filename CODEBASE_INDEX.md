@@ -2,23 +2,23 @@
 
 ## System shape
 
-The product is a nine-tab Gradio workbench backed by a Rust API, a Playwright HTML-ingestion service, a Python document renderer, and OpenAI-compatible embedding/generation services. Docker keeps application state in `grant-data`; final DOCX/PDF files are bind-mounted to `exports/`. On this M4 profile, native MLX serves OLMo and embeddings, while Claude plans research, validates retrieved evidence, classifies compliance rule meaning, and performs selected high-value synthesis. Rust alone locates and copies exact compliance source excerpts.
+The product is a composable Gradio grant workspace backed by a Rust API, a Playwright HTML-ingestion service, a Python document renderer, and provider-neutral embedding/generation services. Every project persists five mandatory core steps plus its selected optional modules; navigation and gates are derived from that server-side configuration. Docker keeps application state in `grant-data`; final DOCX/PDF files are bind-mounted to `exports/`.
 
-The backend workflow state is: `intake → documents → requirements → interview → research → science → strategy → writing → review → export`. Every final document is built from an immutable approved-section snapshot. Sponsor compliance and readiness gates run before export.
+The legacy stage value remains a read-only compatibility projection. The authoritative evaluator derives each enabled step as `not_started`, `available`, `in_progress`, `awaiting_review`, `blocked`, or `complete`; disabled modules cannot add blockers. Every final document is built from exact approved artifact and section versions recorded in an immutable snapshot.
 
 ## UI-to-backend workflow
 
 | UI step | User outcome | Backend support |
 |---|---|---|
-| 1. Intake & Requirements | Create a project; upload, fetch, or paste an opportunity; approve extracted requirements | Browser-rendered URL-to-Markdown ingestion, byte-preserved paste ingestion, chunking, requirement/compliance compilation, SQLite persistence, workflow gates |
-| 2. Investigator Interview | Resolve missing facts with confidence and provenance | Claude question generation, typed answer storage, unresolved-question gate |
-| 3. Research & Evidence | Find external evidence and test retrieval | Claude research plan, bounded Brave/web fetching, Claude evidence validation, embeddings, lexical/vector/graph retrieval |
-| 4. Clinical Study Design | Define aims, arms, endpoints, statistics, recruitment, timeline, and resources | Typed validation, sample-size/recruitment calculations, scenario sweeps, cross-section consistency checks |
-| 5. Competitive Intelligence | Compare against capability-matched organizations using public data | NIH RePORTER, ClinicalTrials.gov, OpenAlex, bounded web enrichment, scoring, refresh and proposed-update workflow |
-| 6. Sponsor Compliance | Approve deterministic rules, register forms/attachments, run rendered preflight | Rule engine, checksummed artifact registry, per-section word/page measurements, hard-failure readiness gate |
-| 7. Write/Edit/Approve | Draft locally or escalate, edit, and approve exact versions | Context compiler, OLMo default drafting, Claude high-value routing, versioned sections and explicit approval |
-| 8. Final Export | Choose DOCX, PDF, or BOTH and receive a submission ZIP | Immutable snapshot, Markdown-aware renderer, DOCX/PDF generation, atomic ZIP with SHA-256 manifest |
-| 9. Diagnostics | Inspect safe runtime metadata and benchmark compute | Health/system endpoints and C++/OpenMP/OpenBLAS benchmark |
+| 1. Solicitation analysis | Create/import a project; ingest an opportunity; approve normalized facts and rubric | Browser-rendered ingestion, exact source anchors, structured profile, server-derived editor contract, SQLite persistence, composable gates |
+| 2. Research-plan framework | Map sponsor requirements and rubric to an owned proposal outline | Versioned structured nodes, project-scoped requirement/member catalogs, coverage validation, transactional `project_sections` synchronization |
+| 3. Key aims | Approve objectives, thesis, typed aims, and evidence support | Structured aim set, fact/estimate/assumption contract, approved-framework linkage, project evidence validation |
+| 4. Literature & evidence | Run and approve solicitation- and aim-derived research | Reproducible run manifest, dispositions, transactionally stored evidence, project-scoped source/citation validation |
+| Optional: Investigator interview | Resolve missing facts with confidence and provenance | Model-assisted question generation, typed answer storage, unresolved-question gate |
+| Optional: Clinical design | Define study design, statistics, recruitment, timeline, and resources | Typed validation, sample-size/recruitment calculations, scenario sweeps, cross-section consistency checks |
+| Optional: Competitive intelligence | Compare against capability-matched organizations using public data | NIH RePORTER, ClinicalTrials.gov, OpenAlex, bounded web enrichment, scoring, refresh and proposed-update workflow |
+| Optional: Sponsor compliance | Approve deterministic rules, register forms/attachments, run rendered preflight | Rule engine, checksummed artifact registry, per-section word/page measurements, configured readiness gate |
+| 5. Draft/review/approve/export | Draft locally or cloud-route permitted tasks, reconcile edits, approve exact versions, and export | Context compiler, per-project routing, immutable lineage, three-way merge, exact approval snapshots, DOCX/PDF/ZIP rendering |
 
 ## File catalog
 
@@ -27,6 +27,11 @@ The backend workflow state is: `intake → documents → requirements → interv
 - `env.m4Mac.txt` — real-world M4/24 GB hybrid defaults; copied to `.env`.
 - `.env.example` — generic deployment template.
 - `docker-compose.yml` — core, renderer, UI, and optional CPU embedding topology, security, resources, volumes, and environment wiring.
+- `docker-compose.oidc.yml` — enterprise override that removes backend host ports and adds pinned OIDC and TLS gateway services.
+- `gateway/oauth2-proxy-alpha.yml` — structured OIDC claim mapping that keeps immutable subject and email distinct and injects the private gateway proof.
+- `gateway/nginx.conf.template` — TLS/auth-request gateway, browser-header overwrite policy, and authenticated proof forwarding.
+- `scripts/preflight_oidc_gateway.sh` — OIDC discovery, PKCE, secret, certificate, and Compose-isolation validation.
+- `scripts/start_oidc_gateway.sh` / `scripts/stop_oidc_gateway.sh` — validated shared-enterprise lifecycle commands.
 - `Dockerfile.core` — pinned Rust 1.91 release build and minimal runtime image.
 - `Dockerfile.renderer` — renderer/WeasyPrint image.
 - `Dockerfile.ui` — Gradio UI image.
@@ -47,10 +52,11 @@ The backend workflow state is: `intake → documents → requirements → interv
 - `core/rust-toolchain.toml` — pinned Rust toolchain configuration.
 - `core/build.rs` — compiles and links the C++ HPC kernels.
 - `core/src/main.rs` — HTTP routes, application orchestration, workflow gates, background refresh, drafting, and export snapshots.
-- `core/src/storage.rs` — SQLite schema, transactions, versions, approvals, readiness, snapshots, compliance, and artifact metadata.
-- `core/src/workflow.rs` — ordered workflow-stage model and gate helpers.
+- `core/src/storage.rs` — SQLite schema, authoritative structured-editor catalogs, cross-project reference enforcement, atomic section/artifact transactions, approvals, readiness, snapshots, and compliance.
+- `core/src/versioning.rs` — bounded deterministic line-level three-way merge with explicit conflict preservation; it never silently chooses between overlapping human edits.
+- `core/src/workflow.rs` — versioned workflow registry, composable gate evaluator, module-combination validation, and legacy-stage compatibility projection.
 - `core/src/domain.rs` — shared request/response and model-output data structures.
-- `core/src/models.rs` — hybrid OLMo/Claude routing and provider clients.
+- `core/src/models.rs` — per-project hybrid routing; Rust-derived, versioned JSON Schema contracts; vLLM/MLX, native Ollama, and Claude tool-schema adapters; common fail-closed response validation.
 - `core/src/research.rs` — safe public search/fetch client and destination validation.
 - `core/src/chunker.rs` — normalized document chunking.
 - `core/src/context_compiler.rs` — evidence-grounded prompt/context assembly.
@@ -71,7 +77,7 @@ The backend workflow state is: `intake → documents → requirements → interv
 
 ### UI, rendering, and embeddings
 
-- `ui/app.py` — all nine Gradio tabs and backend/renderer API bindings.
+- `ui/app.py` — composable Gradio workflow with structured solicitation/framework/aims/literature forms backed by server-derived reference catalogs, authenticated account pages, and the shared Team Workspace.
 - `ui/requirements.txt` — pinned UI Python dependencies.
 - `renderer/app.py` — design profiles, previews, measurements, DOCX/PDF rendering, diffs, and atomic submission packaging.
 - `renderer/requirements.txt` — pinned document-rendering dependencies.
@@ -95,6 +101,8 @@ The backend workflow state is: `intake → documents → requirements → interv
 - `scripts/start_mlx.sh` — resolves immutable Hugging Face revisions and serves local generation plus embeddings.
 - `scripts/tune_mac.sh` — Mac resource-tuning helper.
 - `scripts/preflight.sh` — credentials, Docker, MLX, and export-path checks.
+- `scripts/preflight_oidc_gateway.sh` — issuer discovery, immutable-claim, secret, TLS, and enterprise Compose isolation checks.
+- `scripts/start_oidc_gateway.sh` / `scripts/stop_oidc_gateway.sh` — shared OIDC deployment lifecycle.
 - `scripts/validate.sh` — static, integration, build, and release validation entry point.
 - `scripts/smoke_test.sh` — running-service health and basic API checks.
 - `scripts/doctor.sh` — installation diagnostics.
@@ -108,6 +116,7 @@ The backend workflow state is: `intake → documents → requirements → interv
 ### Development evidence
 
 - `dev_docs/ERRATA.md` — known corrections and caveats.
+- `dev_docs/ADR_003_IDENTITY_AND_SHARED_DEPLOYMENT.md` — accepted internal-account and enterprise identity boundary.
 - `dev_docs/PHASE6_VALIDATION.md` — competitive-intelligence validation record.
 - `dev_docs/PHASE7_VALIDATION.md` — compliance/intake/export validation record.
 - `dev_docs/PHASE8_VALIDATION.md` — production-hardening validation record.

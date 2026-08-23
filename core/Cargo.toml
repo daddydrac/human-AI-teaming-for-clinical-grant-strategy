@@ -25,13 +25,15 @@ walkdir = "=2.5.0"
 sha2 = "=0.10.9"
 hex = "=0.4.3"
 parking_lot = "=0.12.4"
-time = { version = "=0.3.41", features = ["formatting"] }
+time = { version = "=0.3.41", features = ["formatting", "parsing"] }
 html2text = "=0.14.2"
 futures = "=0.3.31"
 argon2 = "=0.5.3"
 base64 = "=0.22.1"
 rand = "=0.8.5"
 lettre = { version = "=0.11.18", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+schemars = "=1.0.4"
+jsonschema = "=0.33.0"
 
 [build-dependencies]
 cc = "=1.2.37"

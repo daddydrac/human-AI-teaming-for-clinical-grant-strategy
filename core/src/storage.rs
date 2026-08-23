@@ -9,7 +9,7 @@ use crate::competitive::{CompetitiveConfig, CompetitiveProfile, CompetitiveRunOu
 use crate::competitive_updates::CompetitiveDelta;
 use crate::compliance::{evaluate as evaluate_compliance, ComplianceFacts, ComplianceProfile};
 use crate::domain::{InterviewQuestionDraft, RequirementDraft, RetrievalRecord};
-use crate::models::GenerationAudit;
+use crate::models::{GenerationAudit, StructuredOutputContract};
 use crate::research::FetchedSource;
 use crate::source_locator::SourceDocument;
 use crate::workflow::{WorkflowConfig, WorkflowRegistry, WorkflowStepDefinition};
@@ -242,7 +242,7 @@ impl Store {
         if current < 16 {
             conn.execute_batch(r#"
             CREATE TABLE IF NOT EXISTS idempotency_keys(
-              user_id TEXT NOT NULL,key TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,
+              user_id TEXT NOT NULL,key TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,request_sha256 TEXT NOT NULL,
               state TEXT NOT NULL CHECK(state IN ('in_progress','complete')),
               status_code INTEGER,content_type TEXT,response_body BLOB,
               created_at TEXT DEFAULT CURRENT_TIMESTAMP,completed_at TEXT,
@@ -367,6 +367,21 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_account_audit_events ON account_audit_events(target_user_id,id DESC);
             "#)?;
         }
+        if current < 22 && !Self::has_column(conn,"idempotency_keys","request_sha256")? {
+            // Existing keys were created before requests were content-bound. Leaving
+            // the new value NULL makes every attempted reuse conflict safely.
+            conn.execute("ALTER TABLE idempotency_keys ADD COLUMN request_sha256 TEXT",[])?;
+        }
+        if current < 23 {
+            if !Self::has_column(conn,"generation_runs","input_manifest_json")?{conn.execute("ALTER TABLE generation_runs ADD COLUMN input_manifest_json TEXT",[])?;}
+            if !Self::has_column(conn,"generation_runs","input_manifest_sha256")?{conn.execute("ALTER TABLE generation_runs ADD COLUMN input_manifest_sha256 TEXT",[])?;}
+        }
+        if current < 24 {
+            if !Self::has_column(conn,"generation_runs","output_contract_name")?{conn.execute("ALTER TABLE generation_runs ADD COLUMN output_contract_name TEXT",[])?;}
+            if !Self::has_column(conn,"generation_runs","output_contract_version")?{conn.execute("ALTER TABLE generation_runs ADD COLUMN output_contract_version INTEGER",[])?;}
+            if !Self::has_column(conn,"generation_runs","output_schema_json")?{conn.execute("ALTER TABLE generation_runs ADD COLUMN output_schema_json TEXT",[])?;}
+            if !Self::has_column(conn,"generation_runs","output_schema_sha256")?{conn.execute("ALTER TABLE generation_runs ADD COLUMN output_schema_sha256 TEXT",[])?;}
+        }
         // Section catalog backfill is idempotent and safe on every startup.
         conn.execute_batch(
             r#"
@@ -483,12 +498,14 @@ impl Store {
           routing_mode TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,
           prompt_sha256 TEXT NOT NULL,response_sha256 TEXT,high_value INTEGER NOT NULL DEFAULT 0,
           status TEXT NOT NULL CHECK(status IN ('running','complete','failed')),
+          input_manifest_json TEXT,input_manifest_sha256 TEXT,
+          output_contract_name TEXT,output_contract_version INTEGER,output_schema_json TEXT,output_schema_sha256 TEXT,
           error TEXT,started_at TEXT DEFAULT CURRENT_TIMESTAMP,completed_at TEXT,
           FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_generation_runs_project ON generation_runs(project_id,id);
         CREATE TABLE IF NOT EXISTS idempotency_keys(
-          user_id TEXT NOT NULL,key TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,
+          user_id TEXT NOT NULL,key TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,request_sha256 TEXT NOT NULL,
           state TEXT NOT NULL CHECK(state IN ('in_progress','complete')),
           status_code INTEGER,content_type TEXT,response_body BLOB,
           created_at TEXT DEFAULT CURRENT_TIMESTAMP,completed_at TEXT,
@@ -772,7 +789,7 @@ impl Store {
             conn.execute("UPDATE project_workflows SET definition_version=?1,definition_sha256=?2,config_sha256=?3,config_json=?4 WHERE project_id=?5",
               params![workflow_registry.definition_version,definition_sha256,config_sha256,config_json,project_id])?;
         }
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(21)",[])?;
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(24)",[])?;
         Ok(Self {
             path: path_buf,
             workflow_registry,
@@ -983,6 +1000,40 @@ impl Store {
         ))
     }
 
+    fn latest_approved_artifact_json(c: &Connection, project: &str, artifact_type: &str) -> Result<Value> {
+        let row=c.query_row("SELECT id,version,body_json,content_sha256,approved_by,approved_at FROM workflow_artifacts WHERE project_id=?1 AND artifact_type=?2 AND approved=1 ORDER BY version DESC LIMIT 1",params![project,artifact_type],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"artifact_type":artifact_type,"version":r.get::<_,i64>(1)?,"body":serde_json::from_str::<Value>(&r.get::<_,String>(2)?).unwrap_or(Value::Null),"sha256":r.get::<_,String>(3)?,"approved_by":r.get::<_,Option<String>>(4)?,"approved_at":r.get::<_,Option<String>>(5)?}))).optional()?;
+        Ok(row.unwrap_or_else(||json!({"artifact_type":artifact_type,"version":null,"body":null,"approved":false})))
+    }
+
+    /// Authoritative reference catalog for structured editors. Every identifier
+    /// offered here is scoped to this project and comes from an approved upstream
+    /// artifact or an active project record.
+    pub fn workflow_editor_context_json(&self, project: &str) -> Result<Value> {
+        let c=self.conn()?;
+        let solicitation=Self::latest_approved_artifact_json(&c,project,"solicitation_profile")?;
+        let framework=Self::latest_approved_artifact_json(&c,project,"research_framework")?;
+        let aims=Self::latest_approved_artifact_json(&c,project,"aim_set")?;
+        let literature=Self::latest_approved_artifact_json(&c,project,"literature_manifest")?;
+
+        let mut members=Vec::new();
+        {let mut st=c.prepare("SELECT u.id,u.display_name,u.email,pm.role FROM project_members pm JOIN users u ON u.id=pm.user_id WHERE pm.project_id=?1 AND u.active=1 ORDER BY lower(u.display_name),u.id")?;for row in st.query_map([project],|r|Ok(json!({"user_id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"email":r.get::<_,Option<String>>(2)?,"role":r.get::<_,String>(3)?})))?{members.push(row?);}}
+        let mut evidence=Vec::new();
+        {let mut st=c.prepare("SELECT id,requirement_external_id,claim,status FROM evidence WHERE project_id=?1 ORDER BY id")?;for row in st.query_map([project],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"requirement_id":r.get::<_,Option<String>>(1)?,"claim":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?})))?{evidence.push(row?);}}
+        let mut sources=Vec::new();
+        {let mut st=c.prepare("SELECT id,title,url,retrieved_at,http_status FROM research_sources WHERE project_id=?1 ORDER BY id")?;for row in st.query_map([project],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"title":r.get::<_,String>(1)?,"url":r.get::<_,String>(2)?,"retrieved_at":r.get::<_,String>(3)?,"http_status":r.get::<_,i64>(4)?})))?{sources.push(row?);}}
+        let mut citations=Vec::new();
+        {let mut st=c.prepare("SELECT id,evidence_id,citation_key,title,verified FROM citations WHERE project_id=?1 ORDER BY id")?;for row in st.query_map([project],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"evidence_id":r.get::<_,i64>(1)?,"citation_key":r.get::<_,String>(2)?,"title":r.get::<_,String>(3)?,"verified":r.get::<_,i64>(4)?!=0})))?{citations.push(row?);}}
+        let mut sections=Vec::new();
+        {let mut st=c.prepare("SELECT section_key,title,position,required,origin FROM project_sections WHERE project_id=?1 ORDER BY position,section_key")?;for row in st.query_map([project],|r|Ok(json!({"section_key":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"position":r.get::<_,i64>(2)?,"required":r.get::<_,i64>(3)?!=0,"origin":r.get::<_,String>(4)?})))?{sections.push(row?);}}
+
+        Ok(json!({
+            "project_id":project,
+            "contract":crate::workflow_artifacts::editor_contract_json(),
+            "approved_artifacts":{"solicitation_profile":solicitation,"research_framework":framework,"aim_set":aims,"literature_manifest":literature},
+            "members":members,"evidence":evidence,"sources":sources,"citations":citations,"sections":sections
+        }))
+    }
+
     fn validate_artifact_source_anchors(c:&Connection,project:&str,value:&Value)->Result<()>{
         match value{
             Value::Array(items)=>for item in items{Self::validate_artifact_source_anchors(c,project,item)?;},
@@ -1026,22 +1077,44 @@ impl Store {
                 let profile:SolicitationProfile=serde_json::from_value(profile_value)?;
                 let mapped_requirements:BTreeSet<&str>=framework.nodes.iter().flat_map(|node|node.requirement_ids.iter().map(String::as_str)).collect();
                 let mapped_criteria:BTreeSet<&str>=framework.nodes.iter().flat_map(|node|node.review_criterion_ids.iter().map(String::as_str)).collect();
+                let valid_requirements:BTreeSet<&str>=profile.requirements.iter().map(|fact|fact.id.as_str()).collect();
+                let valid_criteria:BTreeSet<&str>=profile.review_criteria.iter().map(|criterion|criterion.id.as_str()).collect();
+                for requirement_id in &mapped_requirements{if !valid_requirements.contains(requirement_id){bail!("research framework references unknown solicitation requirement {requirement_id}");}}
+                for criterion_id in &mapped_criteria{if !valid_criteria.contains(criterion_id){bail!("research framework references unknown review criterion {criterion_id}");}}
+                for node in &framework.nodes{for user_id in [&node.owner_user_id,&node.approver_user_id]{
+                    let active:i64=c.query_row("SELECT COUNT(*) FROM project_members pm JOIN users u ON u.id=pm.user_id WHERE pm.project_id=?1 AND pm.user_id=?2 AND u.active=1",params![project,user_id],|row|row.get(0))?;
+                    if active!=1{bail!("framework node {} references a user who is not an active project member: {user_id}",node.key);}
+                }}
                 for requirement in profile.requirements.iter().filter(|fact|fact.mandatory){if !mapped_requirements.contains(requirement.id.as_str()){bail!("mandatory solicitation requirement {} is not mapped to the research framework",requirement.id);}}
                 for criterion in &profile.review_criteria{if !mapped_criteria.contains(criterion.id.as_str()){bail!("review criterion {} is not mapped to the research framework",criterion.id);}}
             }
             "aim_set"=>{
                 let aims:AimSet=serde_json::from_value(body.clone())?;
                 let _=Self::approved_artifact_body_at(c,project,"research_framework",aims.framework_version)?;
+                for evidence_id in aims.aims.iter().flat_map(|aim|aim.supporting_evidence_ids.iter()){
+                    let exists:i64=c.query_row("SELECT COUNT(*) FROM evidence WHERE id=?1 AND project_id=?2",params![evidence_id,project],|row|row.get(0))?;
+                    if exists!=1{bail!("aim set references evidence {evidence_id} outside the project");}
+                }
             }
             "literature_manifest"=>{
                 let manifest:LiteratureManifest=serde_json::from_value(body.clone())?;
-                let _=Self::approved_artifact_body_at(c,project,"solicitation_profile",manifest.solicitation_profile_version)?;
+                let profile:SolicitationProfile=serde_json::from_value(Self::approved_artifact_body_at(c,project,"solicitation_profile",manifest.solicitation_profile_version)?)?;
                 let _=Self::approved_artifact_body_at(c,project,"research_framework",manifest.framework_version)?;
-                let _=Self::approved_artifact_body_at(c,project,"aim_set",manifest.aim_set_version)?;
+                let aims:AimSet=serde_json::from_value(Self::approved_artifact_body_at(c,project,"aim_set",manifest.aim_set_version)?)?;
+                let valid_aims:BTreeSet<&str>=aims.aims.iter().map(|aim|aim.id.as_str()).collect();
+                let valid_requirements:BTreeSet<&str>=profile.requirements.iter().map(|fact|fact.id.as_str()).collect();
+                let valid_criteria:BTreeSet<&str>=profile.review_criteria.iter().map(|criterion|criterion.id.as_str()).collect();
+                for query in &manifest.queries{
+                    for id in &query.aim_ids{if !valid_aims.contains(id.as_str()){bail!("literature query {} references unknown aim {id}",query.id);}}
+                    for id in &query.requirement_ids{if !valid_requirements.contains(id.as_str()){bail!("literature query {} references unknown solicitation requirement {id}",query.id);}}
+                    for id in &query.criterion_ids{if !valid_criteria.contains(id.as_str()){bail!("literature query {} references unknown review criterion {id}",query.id);}}
+                }
                 for need in &manifest.evidence_needs{for evidence_id in &need.evidence_ids{
                     let exists:i64=c.query_row("SELECT COUNT(*) FROM evidence WHERE id=?1 AND project_id=?2",params![evidence_id,project],|row|row.get(0))?;
                     if exists!=1{bail!("literature manifest references evidence {evidence_id} outside the project");}
                 }}
+                for source_id in &manifest.source_ids{let exists:i64=c.query_row("SELECT COUNT(*) FROM research_sources WHERE id=?1 AND project_id=?2",params![source_id,project],|row|row.get(0))?;if exists!=1{bail!("literature manifest references source {source_id} outside the project");}}
+                for citation_id in &manifest.citation_ids{let exists:i64=c.query_row("SELECT COUNT(*) FROM citations WHERE id=?1 AND project_id=?2",params![citation_id,project],|row|row.get(0))?;if exists!=1{bail!("literature manifest references citation {citation_id} outside the project");}}
             }
             "proposal_snapshot"=>{
                 let snapshot:ProposalSnapshot=serde_json::from_value(body.clone())?;
@@ -1823,11 +1896,63 @@ impl Store {
         source: &str,
         editor: Option<&str>,
     ) -> Result<i64> {
-        self.ensure_section(project, key, title)?;
-        let c = self.conn()?;
-        c.execute("INSERT INTO section_versions(project_id,section_key,title,body,html,source,editor_name,author_user_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",params![project,key,title,body,html,source,editor])?;
-        Self::touch_project_conn(&c, project)?;
-        Ok(c.last_insert_rowid())
+        let mut c = self.conn()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let latest:Option<i64>=tx.query_row("SELECT id FROM section_versions WHERE project_id=?1 AND section_key=?2 ORDER BY id DESC LIMIT 1",params![project,key],|row|row.get(0)).optional()?;
+        let next:i64=tx.query_row("SELECT COALESCE(MAX(position),-1)+1 FROM project_sections WHERE project_id=?1",[project],|row|row.get(0))?;
+        tx.execute("INSERT OR IGNORE INTO project_sections(project_id,section_key,title,position,required) VALUES(?1,?2,?3,?4,1)",params![project,key,title.trim(),next])?;
+        tx.execute("UPDATE project_sections SET title=?1 WHERE project_id=?2 AND section_key=?3",params![title.trim(),project,key])?;
+        tx.execute("INSERT INTO section_versions(project_id,section_key,title,body,html,source,editor_name,author_user_id,base_version_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?7,?8)",params![project,key,title,body,html,source,editor,latest])?;
+        let id=tx.last_insert_rowid();
+        tx.execute("INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'section_version_created',?2,?3)",params![project,editor,json!({"section_key":key,"version_id":id,"base_version_id":latest,"source":source}).to_string()])?;
+        Self::touch_project_conn(&tx,project)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn save_generated_section(
+        &self,project:&str,key:&str,title:&str,body:&str,html:Option<&str>,source:&str,
+        generation_run_id:&str,expected_latest:Option<i64>,actor:Option<&str>,
+    )->Result<i64>{
+        if body.trim().is_empty(){bail!("generated section body cannot be empty");}
+        let mut c=self.conn()?;
+        let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let(response_sha,status):(Option<String>,String)=tx.query_row("SELECT response_sha256,status FROM generation_runs WHERE id=?1 AND project_id=?2",params![generation_run_id,project],|row|Ok((row.get(0)?,row.get(1)?))).context("generation run does not belong to this project")?;
+        if status!="complete"{bail!("generation run must be complete before its output can become a section version");}
+        let response_sha=response_sha.context("completed generation run is missing its response digest")?;
+        if response_sha!=sha256_hex(body.as_bytes()){bail!("generated section body does not match the immutable generation response digest");}
+        let prior_links:i64=tx.query_row("SELECT COUNT(*) FROM section_versions WHERE generation_run_id=?1",[generation_run_id],|row|row.get(0))?;
+        if prior_links!=0{bail!("generation run is already linked to a section version");}
+        let exists:i64=tx.query_row("SELECT COUNT(*) FROM project_sections WHERE project_id=?1 AND section_key=?2",params![project,key],|row|row.get(0))?;
+        if exists!=1{bail!("generated output targets a section that is not present in the active project framework");}
+        let latest:Option<i64>=tx.query_row("SELECT id FROM section_versions WHERE project_id=?1 AND section_key=?2 ORDER BY id DESC LIMIT 1",params![project,key],|row|row.get(0)).optional()?;
+        if latest!=expected_latest{bail!("section changed while generation was running: expected base version {}, found {}",expected_latest.map_or_else(||"none".into(),|value|value.to_string()),latest.map_or_else(||"none".into(),|value|value.to_string()));}
+        tx.execute("UPDATE project_sections SET title=?1 WHERE project_id=?2 AND section_key=?3",params![title.trim(),project,key])?;
+        tx.execute("INSERT INTO section_versions(project_id,section_key,title,body,html,source,editor_name,author_user_id,base_version_id,generation_run_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?7,?8,?9)",params![project,key,title.trim(),body,html,source,actor,latest,generation_run_id])?;
+        let id=tx.last_insert_rowid();
+        tx.execute("INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'section_version_created',?2,?3)",params![project,actor,json!({"section_key":key,"version_id":id,"base_version_id":latest,"source":source,"generation_run_id":generation_run_id,"response_sha256":response_sha}).to_string()])?;
+        Self::touch_project_conn(&tx,project)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn save_section_edit(
+        &self,project:&str,key:&str,title:&str,body:&str,html:Option<&str>,
+        expected_latest:Option<i64>,actor:&str,
+    )->Result<i64>{
+        let mut c=self.conn()?;
+        let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let latest:Option<i64>=tx.query_row("SELECT id FROM section_versions WHERE project_id=?1 AND section_key=?2 ORDER BY id DESC LIMIT 1",params![project,key],|row|row.get(0)).optional()?;
+        if latest!=expected_latest{bail!("section changed since editing began: expected base version {}, found {}",expected_latest.map_or_else(||"none".into(),|value|value.to_string()),latest.map_or_else(||"none".into(),|value|value.to_string()));}
+        let exists:i64=tx.query_row("SELECT COUNT(*) FROM project_sections WHERE project_id=?1 AND section_key=?2",params![project,key],|row|row.get(0))?;
+        if exists!=1{bail!("project section does not exist");}
+        tx.execute("UPDATE project_sections SET title=?1 WHERE project_id=?2 AND section_key=?3",params![title.trim(),project,key])?;
+        tx.execute("INSERT INTO section_versions(project_id,section_key,title,body,html,source,editor_name,author_user_id,base_version_id) VALUES(?1,?2,?3,?4,?5,'human_edit',?6,?6,?7)",params![project,key,title,body,html,actor,latest])?;
+        let id=tx.last_insert_rowid();
+        tx.execute("INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'section_version_created',?2,?3)",params![project,actor,json!({"section_key":key,"version_id":id,"base_version_id":latest,"source":"human_edit"}).to_string()])?;
+        Self::touch_project_conn(&tx,project)?;
+        tx.commit()?;
+        Ok(id)
     }
 
     pub fn section_versions_json(&self, project: &str, key: &str) -> Result<Value> {
@@ -1835,11 +1960,12 @@ impl Store {
         let mut st = c.prepare(
             r#"
           SELECT id,created_at,source,COALESCE(author_user_id,editor_name),approved,length(body),
+                 base_version_id,restored_from_version_id,
                  CASE WHEN length(body)>180 THEN substr(body,1,180)||'…' ELSE body END
           FROM section_versions WHERE project_id=?1 AND section_key=?2 ORDER BY id DESC LIMIT 100
         "#,
         )?;
-        let rows=st.query_map(params![project,key],|r|Ok(json!({"version":r.get::<_,i64>(0)?,"created_at":r.get::<_,String>(1)?,"source":r.get::<_,String>(2)?,"editor":r.get::<_,Option<String>>(3)?,"approved":r.get::<_,i64>(4)?!=0,"characters":r.get::<_,i64>(5)?,"preview":r.get::<_,String>(6)?})))?;
+        let rows=st.query_map(params![project,key],|r|Ok(json!({"version":r.get::<_,i64>(0)?,"created_at":r.get::<_,String>(1)?,"source":r.get::<_,String>(2)?,"editor":r.get::<_,Option<String>>(3)?,"approved":r.get::<_,i64>(4)?!=0,"characters":r.get::<_,i64>(5)?,"base_version_id":r.get::<_,Option<i64>>(6)?,"restored_from_version_id":r.get::<_,Option<i64>>(7)?,"preview":r.get::<_,String>(8)?})))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1855,21 +1981,43 @@ impl Store {
         expected_latest: i64,
         actor: Option<&str>,
     ) -> Result<i64> {
-        let c = self.conn()?;
-        let latest:i64=c.query_row("SELECT id FROM section_versions WHERE project_id=?1 AND section_key=?2 ORDER BY id DESC LIMIT 1",params![project,key],|r|r.get(0)).context("section has no versions")?;
+        let mut c = self.conn()?;
+        let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let latest:i64=tx.query_row("SELECT id FROM section_versions WHERE project_id=?1 AND section_key=?2 ORDER BY id DESC LIMIT 1",params![project,key],|r|r.get(0)).context("section has no versions")?;
         if latest != expected_latest {
             bail!("section changed since history was loaded: expected latest version {expected_latest}, found {latest}");
         }
-        let (title,body,html):(String,String,Option<String>)=c.query_row("SELECT title,body,html FROM section_versions WHERE id=?1 AND project_id=?2 AND section_key=?3",params![version_id,project,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("version does not belong to this project section")?;
-        self.save_section_by(
-            project,
-            key,
-            &title,
-            &body,
-            html.as_deref(),
-            &format!("rollback:{version_id}"),
-            actor,
-        )
+        let (title,body,html):(String,String,Option<String>)=tx.query_row("SELECT title,body,html FROM section_versions WHERE id=?1 AND project_id=?2 AND section_key=?3",params![version_id,project,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("version does not belong to this project section")?;
+        let source=format!("rollback:{version_id}");
+        tx.execute("INSERT INTO section_versions(project_id,section_key,title,body,html,source,editor_name,author_user_id,base_version_id,restored_from_version_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?7,?8,?9)",params![project,key,title,body,html,source,actor,latest,version_id])?;
+        let id=tx.last_insert_rowid();
+        tx.execute("INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'section_version_restored',?2,?3)",params![project,actor,json!({"section_key":key,"version_id":id,"base_version_id":latest,"restored_from_version_id":version_id}).to_string()])?;
+        Self::touch_project_conn(&tx,project)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn section_version_json(&self,project:&str,key:&str,version_id:i64)->Result<Value>{
+        self.conn()?.query_row(r#"SELECT id,title,body,html,source,COALESCE(author_user_id,editor_name),approved,base_version_id,restored_from_version_id,generation_run_id,created_at
+          FROM section_versions WHERE project_id=?1 AND section_key=?2 AND id=?3"#,params![project,key,version_id],|row|Ok(json!({"version":row.get::<_,i64>(0)?,"title":row.get::<_,String>(1)?,"body":row.get::<_,String>(2)?,"html":row.get::<_,Option<String>>(3)?,"source":row.get::<_,String>(4)?,"editor":row.get::<_,Option<String>>(5)?,"approved":row.get::<_,i64>(6)?!=0,"base_version_id":row.get::<_,Option<i64>>(7)?,"restored_from_version_id":row.get::<_,Option<i64>>(8)?,"generation_run_id":row.get::<_,Option<String>>(9)?,"created_at":row.get::<_,String>(10)?}))).context("section version does not belong to this project section")
+    }
+
+    pub fn section_compare_json(&self,project:&str,key:&str,from_version:i64,to_version:i64)->Result<Value>{
+        if from_version==to_version{bail!("comparison requires two different versions");}
+        let from=self.section_version_json(project,key,from_version)?;
+        let to=self.section_version_json(project,key,to_version)?;
+        Ok(json!({"section_key":key,"from":from,"to":to}))
+    }
+
+    pub fn section_merge_preview_json(&self,project:&str,key:&str,base_version:i64,latest_version:i64,proposed_body:&str)->Result<Value>{
+        let current=self.section_version_json(project,key,latest_version)?;
+        let actual_latest:i64=self.conn()?.query_row("SELECT id FROM section_versions WHERE project_id=?1 AND section_key=?2 ORDER BY id DESC LIMIT 1",params![project,key],|row|row.get(0)).context("section has no versions")?;
+        if actual_latest!=latest_version{bail!("section changed while merge was prepared: expected latest version {latest_version}, found {actual_latest}");}
+        let base=self.section_version_json(project,key,base_version)?;
+        let base_body=base.get("body").and_then(Value::as_str).context("base section body is missing")?;
+        let latest_body=current.get("body").and_then(Value::as_str).context("latest section body is missing")?;
+        let result=crate::versioning::three_way_merge(base_body,proposed_body,latest_body);
+        Ok(json!({"section_key":key,"base_version_id":base_version,"latest_version_id":latest_version,"clean":result.clean,"merged_body":result.merged_body,"conflicts":result.conflicts}))
     }
 
     pub fn post_message(&self, project: &str, author_user_id: &str, body: &str) -> Result<i64> {
@@ -1923,6 +2071,31 @@ impl Store {
             }
         }
         Ok(json!({"members":members,"messages":messages,"activity":activity}))
+    }
+
+    pub fn approval_routing_status_json(&self,project:&str)->Result<Value>{
+        let c=self.conn()?;
+        let raw:Option<String>=c.query_row("SELECT body_json FROM workflow_artifacts WHERE project_id=?1 AND artifact_type='collaboration_record' AND approved=1 ORDER BY version DESC LIMIT 1",[project],|row|row.get(0)).optional()?;
+        let Some(raw)=raw else{return Ok(json!({"configured":false,"project_owner_user_id":null,"routes":[]}));};
+        let routing:crate::workflow_artifacts::CollaborationRouting=serde_json::from_str(&raw)?;
+        let mut statuses=Vec::new();
+        for route in &routing.routes{
+            if route.artifact_type=="proposal_section"{
+                let mut statement=c.prepare("SELECT ps.section_key,ps.title,sv.id,sv.approved FROM project_sections ps LEFT JOIN section_versions sv ON sv.id=(SELECT id FROM section_versions latest WHERE latest.project_id=ps.project_id AND latest.section_key=ps.section_key ORDER BY id DESC LIMIT 1) WHERE ps.project_id=?1 ORDER BY ps.position,ps.section_key")?;
+                let rows=statement.query_map([project],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<i64>>(2)?,row.get::<_,Option<i64>>(3)?.unwrap_or(0)!=0)))?;
+                for row in rows{
+                    let(key,title,version,approved)=row?;let artifact_type=format!("section:{key}");
+                    let approvals=if let Some(version)=version{c.query_row("SELECT COUNT(*) FROM artifact_approval_decisions WHERE project_id=?1 AND artifact_type=?2 AND artifact_version=?3 AND decision='approved'",params![project,artifact_type,version],|row|row.get::<_,i64>(0))?}else{0};
+                    statuses.push(json!({"configured_artifact_type":route.artifact_type,"artifact_type":artifact_type,"artifact_key":key,"title":title,"current_version":version,"approved":approved,"owner_user_id":route.owner_user_id,"approver_user_ids":route.approver_user_ids,"approvals":approvals,"minimum_approvals":route.minimum_approvals,"threshold_met":approvals>=route.minimum_approvals as i64}));
+                }
+            }else{
+                let current:Option<(i64,bool)>=c.query_row("SELECT version,approved FROM workflow_artifacts WHERE project_id=?1 AND artifact_type=?2 ORDER BY version DESC LIMIT 1",params![project,route.artifact_type],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?!=0))).optional()?;
+                let(version,approved)=current.map(|(version,approved)|(Some(version),approved)).unwrap_or((None,false));
+                let approvals=if let Some(version)=version{c.query_row("SELECT COUNT(*) FROM artifact_approval_decisions WHERE project_id=?1 AND artifact_type=?2 AND artifact_version=?3 AND decision='approved'",params![project,route.artifact_type,version],|row|row.get::<_,i64>(0))?}else{0};
+                statuses.push(json!({"configured_artifact_type":route.artifact_type,"artifact_type":route.artifact_type,"artifact_key":null,"title":route.artifact_type,"current_version":version,"approved":approved,"owner_user_id":route.owner_user_id,"approver_user_ids":route.approver_user_ids,"approvals":approvals,"minimum_approvals":route.minimum_approvals,"threshold_met":approvals>=route.minimum_approvals as i64}));
+            }
+        }
+        Ok(json!({"configured":true,"project_owner_user_id":routing.project_owner_user_id,"routes":statuses}))
     }
 
     pub fn create_project_invite(&self,project:&str,email:&str,role:&str,invited_by:&str,expires_in_days:u32)->Result<Value>{
@@ -1987,10 +2160,18 @@ impl Store {
     }
 
     pub fn add_comment(&self,project:&str,artifact_type:&str,artifact_key:&str,version_id:i64,start:Option<i64>,end:Option<i64>,quoted:Option<&str>,author:&str,body:&str,parent:Option<i64>,mentioned_users:&[String])->Result<Value>{
-        let body=body.trim();if body.is_empty()||body.len()>8000{bail!("comment must contain 1-8000 characters");}if start.zip(end).is_some_and(|(a,b)|a<0||b<=a){bail!("comment range is invalid");}
+        let body=body.trim();if body.is_empty()||body.len()>8000{bail!("comment must contain 1-8000 characters");}
+        if start.is_some()!=end.is_some(){bail!("comment start and end offsets must be supplied together");}
+        if start.zip(end).is_some_and(|(a,b)|a<0||b<=a){bail!("comment range is invalid");}
         let mut c=self.conn()?;let tx=c.transaction()?;
-        let version_exists=match artifact_type{"section"=>tx.query_row("SELECT COUNT(*) FROM section_versions WHERE id=?1 AND project_id=?2 AND section_key=?3",params![version_id,project,artifact_key],|r|r.get::<_,i64>(0))?,_=>tx.query_row("SELECT COUNT(*) FROM workflow_artifacts WHERE id=?1 AND project_id=?2 AND artifact_type=?3",params![version_id,project,artifact_key],|r|r.get::<_,i64>(0))?};if version_exists!=1{bail!("comment target version is outside this project artifact");}
-        if let Some(parent_id)=parent{let valid:i64=tx.query_row("SELECT COUNT(*) FROM comments WHERE id=?1 AND project_id=?2",params![parent_id,project],|r|r.get(0))?;if valid!=1{bail!("parent comment is outside this project");}}
+        let target:Option<String>=match artifact_type{"section"=>tx.query_row("SELECT body FROM section_versions WHERE id=?1 AND project_id=?2 AND section_key=?3",params![version_id,project,artifact_key],|r|r.get(0)).optional()?,_=>tx.query_row("SELECT body_json FROM workflow_artifacts WHERE id=?1 AND project_id=?2 AND artifact_type=?3",params![version_id,project,artifact_key],|r|r.get(0)).optional()?};
+        let target=target.context("comment target version is outside this project artifact")?;
+        if let Some((start,end))=start.zip(end){
+            let exact=target.get(start as usize..end as usize).context("comment range is outside the target or splits a UTF-8 character")?;
+            let quoted=quoted.map(str::trim).filter(|value|!value.is_empty()).context("quoted text is required for a ranged comment")?;
+            if quoted!=exact{bail!("quoted text is not the exact target range");}
+        }else if quoted.is_some_and(|value|!value.trim().is_empty()){bail!("quoted text requires start and end offsets");}
+        if let Some(parent_id)=parent{let valid:i64=tx.query_row("SELECT COUNT(*) FROM comments WHERE id=?1 AND project_id=?2 AND artifact_type=?3 AND artifact_key=?4 AND version_id=?5",params![parent_id,project,artifact_type,artifact_key,version_id],|r|r.get(0))?;if valid!=1{bail!("parent comment is outside this exact artifact version");}}
         tx.execute("INSERT INTO comments(project_id,artifact_type,artifact_key,version_id,start_offset,end_offset,quoted_text,author_user_id,body,parent_comment_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![project,artifact_type,artifact_key,version_id,start,end,quoted,author,body,parent])?;let comment_id=tx.last_insert_rowid();
         for mentioned in mentioned_users{if mentioned==author{continue;}let valid:i64=tx.query_row("SELECT COUNT(*) FROM project_members WHERE project_id=?1 AND user_id=?2",params![project,mentioned],|r|r.get(0))?;if valid!=1{bail!("mentioned user {mentioned} is not a project member");}tx.execute("INSERT INTO mentions(project_id,user_id,comment_id) VALUES(?1,?2,?3)",params![project,mentioned,comment_id])?;tx.execute("INSERT INTO notifications(user_id,project_id,kind,payload_json) VALUES(?1,?2,'mention',?3)",params![mentioned,project,serde_json::to_string(&json!({"comment_id":comment_id,"artifact_type":artifact_type,"artifact_key":artifact_key,"author_user_id":author}))?])?;}
         tx.commit()?;Ok(json!({"id":comment_id}))
@@ -2008,9 +2189,26 @@ impl Store {
         tx.execute("INSERT INTO tasks(id,project_id,title,description,owner_user_id,source,priority,due_at,created_by_user_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id,project,title,description,owner,source,priority,due_at,created_by])?;for dependency in dependencies{let valid:i64=tx.query_row("SELECT COUNT(*) FROM tasks WHERE id=?1 AND project_id=?2",params![dependency,project],|r|r.get(0))?;if valid!=1{bail!("task dependency {dependency} is outside this project");}tx.execute("INSERT INTO task_dependencies(task_id,depends_on_task_id) VALUES(?1,?2)",params![id,dependency])?;}tx.execute("INSERT INTO notifications(user_id,project_id,kind,payload_json) VALUES(?1,?2,'task_assigned',?3)",params![owner,project,serde_json::to_string(&json!({"task_id":id,"title":title}))?])?;tx.commit()?;Ok(json!({"id":id}))
     }
 
-    pub fn tasks_json(&self,project:&str)->Result<Value>{let c=self.conn()?;let mut st=c.prepare("SELECT id,title,description,owner_user_id,source,status,priority,due_at,completed_at,created_by_user_id,created_at,updated_at FROM tasks WHERE project_id=?1 ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,due_at,id")?;let rows=st.query_map([project],|r|Ok(json!({"id":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"description":r.get::<_,String>(2)?,"owner_user_id":r.get::<_,String>(3)?,"source":r.get::<_,String>(4)?,"status":r.get::<_,String>(5)?,"priority":r.get::<_,String>(6)?,"due_at":r.get::<_,Option<String>>(7)?,"completed_at":r.get::<_,Option<String>>(8)?,"created_by_user_id":r.get::<_,String>(9)?,"created_at":r.get::<_,String>(10)?,"updated_at":r.get::<_,String>(11)?})))?;let mut out=Vec::new();for row in rows{out.push(row?);}Ok(Value::Array(out))}
+    pub fn tasks_json(&self,project:&str)->Result<Value>{
+        let c=self.conn()?;let mut st=c.prepare("SELECT id,title,description,owner_user_id,source,status,priority,due_at,completed_at,created_by_user_id,created_at,updated_at FROM tasks WHERE project_id=?1 ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,due_at,id")?;
+        let rows=st.query_map([project],|r|Ok(json!({"id":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"description":r.get::<_,String>(2)?,"owner_user_id":r.get::<_,String>(3)?,"source":r.get::<_,String>(4)?,"status":r.get::<_,String>(5)?,"priority":r.get::<_,String>(6)?,"due_at":r.get::<_,Option<String>>(7)?,"completed_at":r.get::<_,Option<String>>(8)?,"created_by_user_id":r.get::<_,String>(9)?,"created_at":r.get::<_,String>(10)?,"updated_at":r.get::<_,String>(11)?})))?;
+        let mut out=Vec::new();
+        for row in rows{
+            let mut task=row?;let task_id=task.get("id").and_then(Value::as_str).unwrap_or_default();
+            let mut dependencies=Vec::new();let mut dependency_statement=c.prepare("SELECT depends_on_task_id FROM task_dependencies WHERE task_id=?1 ORDER BY depends_on_task_id")?;
+            for dependency in dependency_statement.query_map([task_id],|row|row.get::<_,String>(0))?{dependencies.push(Value::String(dependency?));}
+            task["dependencies"]=Value::Array(dependencies);out.push(task);
+        }
+        Ok(Value::Array(out))
+    }
 
-    pub fn update_task_status(&self,project:&str,task_id:&str,status:&str)->Result<()> {if !matches!(status,"open"|"in_progress"|"blocked"|"complete"|"cancelled"){bail!("invalid task status");}let changed=self.conn()?.execute("UPDATE tasks SET status=?1,completed_at=CASE WHEN ?1='complete' THEN CURRENT_TIMESTAMP ELSE NULL END,updated_at=CURRENT_TIMESTAMP WHERE id=?2 AND project_id=?3",params![status,task_id,project])?;if changed!=1{bail!("task not found");}Ok(())}
+    pub fn update_task_status(&self,project:&str,task_id:&str,status:&str,actor:&str,actor_role:&str)->Result<()> {
+        if !matches!(status,"open"|"in_progress"|"blocked"|"complete"|"cancelled"){bail!("invalid task status");}
+        let c=self.conn()?;let owner:Option<String>=c.query_row("SELECT owner_user_id FROM tasks WHERE id=?1 AND project_id=?2",params![task_id,project],|row|row.get(0)).optional()?;
+        let owner=owner.context("task not found")?;
+        if owner!=actor&&!matches!(actor_role,"owner"|"pi"|"research_administrator"){bail!("only the task owner or project leadership can change task status");}
+        c.execute("UPDATE tasks SET status=?1,completed_at=CASE WHEN ?1='complete' THEN CURRENT_TIMESTAMP ELSE NULL END,updated_at=CURRENT_TIMESTAMP WHERE id=?2 AND project_id=?3",params![status,task_id,project])?;Ok(())
+    }
 
     pub fn notifications_json(&self,user_id:&str,project:Option<&str>)->Result<Value>{let c=self.conn()?;let mut st=c.prepare("SELECT id,project_id,kind,payload_json,read_at,created_at FROM notifications WHERE user_id=?1 AND (?2 IS NULL OR project_id=?2) ORDER BY id DESC LIMIT 500")?;let rows=st.query_map(params![user_id,project],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"project_id":r.get::<_,String>(1)?,"kind":r.get::<_,String>(2)?,"payload":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(json!({})),"read_at":r.get::<_,Option<String>>(4)?,"created_at":r.get::<_,String>(5)?})))?;let mut out=Vec::new();for row in rows{out.push(row?);}Ok(Value::Array(out))}
 
@@ -2293,11 +2491,6 @@ impl Store {
         tx.execute(
             "UPDATE interview_questions SET status='answered' WHERE id=?1 AND project_id=?2",
             params![question_id, project],
-        )?;
-        let open: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM interview_questions WHERE project_id=?1 AND status='open'",
-            [project],
-            |r| r.get(0),
         )?;
         tx.execute("UPDATE projects SET updated_at=CURRENT_TIMESTAMP WHERE id=?1",[project])?;
         tx.commit()?;
@@ -2805,6 +2998,26 @@ impl Store {
     pub fn fail_review_run(&self,project:&str,run_id:&str,error:&str)->Result<()> {self.conn()?.execute("UPDATE review_simulation_runs SET status='failed',error=?1,completed_at=CURRENT_TIMESTAMP WHERE id=?2 AND project_id=?3 AND status='running'",params![error.chars().take(4000).collect::<String>(),run_id,project])?;Ok(())}
     pub fn review_run_json(&self,project:&str,run_id:&str)->Result<Value>{let c=self.conn()?;c.query_row("SELECT id,snapshot_id,panel_plan_id,rubric_version_id,status,result_json,result_sha256,error,created_by_user_id,created_at,completed_at FROM review_simulation_runs WHERE id=?1 AND project_id=?2",params![run_id,project],|r|{let raw=r.get::<_,Option<String>>(5)?;Ok(json!({"id":r.get::<_,String>(0)?,"snapshot_id":r.get::<_,String>(1)?,"panel_plan_id":r.get::<_,String>(2)?,"rubric_version_id":r.get::<_,String>(3)?,"status":r.get::<_,String>(4)?,"result":raw.and_then(|value|serde_json::from_str::<Value>(&value).ok()),"result_sha256":r.get::<_,Option<String>>(6)?,"error":r.get::<_,Option<String>>(7)?,"created_by_user_id":r.get::<_,String>(8)?,"created_at":r.get::<_,String>(9)?,"completed_at":r.get::<_,Option<String>>(10)?}))}).context("review run not found")}
 
+    pub fn approve_review_run(&self,project:&str,run_id:&str,approver:&str)->Result<Value>{
+        let c=self.conn()?;
+        let (status,result_sha):(String,Option<String>)=c.query_row(
+            "SELECT status,result_sha256 FROM review_simulation_runs WHERE id=?1 AND project_id=?2",
+            params![run_id,project],
+            |row|Ok((row.get(0)?,row.get(1)?)),
+        ).context("review run not found")?;
+        if status!="complete"{bail!("only a completed review simulation can be approved");}
+        let result_sha=result_sha.context("completed review simulation is missing its immutable result hash")?;
+        let version:i64=c.query_row(
+            "SELECT version FROM workflow_artifacts WHERE project_id=?1 AND artifact_type='review_simulation' AND content_sha256=?2 ORDER BY version DESC LIMIT 1",
+            params![project,result_sha],
+            |row|row.get(0),
+        ).context("review simulation workflow artifact is missing")?;
+        drop(c);
+        let mut artifact=self.approve_workflow_artifact(project,"review_simulation",version,Some(approver))?;
+        artifact["review_run_id"]=json!(run_id);
+        Ok(artifact)
+    }
+
     pub fn save_causal_model_version(&self,project:&str,run_id:&str,body:&Value,author:&str,confirmed:bool)->Result<Value>{
         let causal:crate::workflow_artifacts::CausalAnalysisResult=serde_json::from_value(body.clone())?;let wrapper=crate::workflow_artifacts::ReviewSimulationResult{schema_version:1,snapshot_id:"validation".into(),rubric_version_id:"validation".into(),panel_plan_id:"validation".into(),reviews:Vec::new(),causal_analysis:Some(causal),panel_summary:json!({}),revision_tasks:Vec::new(),synthetic_review_notice:"validation".into()};crate::workflow_artifacts::validate_review_result(&wrapper,false)?;
         let raw=serde_json::to_string(body)?;let sha=sha256_hex(raw.as_bytes());let c=self.conn()?;let version:i64=c.query_row("SELECT COALESCE(MAX(version),0)+1 FROM causal_models WHERE review_run_id=?1",[run_id],|r|r.get(0))?;c.execute("INSERT INTO causal_models(project_id,review_run_id,version,body_json,content_sha256,author_user_id,confirmed) SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE EXISTS(SELECT 1 FROM review_simulation_runs WHERE id=?2 AND project_id=?1 AND status='complete')",params![project,run_id,version,raw,sha,author,confirmed as i64])?;Ok(json!({"review_run_id":run_id,"version":version,"body":body,"sha256":sha,"confirmed":confirmed,"author_user_id":author}))
@@ -2816,6 +3029,7 @@ impl Store {
         let c = self.conn()?;
         let mut statement = c.prepare(
             r#"SELECT id,task_kind,routing_mode,provider,model,prompt_sha256,response_sha256,
+                      input_manifest_sha256,output_contract_name,output_contract_version,output_schema_sha256,
                       high_value,status,error,started_at,completed_at
                FROM generation_runs WHERE project_id=?1 ORDER BY started_at DESC,id DESC LIMIT ?2"#,
         )?;
@@ -2828,11 +3042,15 @@ impl Store {
                 "model": row.get::<_, String>(4)?,
                 "prompt_sha256": row.get::<_, String>(5)?,
                 "response_sha256": row.get::<_, Option<String>>(6)?,
-                "high_value": row.get::<_, i64>(7)? != 0,
-                "status": row.get::<_, String>(8)?,
-                "error": row.get::<_, Option<String>>(9)?,
-                "started_at": row.get::<_, String>(10)?,
-                "completed_at": row.get::<_, Option<String>>(11)?
+                "input_manifest_sha256": row.get::<_, Option<String>>(7)?,
+                "output_contract_name":row.get::<_,Option<String>>(8)?,
+                "output_contract_version":row.get::<_,Option<i64>>(9)?,
+                "output_schema_sha256":row.get::<_,Option<String>>(10)?,
+                "high_value": row.get::<_, i64>(11)? != 0,
+                "status": row.get::<_, String>(12)?,
+                "error": row.get::<_, Option<String>>(13)?,
+                "started_at": row.get::<_, String>(14)?,
+                "completed_at": row.get::<_, Option<String>>(15)?
             }))
         })?;
         let mut result = Vec::new();
@@ -2842,12 +3060,44 @@ impl Store {
         Ok(Value::Array(result))
     }
 
+    pub fn generation_run_json(&self,project:&str,run_id:&str)->Result<Value>{
+        self.conn()?.query_row(r#"SELECT id,task_kind,routing_mode,provider,model,prompt_sha256,response_sha256,
+          input_manifest_json,input_manifest_sha256,output_contract_name,output_contract_version,output_schema_json,output_schema_sha256,
+          high_value,status,error,started_at,completed_at
+          FROM generation_runs WHERE id=?1 AND project_id=?2"#,params![run_id,project],|row|{
+            let manifest=row.get::<_,Option<String>>(7)?.and_then(|raw|serde_json::from_str::<Value>(&raw).ok());
+            let schema=row.get::<_,Option<String>>(11)?.and_then(|raw|serde_json::from_str::<Value>(&raw).ok());
+            Ok(json!({"id":row.get::<_,String>(0)?,"task_kind":row.get::<_,String>(1)?,"routing_mode":row.get::<_,String>(2)?,"provider":row.get::<_,String>(3)?,"model":row.get::<_,String>(4)?,"prompt_sha256":row.get::<_,String>(5)?,"response_sha256":row.get::<_,Option<String>>(6)?,"input_manifest":manifest,"input_manifest_sha256":row.get::<_,Option<String>>(8)?,"output_contract_name":row.get::<_,Option<String>>(9)?,"output_contract_version":row.get::<_,Option<i64>>(10)?,"output_schema":schema,"output_schema_sha256":row.get::<_,Option<String>>(12)?,"high_value":row.get::<_,i64>(13)?!=0,"status":row.get::<_,String>(14)?,"error":row.get::<_,Option<String>>(15)?,"started_at":row.get::<_,String>(16)?,"completed_at":row.get::<_,Option<String>>(17)?}))
+          }).context("generation run does not belong to this project")
+    }
+
+    fn generation_input_manifest_conn(c:&Connection,project:&str)->Result<Value>{
+        let workflow=c.query_row("SELECT definition_version,definition_sha256,config_version,config_sha256 FROM project_workflows WHERE project_id=?1",[project],|row|Ok(json!({"definition_version":row.get::<_,i64>(0)?,"definition_sha256":row.get::<_,Option<String>>(1)?,"config_version":row.get::<_,i64>(2)?,"config_sha256":row.get::<_,Option<String>>(3)?}))).context("project workflow is missing")?;
+        let mut artifacts=Vec::new();
+        {let mut statement=c.prepare(r#"SELECT artifact_type,id,version,content_sha256 FROM workflow_artifacts a WHERE project_id=?1 AND approved=1 AND version=(SELECT MAX(version) FROM workflow_artifacts b WHERE b.project_id=a.project_id AND b.artifact_type=a.artifact_type AND b.approved=1) ORDER BY artifact_type"#)?;for row in statement.query_map([project],|row|Ok(json!({"artifact_type":row.get::<_,String>(0)?,"id":row.get::<_,i64>(1)?,"version":row.get::<_,i64>(2)?,"sha256":row.get::<_,String>(3)?})))?{artifacts.push(row?);}}
+        let mut documents=Vec::new();
+        {let mut statement=c.prepare("SELECT id,kind,sha256 FROM documents WHERE project_id=?1 ORDER BY id")?;for row in statement.query_map([project],|row|Ok(json!({"id":row.get::<_,i64>(0)?,"kind":row.get::<_,String>(1)?,"sha256":row.get::<_,String>(2)?})))?{documents.push(row?);}}
+        let mut requirements=Vec::new();
+        {let mut statement=c.prepare("SELECT id,external_id,category,requirement,mandatory,evidence_needed_json,dependencies_json,status,approved FROM requirements WHERE project_id=?1 ORDER BY id")?;for row in statement.query_map([project],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?,row.get::<_,i64>(8)?)))?{let(id,external_id,category,text,mandatory,evidence,dependencies,status,approved)=row?;let record=json!({"external_id":external_id,"category":category,"requirement":text,"mandatory":mandatory!=0,"evidence_needed":serde_json::from_str::<Value>(&evidence)?,"dependencies":serde_json::from_str::<Value>(&dependencies)?,"status":status,"approved":approved!=0});requirements.push(json!({"id":id,"sha256":sha256_hex(&serde_json::to_vec(&record)?)}));}}
+        let mut evidence=Vec::new();
+        {let mut statement=c.prepare("SELECT id,requirement_external_id,source_type,source_ref,claim,passage,source_url,source_locator,confidence,status FROM evidence WHERE project_id=?1 ORDER BY id")?;for row in statement.query_map([project],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<String>>(7)?,row.get::<_,f64>(8)?,row.get::<_,String>(9)?)))?{let(id,requirement_id,source_type,source_ref,claim,passage,url,locator,confidence,status)=row?;let record=json!({"requirement_id":requirement_id,"source_type":source_type,"source_ref":source_ref,"claim":claim,"passage":passage,"url":url,"locator":locator,"confidence":confidence,"status":status});evidence.push(json!({"id":id,"sha256":sha256_hex(&serde_json::to_vec(&record)?)}));}}
+        let mut citations=Vec::new();
+        {let mut statement=c.prepare("SELECT id,evidence_id,content_sha256,verified FROM citations WHERE project_id=?1 ORDER BY id")?;for row in statement.query_map([project],|row|Ok(json!({"id":row.get::<_,i64>(0)?,"evidence_id":row.get::<_,i64>(1)?,"sha256":row.get::<_,String>(2)?,"verified":row.get::<_,i64>(3)?!=0})))?{citations.push(row?);}}
+        let mut approved_sections=Vec::new();
+        {let mut statement=c.prepare(r#"SELECT sv.id,sv.section_key,sv.body FROM section_versions sv WHERE sv.project_id=?1 AND sv.approved=1 AND sv.id=(SELECT MAX(x.id) FROM section_versions x WHERE x.project_id=sv.project_id AND x.section_key=sv.section_key AND x.approved=1) ORDER BY sv.section_key"#)?;for row in statement.query_map([project],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?{let(id,key,body)=row?;approved_sections.push(json!({"version_id":id,"section_key":key,"sha256":sha256_hex(body.as_bytes())}));}}
+        let clinical=c.query_row("SELECT version,content_sha256 FROM clinical_studies WHERE project_id=?1",[project],|row|Ok(json!({"version":row.get::<_,i64>(0)?,"sha256":row.get::<_,String>(1)?}))).optional()?;
+        let competitive=c.query_row("SELECT version,content_sha256 FROM competitive_profiles WHERE project_id=?1",[project],|row|Ok(json!({"profile_version":row.get::<_,i64>(0)?,"profile_sha256":row.get::<_,String>(1)?}))).optional()?;
+        let compliance=c.query_row("SELECT version,content_sha256,approved FROM compliance_profiles WHERE project_id=?1",[project],|row|Ok(json!({"version":row.get::<_,i64>(0)?,"sha256":row.get::<_,String>(1)?,"approved":row.get::<_,i64>(2)?!=0}))).optional()?;
+        Ok(json!({"schema_version":1,"workflow":workflow,"approved_workflow_artifacts":artifacts,"documents":documents,"requirements":requirements,"evidence":evidence,"citations":citations,"approved_sections":approved_sections,"clinical_study":clinical,"competitive_profile":competitive,"compliance_profile":compliance}))
+    }
+
     pub fn claim_idempotency(
         &self,
         user_id: &str,
         key: &str,
         method: &str,
         path: &str,
+        request_sha256: &str,
     ) -> Result<IdempotencyClaim> {
         if key.len() < 8 || key.len() > 200 || key.chars().any(char::is_whitespace) {
             bail!("Idempotency-Key must be 8-200 non-whitespace characters");
@@ -2856,22 +3106,25 @@ impl Store {
         let tx = c.transaction()?;
         let existing = tx
             .query_row(
-                "SELECT method,path,state,status_code,content_type,response_body FROM idempotency_keys WHERE user_id=?1 AND key=?2",
+                "SELECT method,path,request_sha256,state,status_code,content_type,response_body FROM idempotency_keys WHERE user_id=?1 AND key=?2",
                 params![user_id, key],
                 |row| Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
                 )),
             )
             .optional()?;
         let claim = match existing {
-            Some((stored_method, stored_path, _, _, _, _))
-                if stored_method != method || stored_path != path => IdempotencyClaim::Conflict,
-            Some((_, _, state, status, content_type, body)) if state == "complete" => {
+            Some((stored_method, stored_path, stored_request_sha256, _, _, _, _))
+                if stored_method != method
+                    || stored_path != path
+                    || stored_request_sha256.as_deref() != Some(request_sha256) => IdempotencyClaim::Conflict,
+            Some((_, _, _, state, status, content_type, body)) if state == "complete" => {
                 IdempotencyClaim::Replay {
                     status_code: status.unwrap_or(500).clamp(100, 599) as u16,
                     content_type: content_type.unwrap_or_else(|| "application/json".into()),
@@ -2881,8 +3134,8 @@ impl Store {
             Some(_) => IdempotencyClaim::InProgress,
             None => {
                 tx.execute(
-                    "INSERT INTO idempotency_keys(user_id,key,method,path,state) VALUES(?1,?2,?3,?4,'in_progress')",
-                    params![user_id, key, method, path],
+                    "INSERT INTO idempotency_keys(user_id,key,method,path,request_sha256,state) VALUES(?1,?2,?3,?4,?5,'in_progress')",
+                    params![user_id, key, method, path, request_sha256],
                 )?;
                 IdempotencyClaim::New
             }
@@ -2995,6 +3248,263 @@ impl Store {
         let snapshot_id = c.last_insert_rowid();
         c.execute("UPDATE projects SET updated_at=CURRENT_TIMESTAMP WHERE id=?1",[project])?;
         Ok(json!({"snapshot_id":snapshot_id,"sha256":sha,"snapshot":snapshot}))
+    }
+
+    pub fn portable_project_package(&self, project:&str)->Result<Value>{
+        let c=self.conn()?;
+        let project_meta=self.project_json(project)?;
+        let workflow=self.workflow_config_record_json(project)?;
+        let mut documents=Vec::new();
+        {let mut st=c.prepare("SELECT id,name,kind,text,sha256,created_at FROM documents WHERE project_id=?1 ORDER BY id")?;for row in st.query_map([project],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"name":r.get::<_,String>(1)?,"kind":r.get::<_,String>(2)?,"text":r.get::<_,String>(3)?,"sha256":r.get::<_,String>(4)?,"created_at":r.get::<_,String>(5)?})))?{documents.push(row?);}}
+        let mut document_chunks=Vec::new();
+        {let mut st=c.prepare("SELECT dc.id,dc.document_id,dc.ordinal,dc.start_word,dc.end_word,dc.text FROM document_chunks dc JOIN documents d ON d.id=dc.document_id WHERE d.project_id=?1 ORDER BY dc.id")?;for row in st.query_map([project],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"document_id":r.get::<_,i64>(1)?,"ordinal":r.get::<_,i64>(2)?,"start_word":r.get::<_,i64>(3)?,"end_word":r.get::<_,i64>(4)?,"text":r.get::<_,String>(5)?})))?{document_chunks.push(row?);}}
+        let mut requirements=Vec::new();
+        {let mut st=c.prepare("SELECT external_id,category,requirement,mandatory,evidence_needed_json,dependencies_json,source_clue,source_document,source_locator,status,approved,created_at FROM requirements WHERE project_id=?1 ORDER BY id")?;for row in st.query_map([project],|r|Ok(json!({"external_id":r.get::<_,String>(0)?,"category":r.get::<_,String>(1)?,"requirement":r.get::<_,String>(2)?,"mandatory":r.get::<_,i64>(3)?!=0,"evidence_needed":serde_json::from_str::<Value>(&r.get::<_,String>(4)?).unwrap_or(json!([])),"dependencies":serde_json::from_str::<Value>(&r.get::<_,String>(5)?).unwrap_or(json!([])),"source_clue":r.get::<_,Option<String>>(6)?,"source_document":r.get::<_,Option<String>>(7)?,"source_locator":r.get::<_,Option<String>>(8)?,"status":r.get::<_,String>(9)?,"approved":r.get::<_,i64>(10)?!=0,"created_at":r.get::<_,String>(11)?})))?{requirements.push(row?);}}
+        let mut interview_questions=Vec::new();
+        {let mut st=c.prepare("SELECT id,requirement_external_id,question,answer_type,choices_json,unit,why_needed,evidence_requested,priority,status,created_at FROM interview_questions WHERE project_id=?1 ORDER BY id")?;for row in st.query_map([project],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"requirement_external_id":r.get::<_,String>(1)?,"question":r.get::<_,String>(2)?,"answer_type":r.get::<_,String>(3)?,"choices":serde_json::from_str::<Value>(&r.get::<_,String>(4)?).unwrap_or(json!([])),"unit":r.get::<_,Option<String>>(5)?,"why_needed":r.get::<_,Option<String>>(6)?,"evidence_requested":r.get::<_,i64>(7)?!=0,"priority":r.get::<_,i64>(8)?,"status":r.get::<_,String>(9)?,"created_at":r.get::<_,String>(10)?})))?{interview_questions.push(row?);}}
+        let mut interview_answers=Vec::new();
+        {let mut st=c.prepare("SELECT a.question_id,a.value_json,a.confidence,a.classification,a.notes,a.answered_by,a.created_at FROM interview_answers a JOIN interview_questions q ON q.id=a.question_id WHERE q.project_id=?1 ORDER BY a.id")?;for row in st.query_map([project],|r|Ok(json!({"question_id":r.get::<_,i64>(0)?,"value":serde_json::from_str::<Value>(&r.get::<_,String>(1)?).unwrap_or(Value::Null),"confidence":r.get::<_,String>(2)?,"classification":r.get::<_,String>(3)?,"notes":r.get::<_,Option<String>>(4)?,"answered_by":r.get::<_,Option<String>>(5)?,"created_at":r.get::<_,String>(6)?})))?{interview_answers.push(row?);}}
+        let mut research_queries=Vec::new();
+        {let mut st=c.prepare("SELECT id,requirement_external_id,query,preferred_domains_json,rationale,status,created_at FROM research_queries WHERE project_id=?1 ORDER BY id")?;for row in st.query_map([project],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"requirement_external_id":r.get::<_,String>(1)?,"query":r.get::<_,String>(2)?,"preferred_domains":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(json!([])),"rationale":r.get::<_,Option<String>>(4)?,"status":r.get::<_,String>(5)?,"created_at":r.get::<_,String>(6)?})))?{research_queries.push(row?);}}
+        let mut research_sources=Vec::new();
+        {let mut st=c.prepare("SELECT id,query_id,title,url,text,retrieved_at,content_sha256,http_status FROM research_sources WHERE project_id=?1 ORDER BY id")?;for row in st.query_map([project],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"query_id":r.get::<_,Option<i64>>(1)?,"title":r.get::<_,String>(2)?,"url":r.get::<_,String>(3)?,"text":r.get::<_,String>(4)?,"retrieved_at":r.get::<_,String>(5)?,"content_sha256":r.get::<_,String>(6)?,"http_status":r.get::<_,i64>(7)?})))?{research_sources.push(row?);}}
+        let mut sections=Vec::new();
+        {let mut st=c.prepare("SELECT section_key,title,position,required,origin,created_at FROM project_sections WHERE project_id=?1 ORDER BY position,section_key")?;for row in st.query_map([project],|r|Ok(json!({"section_key":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"position":r.get::<_,i64>(2)?,"required":r.get::<_,i64>(3)?!=0,"origin":r.get::<_,String>(4)?,"created_at":r.get::<_,String>(5)?})))?{sections.push(row?);}}
+        let mut generation_runs=Vec::new();
+        {let mut st=c.prepare("SELECT id,task_kind,routing_mode,provider,model,prompt_sha256,response_sha256,input_manifest_json,input_manifest_sha256,high_value,status,error,started_at,completed_at,output_contract_name,output_contract_version,output_schema_json,output_schema_sha256 FROM generation_runs WHERE project_id=?1 ORDER BY started_at,id")?;for row in st.query_map([project],|r|Ok(json!({"id":r.get::<_,String>(0)?,"task_kind":r.get::<_,String>(1)?,"routing_mode":r.get::<_,String>(2)?,"provider":r.get::<_,String>(3)?,"model":r.get::<_,String>(4)?,"prompt_sha256":r.get::<_,String>(5)?,"response_sha256":r.get::<_,Option<String>>(6)?,"input_manifest_json":r.get::<_,Option<String>>(7)?,"input_manifest_sha256":r.get::<_,Option<String>>(8)?,"high_value":r.get::<_,i64>(9)?!=0,"status":r.get::<_,String>(10)?,"error":r.get::<_,Option<String>>(11)?,"started_at":r.get::<_,String>(12)?,"completed_at":r.get::<_,Option<String>>(13)?,"output_contract_name":r.get::<_,Option<String>>(14)?,"output_contract_version":r.get::<_,Option<i64>>(15)?,"output_schema_json":r.get::<_,Option<String>>(16)?,"output_schema_sha256":r.get::<_,Option<String>>(17)?})))?{generation_runs.push(row?);}}
+        if generation_runs.iter().any(|run|run.get("status").and_then(Value::as_str)==Some("running")){bail!("project has an active model generation; wait for it to finish before creating a portable package");}
+        let mut section_versions=Vec::new();
+        {let mut st=c.prepare("SELECT id,section_key,title,body,html,source,editor_name,author_user_id,approved,base_version_id,restored_from_version_id,generation_run_id,created_at FROM section_versions WHERE project_id=?1 ORDER BY id")?;for row in st.query_map([project],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"section_key":r.get::<_,String>(1)?,"title":r.get::<_,String>(2)?,"body":r.get::<_,String>(3)?,"html":r.get::<_,Option<String>>(4)?,"source":r.get::<_,String>(5)?,"editor_name":r.get::<_,Option<String>>(6)?,"author_user_id":r.get::<_,Option<String>>(7)?,"approved":r.get::<_,i64>(8)?!=0,"base_version_id":r.get::<_,Option<i64>>(9)?,"restored_from_version_id":r.get::<_,Option<i64>>(10)?,"generation_run_id":r.get::<_,Option<String>>(11)?,"created_at":r.get::<_,String>(12)?})))?{section_versions.push(row?);}}
+        let mut approvals=Vec::new();
+        {let mut st=c.prepare("SELECT a.section_key,a.version_id,a.approved_by,a.approver_user_id,a.role_at_approval,a.decision,a.notes,a.approved_at FROM approvals a JOIN section_versions sv ON sv.id=a.version_id WHERE a.project_id=?1 ORDER BY a.id")?;for row in st.query_map([project],|r|Ok(json!({"section_key":r.get::<_,String>(0)?,"version_id":r.get::<_,i64>(1)?,"approved_by":r.get::<_,Option<String>>(2)?,"approver_user_id":r.get::<_,Option<String>>(3)?,"role_at_approval":r.get::<_,Option<String>>(4)?,"decision":r.get::<_,String>(5)?,"notes":r.get::<_,Option<String>>(6)?,"approved_at":r.get::<_,String>(7)?})))?{approvals.push(row?);}}
+        let mut artifacts=Vec::new();
+        {let mut st=c.prepare("SELECT artifact_type,version,body_json,content_sha256,source,author,approved,approved_by,approved_at,created_at FROM workflow_artifacts WHERE project_id=?1 ORDER BY artifact_type,version")?;for row in st.query_map([project],|r|Ok(json!({"artifact_type":r.get::<_,String>(0)?,"version":r.get::<_,i64>(1)?,"body":serde_json::from_str::<Value>(&r.get::<_,String>(2)?).unwrap_or(json!({})),"content_sha256":r.get::<_,String>(3)?,"source":r.get::<_,String>(4)?,"author":r.get::<_,Option<String>>(5)?,"approved":r.get::<_,i64>(6)?!=0,"approved_by":r.get::<_,Option<String>>(7)?,"approved_at":r.get::<_,Option<String>>(8)?,"created_at":r.get::<_,String>(9)?})))?{artifacts.push(row?);}}
+        let mut evidence=Vec::new();
+        {let mut st=c.prepare("SELECT id,requirement_external_id,source_type,source_ref,claim,passage,source_url,source_locator,confidence,status,created_at FROM evidence WHERE project_id=?1 ORDER BY id")?;for row in st.query_map([project],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"requirement_external_id":r.get::<_,Option<String>>(1)?,"source_type":r.get::<_,String>(2)?,"source_ref":r.get::<_,String>(3)?,"claim":r.get::<_,String>(4)?,"passage":r.get::<_,String>(5)?,"source_url":r.get::<_,Option<String>>(6)?,"source_locator":r.get::<_,Option<String>>(7)?,"confidence":r.get::<_,f64>(8)?,"status":r.get::<_,String>(9)?,"created_at":r.get::<_,String>(10)?})))?{evidence.push(row?);}}
+        let mut citations=Vec::new();
+        {let mut st=c.prepare("SELECT c.evidence_id,c.citation_key,c.title,c.url,c.passage,c.content_sha256,c.verified,c.created_at FROM citations c JOIN evidence e ON e.id=c.evidence_id WHERE e.project_id=?1 ORDER BY c.id")?;for row in st.query_map([project],|r|Ok(json!({"evidence_id":r.get::<_,i64>(0)?,"citation_key":r.get::<_,String>(1)?,"title":r.get::<_,String>(2)?,"url":r.get::<_,Option<String>>(3)?,"passage":r.get::<_,String>(4)?,"content_sha256":r.get::<_,String>(5)?,"verified":r.get::<_,i64>(6)?!=0,"created_at":r.get::<_,String>(7)?})))?{citations.push(row?);}}
+        let design=c.query_row("SELECT profile_json,content_sha256,updated_at FROM project_design WHERE project_id=?1",[project],|r|Ok(json!({"profile":serde_json::from_str::<Value>(&r.get::<_,String>(0)?).unwrap_or(json!({})),"content_sha256":r.get::<_,String>(1)?,"updated_at":r.get::<_,String>(2)?}))).optional()?;
+        let clinical_study=self.clinical_study_json(project)?;
+        let competitive_intelligence=self.competitive_latest_json(project)?;
+        let compliance_profile=self.compliance_profile_json(project)?;
+        let mut compliance_sources=Vec::new();
+        {let mut st=c.prepare("SELECT profile_version,rule_id,source_status,source_hint,source_document_id,source_start_offset,source_end_offset,source_page,source_excerpt FROM compliance_rule_sources WHERE project_id=?1 ORDER BY profile_version,rule_id")?;for row in st.query_map([project],|r|Ok(json!({"profile_version":r.get::<_,i64>(0)?,"rule_id":r.get::<_,String>(1)?,"source_status":r.get::<_,String>(2)?,"source_hint":r.get::<_,String>(3)?,"source_document_id":r.get::<_,Option<i64>>(4)?,"source_start_offset":r.get::<_,Option<i64>>(5)?,"source_end_offset":r.get::<_,Option<i64>>(6)?,"source_page":r.get::<_,Option<i64>>(7)?,"source_excerpt":r.get::<_,String>(8)?})))?{compliance_sources.push(row?);}}
+        let mut compliance_resolutions=Vec::new();
+        {let mut st=c.prepare("SELECT rule_id,status,notes,resolved_by,created_at FROM compliance_resolutions WHERE project_id=?1 ORDER BY id")?;for row in st.query_map([project],|r|Ok(json!({"rule_id":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"notes":r.get::<_,String>(2)?,"resolved_by":r.get::<_,Option<String>>(3)?,"created_at":r.get::<_,String>(4)?})))?{compliance_resolutions.push(row?);}}
+        let mut export_snapshots=Vec::new();
+        {let mut st=c.prepare("SELECT snapshot_json,content_sha256,created_at FROM export_snapshots WHERE project_id=?1 ORDER BY id")?;for row in st.query_map([project],|r|Ok(json!({"snapshot":serde_json::from_str::<Value>(&r.get::<_,String>(0)?).unwrap_or(json!({})),"content_sha256":r.get::<_,String>(1)?,"created_at":r.get::<_,String>(2)?})))?{export_snapshots.push(row?);}}
+        let payload=json!({"project":project_meta,"workflow":workflow,"documents":documents,"document_chunks":document_chunks,"requirements":requirements,"interview_questions":interview_questions,"interview_answers":interview_answers,"research_queries":research_queries,"research_sources":research_sources,"sections":sections,"generation_runs":generation_runs,"section_versions":section_versions,"approvals":approvals,"workflow_artifacts":artifacts,"evidence":evidence,"citations":citations,"design":design,"clinical_study":clinical_study,"competitive_intelligence":competitive_intelligence,"compliance_profile":compliance_profile,"compliance_sources":compliance_sources,"compliance_resolutions":compliance_resolutions,"export_snapshots":export_snapshots});
+        let payload_sha256=sha256_hex(&serde_json::to_vec(&payload)?);
+        Ok(json!({"format":"grantspace-portable-project","schema_version":2,"workflow_definition_version":self.workflow_registry.definition_version,"workflow_definition_sha256":self.workflow_registry.definition_sha256()?,"source_project_id":project,"payload_sha256":payload_sha256,"payload":payload}))
+    }
+
+    pub fn validate_portable_project_package(&self,package:&Value)->Result<Value>{
+        let schema_version=package.get("schema_version").and_then(Value::as_u64).context("portable project schema version is missing")?;
+        if package.get("format").and_then(Value::as_str)!=Some("grantspace-portable-project")||!matches!(schema_version,1|2){bail!("unsupported portable project package format or schema version");}
+        let expected_definition=self.workflow_registry.definition_sha256()?;
+        if package.get("workflow_definition_sha256").and_then(Value::as_str)!=Some(expected_definition.as_str()){bail!("portable project workflow definition does not match this deployment; migrate it with the matching release first");}
+        let payload=package.get("payload").and_then(Value::as_object).context("portable project payload is missing")?;
+        let expected_hash=package.get("payload_sha256").and_then(Value::as_str).context("portable project payload hash is missing")?;
+        if sha256_hex(&serde_json::to_vec(&Value::Object(payload.clone()))?)!=expected_hash{bail!("portable project payload hash does not match its content");}
+        let project=payload.get("project").and_then(Value::as_object).context("portable project metadata is missing")?;
+        if project.get("title").and_then(Value::as_str).is_none_or(|value|value.trim().is_empty()){bail!("portable project title is required");}
+        let config_value=payload.get("workflow").and_then(Value::as_object).and_then(|workflow|workflow.get("config")).context("portable project workflow configuration is missing")?;
+        let config:WorkflowConfig=serde_json::from_value(config_value.clone()).context("portable project workflow configuration is invalid")?;
+        config.validate(&self.workflow_registry)?;
+        let documents=payload.get("documents").and_then(Value::as_array).context("portable project documents must be an array")?;
+        let mut document_ids=std::collections::BTreeMap::new();
+        for document in documents{let id=document.get("id").and_then(Value::as_i64).context("portable document ID is required")?;if document_ids.insert(id,document).is_some(){bail!("portable project contains a duplicate document ID");}let text=document.get("text").and_then(Value::as_str).context("portable document text is required")?;if document.get("sha256").and_then(Value::as_str)!=Some(sha256_hex(text.as_bytes()).as_str()){bail!("portable document hash does not match its exact text");}}
+        let versions=payload.get("section_versions").and_then(Value::as_array).context("portable section_versions must be an array")?;
+        let version_ids=versions.iter().map(|value|value.get("id").and_then(Value::as_i64).context("portable section version ID is required")).collect::<Result<BTreeSet<_>>>()?;
+        if version_ids.len()!=versions.len(){bail!("portable project contains duplicate section version IDs");}
+        for version in versions{for field in ["base_version_id","restored_from_version_id"]{if let Some(id)=version.get(field).and_then(Value::as_i64){if !version_ids.contains(&id){bail!("portable section version references a missing {field}");}}}}
+        let empty_generation_runs=Vec::new();
+        let generation_runs=if schema_version>=2{payload.get("generation_runs").and_then(Value::as_array).context("portable generation_runs must be an array")?}else{payload.get("generation_runs").and_then(Value::as_array).unwrap_or(&empty_generation_runs)};
+        let mut generation_run_ids=BTreeSet::new();
+        for run in generation_runs{
+            let id=portable_str(run,"id")?;
+            if !generation_run_ids.insert(id){bail!("portable project contains a duplicate generation run ID");}
+            validate_sha256_field(run,"prompt_sha256",false)?;
+            validate_sha256_field(run,"response_sha256",true)?;
+            let status=portable_str(run,"status")?;
+            if !matches!(status,"complete"|"failed"){bail!("portable generation runs must be complete or failed");}
+            if status=="complete"&&run.get("response_sha256").and_then(Value::as_str).is_none(){bail!("portable completed generation run is missing its response digest");}
+            match (run.get("input_manifest_json").and_then(Value::as_str),run.get("input_manifest_sha256").and_then(Value::as_str)){
+                (Some(raw),Some(expected))=>{serde_json::from_str::<Value>(raw).context("portable generation input manifest is invalid JSON")?;if sha256_hex(raw.as_bytes())!=expected{bail!("portable generation input manifest hash does not match its exact JSON");}},
+                (None,None)=>{},
+                _=>bail!("portable generation input manifest and digest must either both be present or both be absent"),
+            }
+            match (run.get("output_contract_name").and_then(Value::as_str),run.get("output_contract_version").and_then(Value::as_i64),run.get("output_schema_json").and_then(Value::as_str),run.get("output_schema_sha256").and_then(Value::as_str)){
+                (Some(name),Some(version),Some(raw),Some(expected))=>{if name.is_empty()||version<=0{bail!("portable generation output contract identity is invalid");}let schema:Value=serde_json::from_str(raw).context("portable generation output schema is invalid JSON")?;jsonschema::validator_for(&schema).context("portable generation output schema is invalid")?;if sha256_hex(raw.as_bytes())!=expected{bail!("portable generation output schema hash does not match its exact JSON");}},
+                (None,None,None,None)=>{},
+                _=>bail!("portable generation output contract metadata must be complete"),
+            }
+        }
+        if schema_version>=2{
+            let mut linked_generation_runs=BTreeSet::new();
+            for version in versions{if let Some(run_id)=version.get("generation_run_id").and_then(Value::as_str){if !generation_run_ids.contains(run_id){bail!("portable section version references a missing generation run");}if !linked_generation_runs.insert(run_id){bail!("portable generation run is linked to more than one section version");}}}
+        }
+        let artifacts=payload.get("workflow_artifacts").and_then(Value::as_array).context("portable workflow_artifacts must be an array")?;
+        for artifact in artifacts{let kind=artifact.get("artifact_type").and_then(Value::as_str).context("portable artifact type is required")?;let body=artifact.get("body").context("portable artifact body is required")?;if artifact.get("content_sha256").and_then(Value::as_str)!=Some(sha256_hex(&serde_json::to_vec(body)?).as_str()){bail!("portable {kind} artifact hash does not match its body");}crate::workflow_artifacts::validate_artifact_document(kind,body,artifact.get("approved").and_then(Value::as_bool).unwrap_or(false))?;validate_portable_source_anchors(body,&document_ids)?;}
+        Ok(json!({"valid":true,"schema_version":schema_version,"title":project.get("title"),"source_project_id":package.get("source_project_id"),"counts":{"documents":documents.len(),"sections":payload.get("sections").and_then(Value::as_array).map_or(0,Vec::len),"generation_runs":generation_runs.len(),"section_versions":versions.len(),"workflow_artifacts":artifacts.len(),"evidence":payload.get("evidence").and_then(Value::as_array).map_or(0,Vec::len),"citations":payload.get("citations").and_then(Value::as_array).map_or(0,Vec::len),"export_snapshots":payload.get("export_snapshots").and_then(Value::as_array).map_or(0,Vec::len)}}))
+    }
+
+    pub fn import_portable_project_package(&self,package:&Value,actor:&str)->Result<Value>{
+        let validation=self.validate_portable_project_package(package)?;
+        let payload=package.get("payload").and_then(Value::as_object).context("portable project payload is missing")?;
+        let project_meta=payload.get("project").and_then(Value::as_object).context("portable project metadata is missing")?;
+        let title=portable_str_object(project_meta,"title")?;
+        let sponsor=project_meta.get("sponsor").and_then(Value::as_str);
+        let mechanism=project_meta.get("mechanism").and_then(Value::as_str);
+        let config:WorkflowConfig=serde_json::from_value(payload.get("workflow").and_then(Value::as_object).and_then(|workflow|workflow.get("config")).context("portable workflow config is missing")?.clone())?;
+        let project_id=Uuid::new_v4().to_string();
+        let mut c=self.conn()?;
+        let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO projects(id,title,sponsor,mechanism,stage,interview_generated,updated_at) VALUES(?1,?2,?3,?4,'intake',?5,CURRENT_TIMESTAMP)",params![project_id,title,sponsor,mechanism,!portable_array_object(payload,"interview_questions")?.is_empty() as i64])?;
+        let config_raw=serde_json::to_string(&config)?;
+        tx.execute("INSERT INTO project_workflows(project_id,definition_version,definition_sha256,config_version,config_sha256,config_json) VALUES(?1,?2,?3,1,?4,?5)",params![project_id,self.workflow_registry.definition_version,self.workflow_registry.definition_sha256()?,sha256_hex(config_raw.as_bytes()),config_raw])?;
+
+        let mut document_map=std::collections::BTreeMap::new();
+        for document in portable_array_object(payload,"documents")?{
+            tx.execute("INSERT INTO documents(project_id,name,kind,text,sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![project_id,portable_str(document,"name")?,portable_str(document,"kind")?,portable_str(document,"text")?,portable_str(document,"sha256")?,portable_str(document,"created_at")?])?;
+            document_map.insert(portable_i64(document,"id")?,tx.last_insert_rowid());
+        }
+        for chunk in portable_array_object(payload,"document_chunks")?{
+            let document_id=*document_map.get(&portable_i64(chunk,"document_id")?).context("portable document chunk references a missing document")?;
+            tx.execute("INSERT INTO document_chunks(project_id,document_id,ordinal,start_word,end_word,text) VALUES(?1,?2,?3,?4,?5,?6)",params![project_id,document_id,portable_i64(chunk,"ordinal")?,portable_i64(chunk,"start_word")?,portable_i64(chunk,"end_word")?,portable_str(chunk,"text")?])?;
+        }
+        for requirement in portable_array_object(payload,"requirements")?{
+            tx.execute("INSERT INTO requirements(project_id,external_id,category,requirement,mandatory,evidence_needed_json,dependencies_json,source_clue,source_document,source_locator,status,approved,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![project_id,portable_str(requirement,"external_id")?,portable_str(requirement,"category")?,portable_str(requirement,"requirement")?,portable_bool(requirement,"mandatory")? as i64,serde_json::to_string(requirement.get("evidence_needed").unwrap_or(&json!([])))?,serde_json::to_string(requirement.get("dependencies").unwrap_or(&json!([])))?,requirement.get("source_clue").and_then(Value::as_str),requirement.get("source_document").and_then(Value::as_str),requirement.get("source_locator").and_then(Value::as_str),portable_str(requirement,"status")?,portable_bool(requirement,"approved")? as i64,portable_str(requirement,"created_at")?])?;
+        }
+
+        let mut question_map=std::collections::BTreeMap::new();
+        for question in portable_array_object(payload,"interview_questions")?{
+            tx.execute("INSERT INTO interview_questions(project_id,requirement_external_id,question,answer_type,choices_json,unit,why_needed,evidence_requested,priority,status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![project_id,portable_str(question,"requirement_external_id")?,portable_str(question,"question")?,portable_str(question,"answer_type")?,serde_json::to_string(question.get("choices").unwrap_or(&json!([])))?,question.get("unit").and_then(Value::as_str),question.get("why_needed").and_then(Value::as_str),portable_bool(question,"evidence_requested")? as i64,portable_i64(question,"priority")?,portable_str(question,"status")?,portable_str(question,"created_at")?])?;
+            question_map.insert(portable_i64(question,"id")?,tx.last_insert_rowid());
+        }
+        for answer in portable_array_object(payload,"interview_answers")?{
+            let question_id=*question_map.get(&portable_i64(answer,"question_id")?).context("portable interview answer references a missing question")?;
+            tx.execute("INSERT INTO interview_answers(project_id,question_id,value_json,confidence,classification,notes,answered_by,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![project_id,question_id,serde_json::to_string(answer.get("value").unwrap_or(&Value::Null))?,portable_str(answer,"confidence")?,portable_str(answer,"classification")?,answer.get("notes").and_then(Value::as_str),answer.get("answered_by").and_then(Value::as_str),portable_str(answer,"created_at")?])?;
+        }
+
+        let mut query_map=std::collections::BTreeMap::new();
+        for query in portable_array_object(payload,"research_queries")?{
+            tx.execute("INSERT INTO research_queries(project_id,requirement_external_id,query,preferred_domains_json,rationale,status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![project_id,portable_str(query,"requirement_external_id")?,portable_str(query,"query")?,serde_json::to_string(query.get("preferred_domains").unwrap_or(&json!([])))?,query.get("rationale").and_then(Value::as_str),portable_str(query,"status")?,portable_str(query,"created_at")?])?;
+            query_map.insert(portable_i64(query,"id")?,tx.last_insert_rowid());
+        }
+        for source in portable_array_object(payload,"research_sources")?{
+            let query_id=source.get("query_id").and_then(Value::as_i64).map(|old|query_map.get(&old).copied().context("portable research source references a missing query")).transpose()?;
+            let text=portable_str(source,"text")?;
+            if portable_str(source,"content_sha256")?!=sha256_hex(text.as_bytes()){bail!("portable research source hash does not match its text");}
+            tx.execute("INSERT INTO research_sources(project_id,query_id,title,url,text,retrieved_at,content_sha256,http_status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![project_id,query_id,portable_str(source,"title")?,portable_str(source,"url")?,text,portable_str(source,"retrieved_at")?,portable_str(source,"content_sha256")?,portable_i64(source,"http_status")?])?;
+        }
+
+        let empty_generation_runs=Vec::new();
+        let generation_records=payload.get("generation_runs").and_then(Value::as_array).unwrap_or(&empty_generation_runs);
+        let mut generation_run_map=std::collections::BTreeMap::new();
+        for run in generation_records{
+            let old_id=portable_str(run,"id")?;
+            let new_id=Uuid::new_v4().to_string();
+            tx.execute("INSERT INTO generation_runs(id,project_id,task_kind,routing_mode,provider,model,prompt_sha256,response_sha256,input_manifest_json,input_manifest_sha256,high_value,status,error,started_at,completed_at,output_contract_name,output_contract_version,output_schema_json,output_schema_sha256) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",params![new_id,project_id,portable_str(run,"task_kind")?,portable_str(run,"routing_mode")?,portable_str(run,"provider")?,portable_str(run,"model")?,portable_str(run,"prompt_sha256")?,run.get("response_sha256").and_then(Value::as_str),run.get("input_manifest_json").and_then(Value::as_str),run.get("input_manifest_sha256").and_then(Value::as_str),portable_bool(run,"high_value")? as i64,portable_str(run,"status")?,run.get("error").and_then(Value::as_str),portable_str(run,"started_at")?,run.get("completed_at").and_then(Value::as_str),run.get("output_contract_name").and_then(Value::as_str),run.get("output_contract_version").and_then(Value::as_i64),run.get("output_schema_json").and_then(Value::as_str),run.get("output_schema_sha256").and_then(Value::as_str)])?;
+            generation_run_map.insert(old_id.to_owned(),new_id);
+        }
+
+        for section in portable_array_object(payload,"sections")?{
+            tx.execute("INSERT INTO project_sections(project_id,section_key,title,position,required,origin,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![project_id,portable_str(section,"section_key")?,portable_str(section,"title")?,portable_i64(section,"position")?,portable_bool(section,"required")? as i64,portable_str(section,"origin")?,portable_str(section,"created_at")?])?;
+        }
+        let mut version_map=std::collections::BTreeMap::new();
+        for version in portable_array_object(payload,"section_versions")?{
+            let generation_run_id=version.get("generation_run_id").and_then(Value::as_str).and_then(|old_id|generation_run_map.get(old_id)).map(String::as_str);
+            tx.execute("INSERT INTO section_versions(project_id,section_key,title,body,html,source,editor_name,author_user_id,approved,generation_run_id,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![project_id,portable_str(version,"section_key")?,portable_str(version,"title")?,portable_str(version,"body")?,version.get("html").and_then(Value::as_str),portable_str(version,"source")?,version.get("editor_name").and_then(Value::as_str),version.get("author_user_id").and_then(Value::as_str),portable_bool(version,"approved")? as i64,generation_run_id,portable_str(version,"created_at")?])?;
+            version_map.insert(portable_i64(version,"id")?,tx.last_insert_rowid());
+        }
+        for version in portable_array_object(payload,"section_versions")?{
+            let new_id=*version_map.get(&portable_i64(version,"id")?).context("portable section version map is incomplete")?;
+            let base=version.get("base_version_id").and_then(Value::as_i64).map(|old|version_map.get(&old).copied().context("portable base version is missing")).transpose()?;
+            let restored=version.get("restored_from_version_id").and_then(Value::as_i64).map(|old|version_map.get(&old).copied().context("portable restored version is missing")).transpose()?;
+            tx.execute("UPDATE section_versions SET base_version_id=?1,restored_from_version_id=?2 WHERE id=?3",params![base,restored,new_id])?;
+        }
+        for approval in portable_array_object(payload,"approvals")?{
+            let version_id=*version_map.get(&portable_i64(approval,"version_id")?).context("portable approval references a missing section version")?;
+            tx.execute("INSERT INTO approvals(project_id,section_key,version_id,approved_by,approver_user_id,role_at_approval,decision,notes,approved_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![project_id,portable_str(approval,"section_key")?,version_id,approval.get("approved_by").and_then(Value::as_str),approval.get("approver_user_id").and_then(Value::as_str),approval.get("role_at_approval").and_then(Value::as_str),portable_str(approval,"decision")?,approval.get("notes").and_then(Value::as_str),portable_str(approval,"approved_at")?])?;
+        }
+
+        for artifact in portable_array_object(payload,"workflow_artifacts")?{
+            let mut body=artifact.get("body").context("portable workflow artifact body is missing")?.clone();
+            remap_portable_document_ids(&mut body,&document_map);
+            let raw=serde_json::to_string(&body)?;let sha=sha256_hex(raw.as_bytes());
+            tx.execute("INSERT INTO workflow_artifacts(project_id,artifact_type,version,body_json,content_sha256,source,author,approved,approved_by,approved_at,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![project_id,portable_str(artifact,"artifact_type")?,portable_i64(artifact,"version")?,raw,sha,portable_str(artifact,"source")?,artifact.get("author").and_then(Value::as_str),portable_bool(artifact,"approved")? as i64,artifact.get("approved_by").and_then(Value::as_str),artifact.get("approved_at").and_then(Value::as_str),portable_str(artifact,"created_at")?])?;
+        }
+
+        let mut evidence_map=std::collections::BTreeMap::new();
+        for item in portable_array_object(payload,"evidence")?{
+            tx.execute("INSERT INTO evidence(project_id,requirement_external_id,source_type,source_ref,claim,passage,source_url,source_locator,confidence,status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![project_id,item.get("requirement_external_id").and_then(Value::as_str),portable_str(item,"source_type")?,portable_str(item,"source_ref")?,portable_str(item,"claim")?,portable_str(item,"passage")?,item.get("source_url").and_then(Value::as_str),item.get("source_locator").and_then(Value::as_str),item.get("confidence").and_then(Value::as_f64).context("portable evidence confidence is required")?,portable_str(item,"status")?,portable_str(item,"created_at")?])?;
+            evidence_map.insert(portable_i64(item,"id")?,tx.last_insert_rowid());
+        }
+        for citation in portable_array_object(payload,"citations")?{
+            let evidence_id=*evidence_map.get(&portable_i64(citation,"evidence_id")?).context("portable citation references missing evidence")?;
+            let passage=portable_str(citation,"passage")?;
+            if portable_str(citation,"content_sha256")?!=sha256_hex(passage.as_bytes()){bail!("portable citation hash does not match its exact passage");}
+            tx.execute("INSERT INTO citations(project_id,evidence_id,citation_key,title,url,passage,content_sha256,verified,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![project_id,evidence_id,portable_str(citation,"citation_key")?,portable_str(citation,"title")?,citation.get("url").and_then(Value::as_str),passage,portable_str(citation,"content_sha256")?,portable_bool(citation,"verified")? as i64,portable_str(citation,"created_at")?])?;
+        }
+        if let Some(design)=payload.get("design").filter(|value|!value.is_null()){
+            let profile=design.get("profile").context("portable design profile is missing")?;let raw=serde_json::to_string(profile)?;if design.get("content_sha256").and_then(Value::as_str)!=Some(sha256_hex(raw.as_bytes()).as_str()){bail!("portable design profile hash does not match its content");}
+            tx.execute("INSERT INTO project_design(project_id,profile_json,content_sha256,updated_at) VALUES(?1,?2,?3,?4)",params![project_id,raw,portable_str(design,"content_sha256")?,portable_str(design,"updated_at")?])?;
+        }
+        if let Some(clinical)=payload.get("clinical_study").filter(|value|value.get("exists").and_then(Value::as_bool).unwrap_or(false)){
+            let study=clinical.get("study").context("portable clinical study body is missing")?;
+            let typed:ClinicalStudy=serde_json::from_value(study.clone()).context("portable clinical study is invalid")?;crate::clinical::validate_study(&typed)?;
+            let raw=serde_json::to_string(study)?;let sha=sha256_hex(raw.as_bytes());if clinical.get("sha256").and_then(Value::as_str)!=Some(sha.as_str()){bail!("portable clinical study hash does not match its content");}
+            let version=clinical.get("version").and_then(Value::as_i64).context("portable clinical study version is required")?;
+            tx.execute("INSERT INTO clinical_study_history(project_id,version,study_json,content_sha256,created_at) VALUES(?1,?2,?3,?4,?5)",params![project_id,version,raw,sha,portable_str(clinical,"updated_at")?])?;
+            tx.execute("INSERT INTO clinical_studies(project_id,version,study_json,content_sha256,updated_at) VALUES(?1,?2,?3,?4,?5)",params![project_id,version,raw,sha,portable_str(clinical,"updated_at")?])?;
+        }
+        if let Some(compliance)=payload.get("compliance_profile").filter(|value|value.get("exists").and_then(Value::as_bool).unwrap_or(false)){
+            let profile=compliance.get("profile").context("portable compliance profile body is missing")?;
+            let typed:ComplianceProfile=serde_json::from_value(profile.clone()).context("portable compliance profile is invalid")?;crate::compliance::validate_profile(&typed)?;
+            let raw=serde_json::to_string(profile)?;let sha=sha256_hex(raw.as_bytes());if compliance.get("sha256").and_then(Value::as_str)!=Some(sha.as_str()){bail!("portable compliance profile hash does not match its content");}
+            let version=compliance.get("version").and_then(Value::as_i64).context("portable compliance profile version is required")?;
+            let fingerprint=portable_str(compliance,"source_fingerprint")?;let model=portable_str(compliance,"model")?;let approved=compliance.get("approved").and_then(Value::as_bool).unwrap_or(false) as i64;let updated=portable_str(compliance,"updated_at")?;
+            tx.execute("INSERT INTO compliance_profile_history(project_id,version,source_fingerprint,profile_json,content_sha256,model,approved,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![project_id,version,fingerprint,raw,sha,model,approved,updated])?;
+            tx.execute("INSERT INTO compliance_profiles(project_id,version,source_fingerprint,profile_json,content_sha256,model,approved,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![project_id,version,fingerprint,raw,sha,model,approved,updated])?;
+            for source in portable_array_object(payload,"compliance_sources")?{
+                let document_id=source.get("source_document_id").and_then(Value::as_i64).map(|old|document_map.get(&old).copied().context("portable compliance source references a missing document")).transpose()?;
+                tx.execute("INSERT INTO compliance_rule_sources(project_id,profile_version,rule_id,source_status,source_hint,source_document_id,source_start_offset,source_end_offset,source_page,source_excerpt) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![project_id,portable_i64(source,"profile_version")?,portable_str(source,"rule_id")?,portable_str(source,"source_status")?,portable_str(source,"source_hint")?,document_id,source.get("source_start_offset").and_then(Value::as_i64),source.get("source_end_offset").and_then(Value::as_i64),source.get("source_page").and_then(Value::as_i64),portable_str(source,"source_excerpt")?])?;
+            }
+            for resolution in portable_array_object(payload,"compliance_resolutions")?{
+                tx.execute("INSERT INTO compliance_resolutions(project_id,rule_id,status,notes,resolved_by,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![project_id,portable_str(resolution,"rule_id")?,portable_str(resolution,"status")?,portable_str(resolution,"notes")?,resolution.get("resolved_by").and_then(Value::as_str),portable_str(resolution,"created_at")?])?;
+            }
+        }
+        if let Some(competitive)=payload.get("competitive_intelligence").filter(|value|value.get("exists").and_then(Value::as_bool).unwrap_or(false)){
+            let strategy=competitive.get("strategy").cloned().unwrap_or(Value::Null);let strategy_raw=if strategy.is_null(){None}else{Some(serde_json::to_string(&strategy)?)};
+            tx.execute("INSERT INTO competitive_runs(project_id,profile_version,input_fingerprint,config_sha256,status,provider_status_json,strategy_json,strategy_sha256,strategy_model,created_at,completed_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![project_id,competitive.get("profile_version").and_then(Value::as_i64).unwrap_or(1),portable_str(competitive,"input_fingerprint")?,portable_str(competitive,"config_sha256")?,portable_str(competitive,"status")?,serde_json::to_string(competitive.get("provider_status").unwrap_or(&json!([])))?,strategy_raw,competitive.get("strategy_sha256").and_then(Value::as_str),competitive.get("strategy_model").and_then(Value::as_str),portable_str(competitive,"created_at")?,competitive.get("completed_at").and_then(Value::as_str)])?;
+            let run_id=tx.last_insert_rowid();
+            for candidate in competitive.get("candidates").and_then(Value::as_array).context("portable competitive candidates must be an array")?{
+                tx.execute("INSERT INTO competitor_candidates(run_id,project_id,candidate_key,name,rank,overall_score,grant_score,publication_score,clinical_trial_score,patent_ip_score,technology_score,breadth_score,asset_count,asset_counts_json,dimension_coverage_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![run_id,project_id,portable_str(candidate,"candidate_key")?,portable_str(candidate,"name")?,portable_i64(candidate,"rank")?,candidate.get("overall_score").and_then(Value::as_f64).context("portable competitive overall_score is required")?,candidate.get("grant_score").and_then(Value::as_f64).context("portable competitive grant_score is required")?,candidate.get("publication_score").and_then(Value::as_f64).context("portable competitive publication_score is required")?,candidate.get("clinical_trial_score").and_then(Value::as_f64).context("portable competitive clinical_trial_score is required")?,candidate.get("patent_ip_score").and_then(Value::as_f64).context("portable competitive patent_ip_score is required")?,candidate.get("technology_score").and_then(Value::as_f64).context("portable competitive technology_score is required")?,candidate.get("breadth_score").and_then(Value::as_f64).context("portable competitive breadth_score is required")?,portable_i64(candidate,"asset_count")?,serde_json::to_string(candidate.get("asset_counts").unwrap_or(&json!({})))?,serde_json::to_string(candidate.get("dimension_coverage").unwrap_or(&json!([])))?])?;
+            }
+            for asset in competitive.get("assets").and_then(Value::as_array).context("portable competitive assets must be an array")?{
+                tx.execute("INSERT INTO competitor_assets(run_id,project_id,candidate_key,asset_key,provider,asset_type,external_id,title,summary,url,year,amount,dimension_id,metadata_json,relevance) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![run_id,project_id,portable_str(asset,"candidate_key")?,portable_str(asset,"asset_key")?,portable_str(asset,"provider")?,portable_str(asset,"asset_type")?,portable_str(asset,"external_id")?,portable_str(asset,"title")?,portable_str(asset,"summary")?,asset.get("url").and_then(Value::as_str),asset.get("year").and_then(Value::as_i64),asset.get("amount").and_then(Value::as_f64),asset.get("dimension_id").and_then(Value::as_str),serde_json::to_string(asset.get("metadata").unwrap_or(&json!({})))?,asset.get("relevance").and_then(Value::as_f64).context("portable competitive relevance is required")?])?;
+            }
+        }
+        for snapshot in portable_array_object(payload,"export_snapshots")?{
+            let body=snapshot.get("snapshot").context("portable export snapshot body is missing")?;let raw=serde_json::to_string(body)?;if snapshot.get("content_sha256").and_then(Value::as_str)!=Some(sha256_hex(raw.as_bytes()).as_str()){bail!("portable export snapshot hash does not match its content");}
+            tx.execute("INSERT INTO export_snapshots(project_id,snapshot_json,content_sha256,created_at) VALUES(?1,?2,?3,?4)",params![project_id,raw,portable_str(snapshot,"content_sha256")?,portable_str(snapshot,"created_at")?])?;
+        }
+        tx.execute("INSERT INTO project_members(project_id,user_id,role,invited_by_user_id) VALUES(?1,?2,'owner',?2)",params![project_id,actor])?;
+        let channel_id=Uuid::new_v4().to_string();tx.execute("INSERT INTO channels(id,project_id,kind,subject_key,name,created_by_user_id) VALUES(?1,?2,'general',NULL,'General',?3)",params![channel_id,project_id,actor])?;
+        if config.enabled("team_collaboration"){
+            let mut routed=vec!["solicitation_profile","research_framework","aim_set","literature_manifest","proposal_section","proposal_snapshot"];
+            if config.enabled("review_simulator"){routed.push("review_simulation");}
+            let routes=routed.into_iter().map(|artifact_type|json!({"artifact_type":artifact_type,"owner_user_id":actor,"approver_user_ids":[actor],"minimum_approvals":1})).collect::<Vec<_>>();
+            let body=json!({"schema_version":1,"project_owner_user_id":actor,"routes":routes});
+            crate::workflow_artifacts::validate_artifact_document("collaboration_record",&body,true)?;
+            let version:i64=tx.query_row("SELECT COALESCE(MAX(version),0)+1 FROM workflow_artifacts WHERE project_id=?1 AND artifact_type='collaboration_record'",[&project_id],|row|row.get(0))?;
+            let raw=serde_json::to_string(&body)?;let sha=sha256_hex(raw.as_bytes());
+            tx.execute("INSERT INTO workflow_artifacts(project_id,artifact_type,version,body_json,content_sha256,source,author,approved,approved_by,approved_at) VALUES(?1,'collaboration_record',?2,?3,?4,'portable_import_owner_reconciliation',?5,1,?5,CURRENT_TIMESTAMP)",params![project_id,version,raw,sha,actor])?;
+        }
+        tx.execute("INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'portable_project_imported',?2,?3)",params![project_id,actor,serde_json::to_string(&json!({"source_project_id":package.get("source_project_id"),"payload_sha256":package.get("payload_sha256"),"validation":validation}))?])?;
+        tx.commit()?;
+        Ok(json!({"id":project_id,"title":title,"validation":validation}))
     }
 
     pub fn competitive_input_fingerprint(&self, project: &str) -> Result<String> {
@@ -4281,18 +4791,24 @@ impl GenerationAudit for Store {
         model: &str,
         prompt_sha256: &str,
         high_value: bool,
+        output_contract: Option<&StructuredOutputContract>,
     ) -> Result<String> {
         if task_kind.trim().is_empty() || prompt_sha256.len() != 64 {
             bail!("generation audit requires a task kind and SHA-256 prompt digest");
         }
         let run_id = Uuid::new_v4().to_string();
         let mut c = self.conn()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let input_manifest=Self::generation_input_manifest_conn(&tx,project)?;
+        let input_manifest_json=serde_json::to_string(&input_manifest)?;
+        let input_manifest_sha256=sha256_hex(input_manifest_json.as_bytes());
+        let output_schema_json=output_contract.map(|contract|serde_json::to_string(&contract.schema)).transpose()?;
         tx.execute(
             r#"INSERT INTO generation_runs(
-                 id,project_id,task_kind,routing_mode,provider,model,prompt_sha256,high_value,status
-               ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'running')"#,
-            params![run_id, project, task_kind, routing_mode, provider, model, prompt_sha256, high_value as i64],
+                 id,project_id,task_kind,routing_mode,provider,model,prompt_sha256,input_manifest_json,input_manifest_sha256,high_value,
+                 output_contract_name,output_contract_version,output_schema_json,output_schema_sha256,status
+               ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'running')"#,
+            params![run_id, project, task_kind, routing_mode, provider, model, prompt_sha256,input_manifest_json,input_manifest_sha256, high_value as i64,output_contract.map(|contract|contract.name.as_str()),output_contract.map(|contract|contract.version as i64),output_schema_json,output_contract.map(|contract|contract.schema_sha256.as_str())],
         )?;
         tx.execute(
             "INSERT INTO workflow_events(project_id,event_type,payload_json) VALUES(?1,'model_generation_started',?2)",
@@ -4303,6 +4819,8 @@ impl GenerationAudit for Store {
                 "provider": provider,
                 "model": model,
                 "prompt_sha256": prompt_sha256,
+                "input_manifest_sha256":input_manifest_sha256,
+                "output_contract":output_contract.map(|contract|json!({"name":contract.name,"version":contract.version,"schema_sha256":contract.schema_sha256})),
                 "high_value": high_value
             }))?],
         )?;
@@ -4394,11 +4912,80 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+fn validate_portable_source_anchors(
+    value:&Value,
+    documents:&std::collections::BTreeMap<i64,&Value>,
+)->Result<()> {
+    match value {
+        Value::Array(items)=>for item in items{validate_portable_source_anchors(item,documents)?;},
+        Value::Object(object)=>{
+            if object.contains_key("document_id")&&object.contains_key("document_sha256")&&object.contains_key("excerpt"){
+                let id=object.get("document_id").and_then(Value::as_i64).context("portable source anchor document_id must be an integer")?;
+                let document=documents.get(&id).context("portable source anchor references a missing document")?;
+                let text=document.get("text").and_then(Value::as_str).context("portable source document text is missing")?;
+                let sha=document.get("sha256").and_then(Value::as_str).context("portable source document hash is missing")?;
+                if object.get("document_sha256").and_then(Value::as_str)!=Some(sha){bail!("portable source anchor document hash does not match its document");}
+                let start=object.get("start_offset").and_then(Value::as_u64).context("portable source anchor start_offset is required")? as usize;
+                let end=object.get("end_offset").and_then(Value::as_u64).context("portable source anchor end_offset is required")? as usize;
+                let excerpt=object.get("excerpt").and_then(Value::as_str).context("portable source anchor excerpt is required")?;
+                if end<=start||end>text.len()||text.as_bytes().get(start..end)!=Some(excerpt.as_bytes()){bail!("portable source anchor excerpt is not the exact document byte slice");}
+            }
+            for child in object.values(){validate_portable_source_anchors(child,documents)?;}
+        }
+        _=>{}
+    }
+    Ok(())
+}
+
+fn remap_portable_document_ids(value:&mut Value,map:&std::collections::BTreeMap<i64,i64>){
+    match value{
+        Value::Array(items)=>for item in items{remap_portable_document_ids(item,map);},
+        Value::Object(object)=>{
+            if object.contains_key("document_sha256")&&object.contains_key("excerpt"){
+                if let Some(old)=object.get("document_id").and_then(Value::as_i64){if let Some(new)=map.get(&old){object.insert("document_id".into(),json!(new));}}
+            }
+            for child in object.values_mut(){remap_portable_document_ids(child,map);}
+        }
+        _=>{}
+    }
+}
+
+fn portable_array_object<'a>(object:&'a serde_json::Map<String,Value>,key:&str)->Result<&'a Vec<Value>>{
+    object.get(key).and_then(Value::as_array).with_context(||format!("portable project {key} must be an array"))
+}
+
+fn portable_str<'a>(value:&'a Value,key:&str)->Result<&'a str>{
+    value.get(key).and_then(Value::as_str).filter(|item|!item.is_empty()).with_context(||format!("portable record {key} must be a non-empty string"))
+}
+
+fn portable_str_object<'a>(value:&'a serde_json::Map<String,Value>,key:&str)->Result<&'a str>{
+    value.get(key).and_then(Value::as_str).filter(|item|!item.is_empty()).with_context(||format!("portable record {key} must be a non-empty string"))
+}
+
+fn portable_i64(value:&Value,key:&str)->Result<i64>{
+    value.get(key).and_then(Value::as_i64).with_context(||format!("portable record {key} must be an integer"))
+}
+
+fn portable_bool(value:&Value,key:&str)->Result<bool>{
+    value.get(key).and_then(Value::as_bool).with_context(||format!("portable record {key} must be a boolean"))
+}
+
+fn validate_sha256_field(value:&Value,key:&str,nullable:bool)->Result<()> {
+    let Some(digest)=value.get(key).and_then(Value::as_str) else {
+        if nullable&&value.get(key).is_some_and(Value::is_null){return Ok(());}
+        bail!("portable record {key} must be a SHA-256 digest");
+    };
+    if digest.len()!=64||!digest.bytes().all(|byte|byte.is_ascii_hexdigit()){
+        bail!("portable record {key} must be a 64-character hexadecimal SHA-256 digest");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod phase6_storage_tests {
     use super::*;
     use crate::competitive_updates::CompetitiveDelta;
-    use crate::domain::RequirementDraft;
+    use crate::domain::{RequirementDraft, RequirementsEnvelope};
 
     fn temp_db(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -4528,6 +5115,8 @@ mod phase6_storage_tests {
             &store.default_workflow_config()?,
             Some("test-user"),
         )?;
+        store.upsert_identity("test-user", "test-org", Some("test@example.org"), "Test user")?;
+        store.add_project_member(project, "test-user", "owner", Some("test-user"))?;
         let legacy_version = store.save_section(
             project,
             "legacy_outline",
@@ -4588,6 +5177,206 @@ mod phase6_storage_tests {
         assert_eq!(framework.get("status").and_then(Value::as_str), Some("awaiting_review"));
 
         let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_approval_rejects_unknown_and_cross_project_references() -> Result<()> {
+        let path = temp_db("artifact-reference-integrity");
+        let store = Store::open(&path)?;
+        let project = "artifact-reference-project";
+        store.create_project_with_workflow(project,"Reference integrity",None,None,&[],&store.default_workflow_config()?,Some("test-user"))?;
+        store.upsert_identity("test-user","test-org",Some("test@example.org"),"Test user")?;
+        store.add_project_member(project,"test-user","owner",Some("test-user"))?;
+        let solicitation_version=approve_test_solicitation(&store,project,"Validate scoped references")?;
+
+        let mut invalid=framework_body(solicitation_version);
+        invalid["nodes"][0]["requirement_ids"]=json!(["R-DOES-NOT-EXIST"]);
+        let saved=store.save_workflow_artifact(project,"research_framework",&invalid,"test",Some("test-user"),Some(0))?;
+        let version=saved.get("version").and_then(Value::as_i64).context("version")?;
+        assert!(store.approve_workflow_artifact(project,"research_framework",version,Some("test-user")).is_err());
+
+        let mut nonmember=framework_body(solicitation_version);
+        nonmember["nodes"][0]["owner_user_id"]=json!("outside-user");
+        let saved=store.save_workflow_artifact(project,"research_framework",&nonmember,"test",Some("test-user"),Some(version))?;
+        let version=saved.get("version").and_then(Value::as_i64).context("version")?;
+        assert!(store.approve_workflow_artifact(project,"research_framework",version,Some("test-user")).is_err());
+
+        let context=store.workflow_editor_context_json(project)?;
+        assert_eq!(context.pointer("/approved_artifacts/solicitation_profile/version").and_then(Value::as_i64),Some(solicitation_version));
+        assert_eq!(context.pointer("/members/0/user_id").and_then(Value::as_str),Some("test-user"));
+        let _=std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn idempotency_keys_are_bound_to_the_exact_operation_and_request_payload() -> Result<()> {
+        let path = temp_db("idempotency-payload");
+        let store = Store::open(&path)?;
+        store.upsert_identity("test-user","test-org",Some("test@example.org"),"Test user")?;
+        let key="stable-request-key";
+        let first_sha=sha256_hex(br#"{"title":"one"}"#);
+        let second_sha=sha256_hex(br#"{"title":"two"}"#);
+        assert!(matches!(
+            store.claim_idempotency("test-user",key,"POST","/api/projects",&first_sha)?,
+            IdempotencyClaim::New
+        ));
+        assert!(matches!(
+            store.claim_idempotency("test-user",key,"POST","/api/projects",&first_sha)?,
+            IdempotencyClaim::InProgress
+        ));
+        store.complete_idempotency("test-user",key,201,"application/json",br#"{"id":"p1"}"#)?;
+        assert!(matches!(
+            store.claim_idempotency("test-user",key,"POST","/api/projects",&first_sha)?,
+            IdempotencyClaim::Replay{status_code:201,..}
+        ));
+        assert!(matches!(
+            store.claim_idempotency("test-user",key,"POST","/api/projects",&second_sha)?,
+            IdempotencyClaim::Conflict
+        ));
+        assert!(matches!(
+            store.claim_idempotency("test-user",key,"POST","/api/projects/other",&first_sha)?,
+            IdempotencyClaim::Conflict
+        ));
+        let _=std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn collaboration_tasks_enforce_ownership_and_expose_dependencies_and_routing() -> Result<()> {
+        let path=temp_db("collaboration-workspace");let store=Store::open(&path)?;
+        for(id,email,name) in [("owner-user","owner@example.org","Owner"),("viewer-user","viewer@example.org","Viewer"),("reviewer-user","reviewer@example.org","Reviewer")]{store.upsert_identity(id,"test-org",Some(email),name)?;}
+        let mut workflow=store.default_workflow_config()?;workflow.enabled_modules.push("team_collaboration".into());
+        let project="collaboration-workspace-project";
+        store.create_project_with_workflow(project,"Collaboration",None,None,&["Specific Aims".into()],&workflow,Some("owner-user"))?;
+        store.add_project_member(project,"owner-user","owner",None)?;
+        store.add_project_member(project,"viewer-user","viewer",Some("owner-user"))?;
+        store.add_project_member(project,"reviewer-user","reviewer",Some("owner-user"))?;
+        let first=store.create_task(project,"Collect biosketches","","viewer-user","human","high",None,"owner-user",&[])?;
+        let first_id=first.get("id").and_then(Value::as_str).context("first task ID")?.to_owned();
+        let second=store.create_task(project,"Verify attachments","","owner-user","human","normal",None,"owner-user",std::slice::from_ref(&first_id))?;
+        let second_id=second.get("id").and_then(Value::as_str).context("second task ID")?;
+        let tasks=store.tasks_json(project)?;
+        let dependent=tasks.as_array().and_then(|items|items.iter().find(|item|item.get("id").and_then(Value::as_str)==Some(second_id))).context("dependent task")?;
+        assert_eq!(dependent.pointer("/dependencies/0").and_then(Value::as_str),Some(first_id.as_str()));
+        store.update_task_status(project,&first_id,"in_progress","viewer-user","viewer")?;
+        assert!(store.update_task_status(project,&first_id,"complete","reviewer-user","reviewer").is_err());
+        store.update_task_status(project,&first_id,"complete","owner-user","owner")?;
+        let section_version=store.save_section_by(project,"specific_aims","Specific Aims","Draft grant narrative",None,"human_edit",Some("owner-user"))?;
+        let comment=store.add_comment(project,"section","specific_aims",section_version,Some(0),Some(5),Some("Draft"),"owner-user","Please replace this opening.",None,&[])?;
+        assert!(comment.get("id").and_then(Value::as_i64).is_some());
+        assert!(store.add_comment(project,"section","specific_aims",section_version,Some(0),Some(5),Some("Wrong"),"owner-user","Invalid quote",None,&[]).is_err());
+        let routing=json!({"schema_version":1,"project_owner_user_id":"owner-user","routes":[{"artifact_type":"proposal_section","owner_user_id":"owner-user","approver_user_ids":["owner-user"],"minimum_approvals":1}]});
+        let saved=store.save_workflow_artifact(project,"collaboration_record",&routing,"test",Some("owner-user"),Some(0))?;
+        store.approve_workflow_artifact(project,"collaboration_record",saved.get("version").and_then(Value::as_i64).context("routing version")?,Some("owner-user"))?;
+        let status=store.approval_routing_status_json(project)?;
+        assert_eq!(status.get("configured").and_then(Value::as_bool),Some(true));
+        assert_eq!(status.pointer("/routes/0/artifact_type").and_then(Value::as_str),Some("section:specific_aims"));
+        let _=std::fs::remove_file(path);Ok(())
+    }
+
+    #[test]
+    fn section_edits_compare_merge_and_restore_with_atomic_lineage() -> Result<()> {
+        let path=temp_db("section-versioning");let store=Store::open(&path)?;
+        store.upsert_identity("editor-user","test-org",Some("editor@example.org"),"Editor")?;
+        let project="section-versioning-project";
+        store.create_project_with_workflow(project,"Versioning",None,None,&["Specific Aims".into()],&store.default_workflow_config()?,Some("editor-user"))?;
+        let first=store.save_section_by(project,"specific_aims","Specific Aims","one\ntwo\nthree\n",None,"human_edit",Some("editor-user"))?;
+        let second=store.save_section_edit(project,"specific_aims","Specific Aims","ONE\ntwo\nthree\n",None,Some(first),"editor-user")?;
+        assert!(store.save_section_edit(project,"specific_aims","Specific Aims","stale",None,Some(first),"editor-user").is_err());
+        let history=store.section_versions_json(project,"specific_aims")?;
+        assert_eq!(history.pointer("/0/base_version_id").and_then(Value::as_i64),Some(first));
+        let comparison=store.section_compare_json(project,"specific_aims",first,second)?;
+        assert_eq!(comparison.pointer("/from/body").and_then(Value::as_str),Some("one\ntwo\nthree\n"));
+        let merge=store.section_merge_preview_json(project,"specific_aims",first,second,"one\ntwo\nTHREE\n")?;
+        assert_eq!(merge.get("clean").and_then(Value::as_bool),Some(true));
+        assert_eq!(merge.get("merged_body").and_then(Value::as_str),Some("ONE\ntwo\nTHREE\n"));
+        let restored=store.restore_section_version(project,"specific_aims",first,second,Some("editor-user"))?;
+        let restored_record=store.section_version_json(project,"specific_aims",restored)?;
+        assert_eq!(restored_record.get("base_version_id").and_then(Value::as_i64),Some(second));
+        assert_eq!(restored_record.get("restored_from_version_id").and_then(Value::as_i64),Some(first));
+        assert_eq!(restored_record.get("approved").and_then(Value::as_bool),Some(false));
+        let restored_events:i64=store.conn()?.query_row("SELECT COUNT(*) FROM workflow_events WHERE project_id=?1 AND event_type='section_version_restored'",[project],|row|row.get(0))?;
+        assert_eq!(restored_events,1);
+        let _=std::fs::remove_file(path);Ok(())
+    }
+
+    #[test]
+    fn portable_project_round_trip_validates_hashes_and_preserves_core_history() -> Result<()> {
+        let path=temp_db("portable-round-trip");
+        let store=Store::open(&path)?;
+        store.upsert_identity("owner-user","test-org",Some("owner@example.org"),"Owner")?;
+        let source_project="portable-source";
+        store.create_project_with_workflow(source_project,"Portable grant",Some("Sponsor"),Some("TEST"),&["Specific Aims".into()],&store.default_workflow_config()?,Some("owner-user"))?;
+        let text="Applicants must provide Specific Aims.";let sha=sha256_hex(text.as_bytes());
+        store.add_document(source_project,"NOFO","funding_opportunity",text,&sha)?;
+        store.replace_requirements(source_project,&[RequirementDraft{external_id:"R-001".into(),category:"section".into(),requirement:text.into(),mandatory:true,evidence_needed:vec!["Specific Aims".into()],dependencies:vec![],source_clue:text.into(),source_document:Some("NOFO".into()),source_locator:None}])?;
+        store.approve_requirements(source_project)?;
+        let generated_body="Approved exact generated prose";
+        let generation_run=store.begin_generation(source_project,"section_draft","hybrid","claude","test-model",&sha256_hex(b"immutable prompt"),true,None)?;
+        store.complete_generation(&generation_run,&sha256_hex(generated_body.as_bytes()))?;
+        let version=store.save_generated_section(source_project,"specific_aims","Specific Aims",generated_body,None,"claude:test-model",&generation_run,None,Some("owner-user"))?;
+        store.approve_section_version_by(source_project,"specific_aims",version,Some("owner-user"))?;
+        let contract=StructuredOutputContract::for_type::<RequirementsEnvelope>("requirements_envelope",1)?;
+        let structured_response=r#"{"requirements":[]}"#;
+        let structured_run=store.begin_generation(source_project,"requirement_decomposition","hybrid","claude","test-model",&sha256_hex(b"structured prompt"),true,Some(&contract))?;
+        store.complete_generation(&structured_run,&sha256_hex(structured_response.as_bytes()))?;
+        let package=store.portable_project_package(source_project)?;
+        assert_eq!(package.get("schema_version").and_then(Value::as_u64),Some(2));
+        assert_eq!(store.validate_portable_project_package(&package)?.get("valid").and_then(Value::as_bool),Some(true));
+        let imported=store.import_portable_project_package(&package,"owner-user")?;
+        let imported_id=imported.get("id").and_then(Value::as_str).context("imported project ID")?;
+        assert_ne!(imported_id,source_project);
+        assert_eq!(store.project_json(imported_id)?.get("title").and_then(Value::as_str),Some("Portable grant"));
+        assert_eq!(store.section_versions_json(imported_id,"specific_aims")?.as_array().map(Vec::len),Some(1));
+        assert_eq!(store.approved_sections_json(imported_id)?.pointer("/0/body").and_then(Value::as_str),Some(generated_body));
+        let imported_version=store.section_versions_json(imported_id,"specific_aims")?.pointer("/0/version").and_then(Value::as_i64).context("imported version")?;
+        let imported_lineage=store.section_version_json(imported_id,"specific_aims",imported_version)?;
+        let imported_run_id=imported_lineage.get("generation_run_id").and_then(Value::as_str).context("imported generation lineage")?;
+        assert_ne!(imported_run_id,generation_run);
+        let imported_run=store.generation_run_json(imported_id,imported_run_id)?;
+        assert_eq!(imported_run.get("response_sha256").and_then(Value::as_str),Some(sha256_hex(generated_body.as_bytes()).as_str()));
+        assert_eq!(imported_run.pointer("/input_manifest/schema_version").and_then(Value::as_i64),Some(1));
+        let imported_runs=store.generation_runs_json(imported_id,10)?;
+        let imported_structured=imported_runs.as_array().context("imported runs")?.iter().find(|run|run.get("output_contract_name").and_then(Value::as_str)==Some("requirements_envelope")).context("imported structured run")?;
+        let imported_structured_id=imported_structured.get("id").and_then(Value::as_str).context("imported structured run ID")?;
+        let imported_structured=store.generation_run_json(imported_id,imported_structured_id)?;
+        assert_eq!(imported_structured.get("output_schema_sha256").and_then(Value::as_str),Some(contract.schema_sha256.as_str()));
+        assert_eq!(imported_structured.pointer("/output_schema/type").and_then(Value::as_str),Some("object"));
+        let imported_source:String=store.conn()?.query_row("SELECT text FROM documents WHERE project_id=?1 AND kind='funding_opportunity'",[imported_id],|row|row.get(0))?;
+        assert_eq!(imported_source,text);
+        let mut tampered=package.clone();tampered["payload"]["project"]["title"]=json!("Tampered");
+        assert!(store.validate_portable_project_package(&tampered).is_err());
+        let mut lineage_tampered=package.clone();
+        let manifest=lineage_tampered.pointer("/payload/generation_runs/0/input_manifest_json").and_then(Value::as_str).context("generation manifest")?.to_owned();
+        lineage_tampered["payload"]["generation_runs"][0]["input_manifest_json"]=json!(format!("{manifest} "));
+        lineage_tampered["payload_sha256"]=json!(sha256_hex(&serde_json::to_vec(lineage_tampered.get("payload").context("payload")?)?));
+        assert!(store.validate_portable_project_package(&lineage_tampered).is_err());
+        let _=std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn generated_sections_require_exact_complete_audit_lineage_and_current_base() -> Result<()> {
+        let path=temp_db("generated-section-lineage");
+        let store=Store::open(&path)?;
+        let project="generated-section-project";
+        store.create_project_with_workflow(project,"Generated lineage",None,None,&["Specific Aims".into()],&store.default_workflow_config()?,None)?;
+        let first=store.save_section_by(project,"specific_aims","Specific Aims","Human base",None,"human_edit",None)?;
+        let body="Model result";
+        let run=store.begin_generation(project,"section_draft","local_only","ollama","qwen3:1.7b",&sha256_hex(b"prompt"),false,None)?;
+        store.complete_generation(&run,&sha256_hex(body.as_bytes()))?;
+        assert!(store.save_generated_section(project,"specific_aims","Specific Aims","different bytes",None,"ollama:qwen3:1.7b",&run,Some(first),None).is_err());
+        let concurrent=store.save_section_edit(project,"specific_aims","Specific Aims","Concurrent human change",None,Some(first),"editor")?;
+        assert!(store.save_generated_section(project,"specific_aims","Specific Aims",body,None,"ollama:qwen3:1.7b",&run,Some(first),None).is_err());
+        let generated=store.save_generated_section(project,"specific_aims","Specific Aims",body,None,"ollama:qwen3:1.7b",&run,Some(concurrent),None)?;
+        let record=store.section_version_json(project,"specific_aims",generated)?;
+        assert_eq!(record.get("generation_run_id").and_then(Value::as_str),Some(run.as_str()));
+        assert_eq!(record.get("base_version_id").and_then(Value::as_i64),Some(concurrent));
+        let audit=store.generation_run_json(project,&run)?;
+        let manifest_raw=serde_json::to_string(audit.get("input_manifest").context("input manifest")?)?;
+        assert_eq!(audit.get("input_manifest_sha256").and_then(Value::as_str),Some(sha256_hex(manifest_raw.as_bytes()).as_str()));
+        let _=std::fs::remove_file(path);
         Ok(())
     }
 

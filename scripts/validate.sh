@@ -212,6 +212,31 @@ PYM2
 
 if command -v docker >/dev/null 2>&1; then
   (cd "$ROOT" && docker compose config >/dev/null && docker compose --profile cpu-embedding config >/dev/null && docker build --target test -f Dockerfile.core . && docker compose build)
+  (cd "$ROOT" && docker compose run --rm --no-deps -e AUTH_MODE=local_single_user ui python - <<'PYCOLLAB'
+import app,inspect
+assert hasattr(app,'load_team_workspace') and hasattr(app,'post_artifact_comment')
+assert hasattr(app,'version_history') and hasattr(app,'compare_versions') and hasattr(app,'restore_version')
+assert hasattr(app,'_editor_context') and hasattr(app,'_reference_rows')
+sample={
+  'members':[{'user_id':'u1','name':'Owner','email':'owner@example.org','role':'owner'}],
+  'tasks':[{'id':'t2','priority':'high','status':'blocked','title':'Dependent task','owner_user_id':'u1','source':'human','dependencies':['t1']}],
+  'notifications':[{'id':3,'kind':'task_assigned','payload':{'task_id':'t2'}}],
+  'approval_routing':{'routes':[{'title':'Specific Aims','current_version':7,'owner_user_id':'u1','approver_user_ids':['u1'],'approvals':1,'minimum_approvals':1,'threshold_met':True,'approved':True}]}
+}
+rows=app.team_workspace_rows(sample)
+assert rows[3][0][7]=='t1' and rows[4][0][0]==3 and rows[5][0][6] is True
+def variadic(value,*items):return value,items
+signature=inspect.signature(app.gateway_callback(variadic))
+assert signature.parameters['request'].kind==inspect.Parameter.KEYWORD_ONLY
+context={'approved_artifacts':{'solicitation_profile':{'version':3,'body':{'requirements':[{'id':'R1','label':'Need','mandatory':True}],'review_criteria':[{'id':'C1','title':'Rigor','scored':True}]}},'research_framework':{'version':2,'body':{'nodes':[{'key':'aims','title':'Aims','position':1}]}},'aim_set':{'version':1,'body':{'aims':[{'id':'A1','title':'Aim 1','classification':'fact'}]}}},'members':[{'user_id':'u1','name':'Owner','role':'owner'}],'evidence':[{'id':7,'claim':'Known','status':'approved'}],'sources':[],'citations':[]}
+references=app._reference_rows(context,{'requirements','criteria','members','framework_nodes','aims','evidence'})
+assert {row[1] for row in references}=={'R1','C1','u1','aims','A1',7}
+metadata={'body':{},'editor_context':context}
+assert app.framework_body(metadata,'Argument',[])['solicitation_profile_version']==3
+assert app.aims_body(metadata,'Objective','Hypothesis',[])['framework_version']==2
+print('Collaboration and version-reconciliation UI construction validation passed.')
+PYCOLLAB
+  )
 elif command -v cargo >/dev/null 2>&1 && [[ -f "$ROOT/core/Cargo.lock" ]]; then
   (cd "$ROOT/core" && cargo test --release --locked)
 elif command -v cargo >/dev/null 2>&1; then
@@ -230,7 +255,7 @@ grep -q 'no-new-privileges:true' "$ROOT/docker-compose.yml"
 grep -q 'cap_drop:' "$ROOT/docker-compose.yml"
 grep -q 'restart: unless-stopped' "$ROOT/docker-compose.yml"
 grep -q 'max-size: "10m"' "$ROOT/docker-compose.yml"
-for file in install.sh scripts/start_ollama.sh scripts/security_scan.sh scripts/benchmark.sh scripts/backup.sh scripts/restore.sh scripts/audit_dependencies.sh scripts/doctor.sh scripts/build_release.sh scripts/sign_release.sh scripts/release_acceptance.sh; do
+for file in install.sh scripts/start_ollama.sh scripts/security_scan.sh scripts/benchmark.sh scripts/backup.sh scripts/restore.sh scripts/audit_dependencies.sh scripts/doctor.sh scripts/build_release.sh scripts/sign_release.sh scripts/release_acceptance.sh scripts/preflight_oidc_gateway.sh scripts/start_oidc_gateway.sh scripts/stop_oidc_gateway.sh; do
   test -x "$ROOT/$file"
   bash -n "$ROOT/$file"
 done
@@ -240,6 +265,7 @@ grep -q 'unsafe archive path' "$ROOT/scripts/restore.sh"
 grep -q 'cargo-audit' "$ROOT/scripts/audit_dependencies.sh"
 grep -q 'Grant Writer doctor' "$ROOT/scripts/doctor.sh"
 grep -q 'type=cache,target=/usr/local/cargo/registry' "$ROOT/Dockerfile.core"
+grep -q 'touch build.rs src/\*.rs ../hpc/hpc_kernels.cpp' "$ROOT/Dockerfile.core"
 grep -q 'type=cache,target=/root/.cache/pip' "$ROOT/Dockerfile.ui"
 python3 - "$ROOT" "$PYTHON_RUNTIME_IMPORTS_READY" <<'PYPH8'
 import importlib.util,json,pathlib,sys,tomllib,yaml,tempfile
@@ -274,3 +300,32 @@ with tempfile.TemporaryDirectory() as td:
 print('Phase 8 production/release static validation passed.')
 PYPH8
 echo "Phase 8 validation completed."
+
+# Enterprise identity boundary: structured OIDC claims, TLS-only gateway, and
+# removal of every backend host port in the shared deployment override.
+test "$(grep -c 'ports: !reset \[\]' "$ROOT/docker-compose.oidc.yml")" -eq 4
+grep -q 'AUTH_MODE: trusted_headers' "$ROOT/docker-compose.oidc.yml"
+grep -q 'oauth2-proxy:v7.15.1@sha256:' "$ROOT/docker-compose.oidc.yml"
+grep -q 'nginx-unprivileged:1.29-alpine@sha256:' "$ROOT/docker-compose.oidc.yml"
+grep -q 'proxy_set_header X-Grantspace-User-Id' "$ROOT/gateway/nginx.conf.template"
+grep -q 'proxy_set_header X-Grantspace-Organization-Id' "$ROOT/gateway/nginx.conf.template"
+grep -q 'proxy_set_header X-Grantspace-Gateway-Secret' "$ROOT/gateway/nginx.conf.template"
+grep -q 'rd=https://${OIDC_PUBLIC_HOST}:${OIDC_HTTPS_PORT}' "$ROOT/gateway/nginx.conf.template"
+grep -q 'TRUSTED_GATEWAY_SECRET_FILE: /run/secrets/gateway_shared_secret' "$ROOT/docker-compose.oidc.yml"
+python3 - "$ROOT/gateway/oauth2-proxy-alpha.yml" <<'PYOIDC'
+import sys,yaml
+config=yaml.safe_load(open(sys.argv[1]))
+provider=config['providers'][0]
+oidc=provider['oidcConfig']
+assert provider['clientSecretFile']=='/run/secrets/oidc_client_secret'
+assert oidc['userIDClaim']=='${OIDC_USER_ID_CLAIM}'
+assert oidc['emailClaim']=='${OIDC_EMAIL_CLAIM}'
+assert oidc['insecureSkipNonce'] is False
+headers={item['name']:item['values'][0] for item in config['injectResponseHeaders']}
+assert headers['X-Auth-Request-User']['claimSource']['claim']=='user'
+assert headers['X-Auth-Request-Email']['claimSource']['claim']=='email'
+assert headers['X-Auth-Request-Grantspace-Gateway-Secret']['secretSource']['fromFile']=='/run/secrets/gateway_shared_secret'
+assert config['upstreamConfig']['upstreams'][0]['staticCode']==202
+print('Enterprise OIDC identity contract validation passed.')
+PYOIDC
+echo "Enterprise gateway static validation completed."

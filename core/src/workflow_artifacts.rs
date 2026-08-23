@@ -1,11 +1,26 @@
 use anyhow::{bail, Context, Result};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const SYNTHETIC_REVIEW_NOTICE: &str = "Synthetic reviewer feedback is decision support derived from the approved solicitation and proposal snapshot. It does not represent named real reviewers, private deliberations, an award probability, or a predicted sponsor decision.";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Machine-readable values used by structured artifact editors. Keeping this
+/// contract beside the serializers prevents clients from maintaining a second,
+/// drifting list of statuses or classifications.
+pub fn editor_contract_json() -> Value {
+    json!({
+        "schema_version": 1,
+        "solicitation_fact_categories": ["eligibility", "requirements", "deadlines", "budget_rules", "attachments"],
+        "fact_statuses": ["model_extracted", "deterministically_located", "human_corrected", "human_approved"],
+        "assertion_classifications": ["fact", "estimate", "assumption"],
+        "evidence_need_dispositions": ["supported", "waived", "unresolved_risk"]
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FactStatus {
     ModelExtracted,
@@ -14,7 +29,7 @@ pub enum FactStatus {
     HumanApproved,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SourceAnchor {
     pub document_id: i64,
     pub document_sha256: String,
@@ -24,7 +39,7 @@ pub struct SourceAnchor {
     pub excerpt: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SolicitationFact {
     pub id: String,
     pub label: String,
@@ -36,7 +51,7 @@ pub struct SolicitationFact {
     pub sources: Vec<SourceAnchor>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewCriterion {
     pub id: String,
     pub title: String,
@@ -48,7 +63,7 @@ pub struct ReviewCriterion {
     pub sources: Vec<SourceAnchor>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SolicitationProfile {
     pub schema_version: u32,
     pub working_title: String,
@@ -71,7 +86,7 @@ pub struct SolicitationProfile {
     pub open_questions: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FrameworkNode {
     pub key: String,
     pub title: String,
@@ -95,7 +110,7 @@ pub struct FrameworkNode {
     pub dependencies: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ResearchFramework {
     pub schema_version: u32,
     pub solicitation_profile_version: i64,
@@ -103,7 +118,7 @@ pub struct ResearchFramework {
     pub nodes: Vec<FrameworkNode>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AssertionClassification {
     Fact,
@@ -111,7 +126,7 @@ pub enum AssertionClassification {
     Assumption,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ResearchAim {
     pub id: String,
     pub title: String,
@@ -128,7 +143,7 @@ pub struct ResearchAim {
     pub supporting_evidence_ids: Vec<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AimSet {
     pub schema_version: u32,
     pub framework_version: i64,
@@ -247,22 +262,22 @@ pub struct ReviewerPanelRole { pub key:String, pub title:String, pub description
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewerPanelPlan { pub schema_version:u32, pub solicitation_profile_version:i64, pub registry_definition_version:u32, pub mode:String, pub roles:Vec<ReviewerPanelRole>, pub synthetic_review_notice:String }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CriterionScore { pub criterion_id:String, pub score:Option<f64>, pub strengths:Vec<String>, pub weaknesses:Vec<String>, pub proposal_anchors:Vec<String>, pub solicitation_anchors:Vec<String>, pub confidence:f64 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SimulatedReviewerResult { pub reviewer_archetype:String, pub criterion_scores:Vec<CriterionScore>, pub overall_assessment:String, pub questions:Vec<String> }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CausalNode { pub id:String, pub kind:String, pub label:String, pub inferred:bool }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CausalEdge { pub from:String, pub to:String, pub relationship:String, pub evidence_anchors:Vec<String>, pub inferred:bool }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CausalGraph { pub nodes:Vec<CausalNode>, pub edges:Vec<CausalEdge> }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CausalAnalysisResult { pub mode:String, pub graph:CausalGraph, pub assumptions:Vec<Value>, pub threats:Vec<Value>, pub claim_checks:Vec<Value> }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,77 +320,11 @@ pub fn validate_grounded_review_result(
         bail!("individual reviews must cover each approved panel role exactly once");
     }
 
-    let criteria = solicitation
-        .review_criteria
-        .iter()
-        .map(|criterion| (criterion.id.as_str(), criterion))
-        .collect::<std::collections::BTreeMap<_, _>>();
     for review in &run.reviews {
         let role = expected_roles
             .get(review.reviewer_archetype.as_str())
             .context("review references a role not present in the approved panel plan")?;
-        let expected_criteria = role
-            .criterion_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
-        let actual_criteria = review
-            .criterion_scores
-            .iter()
-            .map(|score| score.criterion_id.as_str())
-            .collect::<BTreeSet<_>>();
-        if actual_criteria != expected_criteria {
-            bail!(
-                "review {} must cover exactly its approved solicitation criteria",
-                review.reviewer_archetype
-            );
-        }
-        for score in &review.criterion_scores {
-            let criterion = criteria
-                .get(score.criterion_id.as_str())
-                .with_context(|| format!("unknown solicitation criterion {}", score.criterion_id))?;
-            if criterion.scored {
-                let value = score.score.with_context(|| {
-                    format!("scored criterion {} requires a numeric score", criterion.id)
-                })?;
-                if !value.is_finite() {
-                    bail!("criterion {} score must be finite", criterion.id);
-                }
-                if let Some((minimum, maximum)) = numeric_scale_bounds(criterion.scale.as_deref()) {
-                    if value < minimum || value > maximum {
-                        bail!(
-                            "criterion {} score {value} is outside its solicitation scale {minimum}-{maximum}",
-                            criterion.id
-                        );
-                    }
-                }
-            } else if score.score.is_some() {
-                bail!(
-                    "narrative criterion {} must retain a null score",
-                    criterion.id
-                );
-            }
-            if !score
-                .solicitation_anchors
-                .iter()
-                .any(|anchor| anchor == &criterion.id)
-            {
-                bail!(
-                    "criterion {} must cite its own solicitation criterion ID",
-                    criterion.id
-                );
-            }
-            for anchor in &score.solicitation_anchors {
-                if !criteria.contains_key(anchor.as_str()) {
-                    bail!("unknown solicitation anchor {anchor}");
-                }
-            }
-            for anchor in &score.proposal_anchors {
-                if !proposal_anchor_ids.contains(anchor) {
-                    bail!("unknown or stale proposal anchor {anchor}");
-                }
-            }
-        }
+        validate_grounded_individual_review(review, role, solicitation, proposal_anchor_ids)?;
     }
 
     if let Some(causal) = &run.causal_analysis {
@@ -384,6 +333,99 @@ pub fn validate_grounded_review_result(
                 if !proposal_anchor_ids.contains(anchor) && !evidence_anchor_ids.contains(anchor) {
                     bail!("causal edge references unknown evidence anchor {anchor}");
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate one model response before it can influence a panel synthesis.
+/// This deliberately accepts exactly one approved role rather than a partial panel,
+/// so an invalid or cross-role response is rejected before the consensus prompt is built.
+pub fn validate_grounded_individual_review(
+    review: &SimulatedReviewerResult,
+    role: &ReviewerPanelRole,
+    solicitation: &SolicitationProfile,
+    proposal_anchor_ids: &BTreeSet<String>,
+) -> Result<()> {
+    if review.reviewer_archetype != role.key {
+        bail!("individual review must use its exact approved reviewer role key");
+    }
+    required(&review.overall_assessment, "review overall_assessment")?;
+    if review.criterion_scores.is_empty() {
+        bail!("review {} has no criterion scores", review.reviewer_archetype);
+    }
+    unique_non_empty(
+        review.criterion_scores.iter().map(|score| score.criterion_id.as_str()),
+        "review criterion id",
+    )?;
+    let expected_criteria = role
+        .criterion_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let actual_criteria = review
+        .criterion_scores
+        .iter()
+        .map(|score| score.criterion_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if actual_criteria != expected_criteria {
+        bail!(
+            "review {} must cover exactly its approved solicitation criteria",
+            review.reviewer_archetype
+        );
+    }
+    let criteria = solicitation
+        .review_criteria
+        .iter()
+        .map(|criterion| (criterion.id.as_str(), criterion))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for score in &review.criterion_scores {
+        if !(0.0..=1.0).contains(&score.confidence) {
+            bail!("review confidence must be between zero and one");
+        }
+        if score.proposal_anchors.is_empty() || score.solicitation_anchors.is_empty() {
+            bail!("every simulated criterion review requires proposal and solicitation anchors");
+        }
+        let criterion = criteria
+            .get(score.criterion_id.as_str())
+            .with_context(|| format!("unknown solicitation criterion {}", score.criterion_id))?;
+        if criterion.scored {
+            let value = score.score.with_context(|| {
+                format!("scored criterion {} requires a numeric score", criterion.id)
+            })?;
+            if !value.is_finite() {
+                bail!("criterion {} score must be finite", criterion.id);
+            }
+            if let Some((minimum, maximum)) = numeric_scale_bounds(criterion.scale.as_deref()) {
+                if value < minimum || value > maximum {
+                    bail!(
+                        "criterion {} score {value} is outside its solicitation scale {minimum}-{maximum}",
+                        criterion.id
+                    );
+                }
+            }
+        } else if score.score.is_some() {
+            bail!("narrative criterion {} must retain a null score", criterion.id);
+        }
+        if !score
+            .solicitation_anchors
+            .iter()
+            .any(|anchor| anchor == &criterion.id)
+        {
+            bail!(
+                "criterion {} must cite its own solicitation criterion ID",
+                criterion.id
+            );
+        }
+        for anchor in &score.solicitation_anchors {
+            if !criteria.contains_key(anchor.as_str()) {
+                bail!("unknown solicitation anchor {anchor}");
+            }
+        }
+        for anchor in &score.proposal_anchors {
+            if !proposal_anchor_ids.contains(anchor) {
+                bail!("unknown or stale proposal anchor {anchor}");
             }
         }
     }
@@ -476,8 +518,9 @@ fn validate_solicitation(profile: SolicitationProfile, approval: bool) -> Result
         }
     }
     unique_non_empty(
-        profile.requirements.iter().map(|fact| fact.id.as_str()),
-        "solicitation requirement id",
+        profile.eligibility.iter().chain(&profile.requirements).chain(&profile.deadlines)
+            .chain(&profile.budget_rules).chain(&profile.attachments).map(|fact| fact.id.as_str()),
+        "solicitation fact id",
     )?;
     unique_non_empty(
         profile.review_criteria.iter().map(|item| item.id.as_str()),
@@ -516,6 +559,9 @@ fn validate_solicitation(profile: SolicitationProfile, approval: bool) -> Result
         for source in &criterion.sources {
             validate_anchor(source)?;
         }
+    }
+    if profile.open_questions.iter().any(|question| question.trim().is_empty()) {
+        bail!("solicitation open questions cannot contain blank entries");
     }
     Ok(())
 }
@@ -603,6 +649,11 @@ fn validate_aims(aim_set: AimSet, approval: bool) -> Result<()> {
             required(&aim.expected_outcome, "aim expected_outcome")?;
             required(&aim.impact, "aim impact")?;
             required(&aim.innovation, "aim innovation")?;
+            if matches!(aim.classification, AssertionClassification::Fact)
+                && aim.supporting_evidence_ids.is_empty()
+            {
+                bail!("fact-classified aim {} requires supporting evidence", aim.id);
+            }
         }
         for dependency in &aim.dependencies {
             if !ids.contains(dependency.as_str()) {
@@ -627,6 +678,13 @@ fn validate_literature(manifest: LiteratureManifest, approval: bool) -> Result<(
     required(&manifest.started_at, "literature started_at")?;
     required(&manifest.completed_at, "literature completed_at")?;
     required(&manifest.search_provider, "literature search_provider")?;
+    let started = OffsetDateTime::parse(&manifest.started_at, &Rfc3339)
+        .context("literature started_at must be RFC 3339")?;
+    let completed = OffsetDateTime::parse(&manifest.completed_at, &Rfc3339)
+        .context("literature completed_at must be RFC 3339")?;
+    if completed < started {
+        bail!("literature completed_at cannot precede started_at");
+    }
     if manifest.queries.is_empty() {
         bail!("literature manifest requires at least one query");
     }
@@ -816,6 +874,17 @@ mod tests {
     }
 
     #[test]
+    fn fact_classified_aims_require_project_evidence_references() {
+        let body = json!({"schema_version":1,"framework_version":1,"overall_objective":"Establish an effect","central_hypothesis_or_thesis":"The intervention improves the endpoint",
+          "aims":[{"id":"aim-1","title":"Aim 1","statement":"Test the intervention","rationale":"Addresses the gap","approach_summary":"Controlled study","expected_outcome":"Estimated effect","impact":"Improved care","innovation":"New delivery model","classification":"fact","supporting_evidence_ids":[]}]});
+        assert!(validate_artifact_document("aim_set", &body, false).is_ok());
+        assert!(validate_artifact_document("aim_set", &body, true).is_err());
+        let mut supported = body;
+        supported["aims"][0]["supporting_evidence_ids"] = json!([42]);
+        assert!(validate_artifact_document("aim_set", &supported, true).is_ok());
+    }
+
+    #[test]
     fn approved_literature_requires_one_resolution_per_grounded_query() {
         let body = json!({
             "schema_version": 1,
@@ -844,5 +913,73 @@ mod tests {
             "evidence_ids": [], "rationale": "No qualifying source was located"
         }]);
         assert!(validate_artifact_document("literature_manifest", &complete, true).is_ok());
+
+        let mut reversed = complete;
+        reversed["completed_at"] = json!("2029-12-31T23:59:59Z");
+        assert!(validate_artifact_document("literature_manifest", &reversed, false).is_err());
+    }
+
+    #[test]
+    fn individual_review_is_rejected_before_consensus_when_not_grounded() {
+        let solicitation = SolicitationProfile {
+            schema_version: 1,
+            working_title: "Test solicitation".into(),
+            sponsor: "Test sponsor".into(),
+            mechanism: None,
+            purpose: "Test grounded review validation".into(),
+            eligibility: vec![],
+            requirements: vec![],
+            review_criteria: vec![ReviewCriterion {
+                id: "criterion-1".into(),
+                title: "Rigor".into(),
+                description: "Assess rigor".into(),
+                scored: true,
+                scale: Some("1-9".into()),
+                status: FactStatus::HumanApproved,
+                sources: vec![],
+            }],
+            deadlines: vec![],
+            budget_rules: vec![],
+            attachments: vec![],
+            open_questions: vec![],
+        };
+        let role = ReviewerPanelRole {
+            key: "methods".into(),
+            title: "Methods reviewer".into(),
+            description: "Reviews rigor and feasibility".into(),
+            criterion_ids: vec!["criterion-1".into()],
+        };
+        let proposal_anchors = BTreeSet::from(["section:approach:v3".to_string()]);
+        let mut review = SimulatedReviewerResult {
+            reviewer_archetype: "methods".into(),
+            criterion_scores: vec![CriterionScore {
+                criterion_id: "criterion-1".into(),
+                score: Some(5.0),
+                strengths: vec!["Clear design".into()],
+                weaknesses: vec![],
+                proposal_anchors: vec!["section:approach:v3".into()],
+                solicitation_anchors: vec!["criterion-1".into()],
+                confidence: 0.8,
+            }],
+            overall_assessment: "The approach is feasible.".into(),
+            questions: vec![],
+        };
+
+        assert!(validate_grounded_individual_review(
+            &review,
+            &role,
+            &solicitation,
+            &proposal_anchors
+        )
+        .is_ok());
+
+        review.criterion_scores[0].proposal_anchors = vec!["section:stale:v1".into()];
+        assert!(validate_grounded_individual_review(
+            &review,
+            &role,
+            &solicitation,
+            &proposal_anchors
+        )
+        .is_err());
     }
 }

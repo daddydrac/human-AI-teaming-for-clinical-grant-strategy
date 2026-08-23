@@ -1,6 +1,7 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RequirementDraft {
     pub external_id: String,
     pub category: String,
@@ -19,12 +20,12 @@ pub struct RequirementDraft {
     pub source_locator: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RequirementsEnvelope {
     pub requirements: Vec<RequirementDraft>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InterviewQuestionDraft {
     pub requirement_id: String,
     pub question: String,
@@ -41,12 +42,12 @@ pub struct InterviewQuestionDraft {
     pub priority: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InterviewEnvelope {
     pub questions: Vec<InterviewQuestionDraft>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ResearchQueryDraft {
     pub requirement_id: String,
     pub query: String,
@@ -60,12 +61,12 @@ pub struct ResearchQueryDraft {
     pub rationale: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ResearchPlanEnvelope {
     pub queries: Vec<ResearchQueryDraft>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CitationCandidate {
     pub source_id: String,
     pub title: String,
@@ -76,7 +77,7 @@ pub struct CitationCandidate {
     pub content_sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EvidenceValidationItem {
     pub source_index: usize,
     pub status: String,
@@ -87,7 +88,7 @@ pub struct EvidenceValidationItem {
     pub explanation: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EvidenceValidationEnvelope {
     pub validations: Vec<EvidenceValidationItem>,
 }

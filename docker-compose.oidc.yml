@@ -1,0 +1,120 @@
+services:
+  core:
+    environment:
+      AUTH_MODE: trusted_headers
+      TRUSTED_GATEWAY_SECRET_FILE: /run/secrets/gateway_shared_secret
+    secrets:
+      - gateway_shared_secret
+    ports: !reset []
+
+  renderer:
+    ports: !reset []
+
+  embedding-cpu:
+    ports: !reset []
+
+  ui:
+    environment:
+      AUTH_MODE: trusted_headers
+      APP_PUBLIC_URL: https://${OIDC_PUBLIC_HOST:?OIDC_PUBLIC_HOST is required}:${OIDC_HTTPS_PORT:-8443}
+      SESSION_COOKIE_SECURE: "true"
+      TRUSTED_PROXY_IPS: "*"
+      TRUSTED_GATEWAY_SECRET_FILE: /run/secrets/gateway_shared_secret
+    secrets:
+      - gateway_shared_secret
+    ports: !reset []
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.1@sha256:39f08531587045a5443db43299bf8495696c99ed8d0e1fdcbe60534f7c02ce14
+    command: ["--alpha-config=/etc/oauth2-proxy/alpha.yml"]
+    environment:
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:?OIDC_ISSUER_URL is required}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?OIDC_CLIENT_ID is required}
+      OIDC_USER_ID_CLAIM: ${OIDC_USER_ID_CLAIM:-sub}
+      OIDC_EMAIL_CLAIM: ${OIDC_EMAIL_CLAIM:-email}
+      OIDC_SCOPES: ${OIDC_SCOPES:-openid profile email}
+      OAUTH2_PROXY_COOKIE_SECRET_FILE: /run/secrets/oidc_cookie_secret
+      OAUTH2_PROXY_REDIRECT_URL: https://${OIDC_PUBLIC_HOST}:${OIDC_HTTPS_PORT:-8443}/oauth2/callback
+      OAUTH2_PROXY_EMAIL_DOMAINS: ${OIDC_ALLOWED_EMAIL_DOMAINS:?OIDC_ALLOWED_EMAIL_DOMAINS is required}
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_TRUSTED_PROXY_IPS: 172.16.0.0/12
+      OAUTH2_PROXY_COOKIE_NAME: __Host-grantspace_oidc
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_COOKIE_HTTPONLY: "true"
+      OAUTH2_PROXY_COOKIE_SAMESITE: lax
+      OAUTH2_PROXY_COOKIE_PATH: /
+      OAUTH2_PROXY_COOKIE_EXPIRE: ${OIDC_SESSION_TTL:-12h}
+      OAUTH2_PROXY_COOKIE_REFRESH: ${OIDC_SESSION_REFRESH:-0}
+      OAUTH2_PROXY_SESSION_COOKIE_MINIMAL: "true"
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      OAUTH2_PROXY_SILENCE_PING_LOGGING: "true"
+    secrets:
+      - oidc_client_secret
+      - oidc_cookie_secret
+      - gateway_shared_secret
+    volumes:
+      - ./gateway/oauth2-proxy-alpha.yml:/etc/oauth2-proxy/alpha.yml:ro
+    expose: ["4180"]
+    read_only: true
+    init: true
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    pids_limit: 128
+    mem_limit: 192m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "/bin/oauth2-proxy", "--alpha-config=/etc/oauth2-proxy/alpha.yml", "--config-test"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  gateway:
+    image: nginxinc/nginx-unprivileged:1.29-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6
+    environment:
+      OIDC_PUBLIC_HOST: ${OIDC_PUBLIC_HOST}
+      OIDC_HTTPS_PORT: ${OIDC_HTTPS_PORT:-8443}
+      OIDC_ORGANIZATION_ID: ${OIDC_ORGANIZATION_ID:?OIDC_ORGANIZATION_ID is required}
+      NGINX_ENVSUBST_FILTER: ^OIDC_
+    depends_on:
+      oauth2-proxy:
+        condition: service_healthy
+      ui:
+        condition: service_started
+    volumes:
+      - ./gateway/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ${OIDC_TLS_CERT_FILE:?OIDC_TLS_CERT_FILE is required}:/run/tls/tls.crt:ro
+      - ${OIDC_TLS_KEY_FILE:?OIDC_TLS_KEY_FILE is required}:/run/tls/tls.key:ro
+    ports:
+      - "${OIDC_BIND_ADDRESS:-0.0.0.0}:${OIDC_HTTPS_PORT:-8443}:8443"
+    read_only: true
+    init: true
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp:size=32m,mode=1777", "/etc/nginx/conf.d:size=1m,mode=0777", "/var/cache/nginx:size=32m", "/var/run:size=8m"]
+    pids_limit: 128
+    mem_limit: 128m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "wget", "--no-check-certificate", "-qO-", "https://127.0.0.1:8443/gateway-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+secrets:
+  oidc_client_secret:
+    file: ${OIDC_CLIENT_SECRET_FILE:?OIDC_CLIENT_SECRET_FILE is required}
+  oidc_cookie_secret:
+    file: ${OIDC_COOKIE_SECRET_FILE:?OIDC_COOKIE_SECRET_FILE is required}
+  gateway_shared_secret:
+    file: ${OIDC_GATEWAY_SHARED_SECRET_FILE:?OIDC_GATEWAY_SHARED_SECRET_FILE is required}

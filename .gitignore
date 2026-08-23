@@ -1,5 +1,6 @@
 .env
 .runtime.env
+.secrets/
 core/target/
 core/Cargo.lock.tmp
 __pycache__/

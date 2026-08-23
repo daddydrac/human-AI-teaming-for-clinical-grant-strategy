@@ -60,6 +60,10 @@ pub fn verify_password(password:&str,encoded:&str)->bool{
 
 pub fn generate_secret()->String{let mut bytes=[0u8;32];OsRng.fill_bytes(&mut bytes);URL_SAFE_NO_PAD.encode(bytes)}
 pub fn sha256(value:&str)->String{hex::encode(Sha256::digest(value.as_bytes()))}
+pub fn constant_time_eq(left:&[u8],right:&[u8])->bool{
+    if left.len()!=right.len(){return false;}
+    left.iter().zip(right).fold(0u8,|difference,(a,b)|difference|(a^b))==0
+}
 
 #[derive(Clone)]
 pub struct EmailSettings {
@@ -100,6 +104,10 @@ impl EmailSettings {
     pub fn send_password_reset(&self,to:&str,raw_token:&str,expires_minutes:u64)->Result<()> {
         self.send(to,"Reset your Grantspace password",format!("A password reset was requested for your Grantspace account.\n\nOpen this single-use link within {expires_minutes} minutes:\n{}/password-reset?token={}\n\nIf you did not request this, you can ignore this message.",self.public_url,raw_token))
     }
+
+    pub fn send_project_invite(&self,to:&str,project_title:&str,role:&str,raw_token:&str,expires_days:u32)->Result<()> {
+        self.send(to,"You were invited to a Grantspace project",format!("You were invited to the Grantspace project \"{project_title}\" with the role {role}.\n\nSign in with the Grantspace account matching this email address, then accept the single-use invitation within {expires_days} day(s):\n{}/invite?token={}\n\nIf you do not yet have an account, contact the Grantspace administrator who invited you. Do not forward this link.",self.public_url,raw_token))
+    }
 }
 
 #[cfg(test)]
@@ -116,6 +124,13 @@ mod tests{
         assert!(policy.validate("Researcher!Pass123","researcher","person@example.org").is_err());
         assert!(policy.validate("short!A1","researcher","person@example.org").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn gateway_secrets_use_constant_time_content_comparison(){
+        assert!(constant_time_eq(b"0123456789abcdef",b"0123456789abcdef"));
+        assert!(!constant_time_eq(b"0123456789abcdef",b"0123456789abcdee"));
+        assert!(!constant_time_eq(b"short",b"longer"));
     }
 
     #[test]

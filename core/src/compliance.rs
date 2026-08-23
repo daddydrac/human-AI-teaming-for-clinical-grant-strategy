@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -6,7 +7,7 @@ use time::OffsetDateTime;
 
 pub const SOURCE_NOT_LOCATED: &str = "SOURCE NOT LOCATED";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ComplianceRuleDraft {
     pub rule_id: String,
@@ -36,7 +37,7 @@ pub struct ComplianceRuleDraft {
     pub notes: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ComplianceProfileDraft {
     #[serde(default)]
@@ -51,7 +52,7 @@ pub struct ComplianceProfileDraft {
     pub rules: Vec<ComplianceRuleDraft>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ComplianceDraftEnvelope {
     pub profile: ComplianceProfileDraft,

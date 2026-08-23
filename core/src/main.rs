@@ -9,6 +9,7 @@ use axum::{
 };
 use anyhow::Context;
 use parking_lot::Mutex as ParkingMutex;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -41,12 +42,13 @@ mod retrieval;
 mod source_locator;
 mod storage;
 mod vector_store;
+mod versioning;
 mod workflow;
 mod workflow_artifacts;
 
 use clinical::{ClinicalStudy, ScenarioSweepInput, StatisticsPlan};
 use competitive::CompetitiveEngine;
-use compliance::ComplianceProfileDraft;
+use compliance::{ComplianceDraftEnvelope, ComplianceProfileDraft};
 use domain::{
     EvidenceValidationEnvelope, InterviewEnvelope, RequirementsEnvelope, ResearchPlanEnvelope,
 };
@@ -81,6 +83,7 @@ struct AuthSettings {
     local_organization_id: String,
     internal_organization_name: String,
     bootstrap_token_sha256: Option<String>,
+    trusted_gateway_secret: Option<Vec<u8>>,
     session_ttl_seconds: u64,
     reset_ttl_seconds: u64,
     login_max_failures: u32,
@@ -109,6 +112,12 @@ impl AuthSettings {
             if value.chars().count()<24{anyhow::bail!("INITIAL_ADMIN_SETUP_TOKEN must contain at least 24 characters");}
             Some(auth::sha256(&value))
         }else{None};
+        let trusted_gateway_secret=if mode=="trusted_headers"{
+            let path=std::env::var("TRUSTED_GATEWAY_SECRET_FILE").context("TRUSTED_GATEWAY_SECRET_FILE is required in trusted_headers mode")?;
+            let value=std::fs::read(&path).with_context(||format!("cannot read trusted gateway secret file {path}"))?;
+            if value.len()!=64||!value.iter().all(u8::is_ascii_hexdigit){anyhow::bail!("trusted gateway secret must contain exactly 64 hexadecimal characters");}
+            Some(value)
+        }else{None};
         let parse_u64=|name:&str,default:&str|->anyhow::Result<u64>{Ok(std::env::var(name).unwrap_or_else(|_|default.into()).parse().with_context(||format!("{name} must be an integer"))?)};
         let settings=Self{
             mode,
@@ -118,6 +127,7 @@ impl AuthSettings {
             local_organization_id:std::env::var("LOCAL_ORGANIZATION_ID").unwrap_or_else(|_|"local-organization".into()),
             internal_organization_name:std::env::var("ORGANIZATION_NAME").unwrap_or_else(|_|"Organization".into()),
             bootstrap_token_sha256,
+            trusted_gateway_secret,
             session_ttl_seconds:parse_u64("AUTH_SESSION_TTL_SECONDS","43200")?,
             reset_ttl_seconds:parse_u64("PASSWORD_RESET_TTL_SECONDS","1800")?,
             login_max_failures:parse_u64("LOGIN_MAX_FAILURES","5")? as u32,
@@ -223,7 +233,7 @@ struct PasswordResetRequestInput { login:String }
 struct PasswordResetConfirmInput { token:String,new_password:String }
 #[derive(Deserialize)]
 struct CreateInternalUserInput { username:String,email:String,display_name:Option<String>,temporary_password:String }
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct PanelSynthesis {
     panel_summary: serde_json::Value,
     #[serde(default)]
@@ -234,6 +244,17 @@ struct RestoreSectionInput {
     version_id: i64,
     base_version_id: i64,
     actor: Option<String>,
+}
+#[derive(Deserialize)]
+struct SectionCompareQuery {
+    from_version: i64,
+    to_version: i64,
+}
+#[derive(Deserialize)]
+struct SectionMergePreviewInput {
+    base_version_id: i64,
+    latest_version_id: i64,
+    proposed_body: String,
 }
 #[derive(Deserialize)]
 struct GenerateRequest {
@@ -333,6 +354,8 @@ struct WorkflowArtifactGenerateInput {
     actor: String,
     high_value: Option<bool>,
 }
+#[derive(Deserialize)]
+struct PortableProjectInput { package: serde_json::Value }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -344,7 +367,7 @@ async fn main() -> anyhow::Result<()> {
         PathBuf::from(std::env::var("GRANT_WORKSPACE").unwrap_or_else(|_| "/workspace".into()));
     std::fs::create_dir_all(&workspace)?;
     let store = Arc::new(Store::open(workspace.join("grant.db"))?);
-    let router = Arc::new(ModelRouter::from_env());
+    let router = Arc::new(ModelRouter::from_env()?);
     let research = Arc::new(ResearchClient::from_env()?);
     let embedding = Arc::new(EmbeddingClient::from_env()?);
     let retrieval = Arc::new(RetrievalService::new(
@@ -387,9 +410,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/admin/users/{user_id}/enable",post(admin_enable_user))
         .route("/api/admin/users/{user_id}/password-reset",post(admin_send_password_reset))
         .route("/api/projects", get(list_projects).post(create_project))
+        .route("/api/project-imports/validate",post(validate_project_import))
+        .route("/api/project-imports",post(import_project))
         .route("/api/me",get(get_authenticated_user))
         .route("/api/workflow-definitions", get(get_workflow_definitions))
         .route("/api/projects/{id}", get(get_project))
+        .route("/api/projects/{id}/portable-export",get(export_portable_project))
         .route(
             "/api/projects/{id}/workflow",
             get(get_project_workflow).patch(update_project_workflow),
@@ -401,6 +427,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/projects/{id}/workflow/status",
             get(get_project_workflow_status),
+        )
+        .route(
+            "/api/projects/{id}/workflow/editor-context",
+            get(get_workflow_editor_context),
+        )
+        .route(
+            "/api/projects/{id}/generation-runs/{run}",
+            get(get_generation_run),
         )
         .route(
             "/api/projects/{id}/review-panel/roles",
@@ -421,6 +455,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/projects/{id}/review-simulations/{run}",
             get(get_review_simulation),
+        )
+        .route(
+            "/api/projects/{id}/review-simulations/{run}/approve",
+            post(approve_review_simulation),
         )
         .route(
             "/api/projects/{id}/review-simulations/{run}/tasks",
@@ -555,6 +593,14 @@ async fn main() -> anyhow::Result<()> {
             get(get_section_versions),
         )
         .route(
+            "/api/projects/{id}/sections/{section}/compare",
+            get(compare_section_versions),
+        )
+        .route(
+            "/api/projects/{id}/sections/{section}/merge-preview",
+            post(preview_section_merge),
+        )
+        .route(
             "/api/projects/{id}/sections/{section}/restore",
             post(restore_section),
         )
@@ -570,6 +616,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/projects/{id}/collaboration/join",
             post(join_collaboration),
         )
+        .route("/api/projects/{id}/collaboration/workspace",get(get_collaboration_workspace))
         .route("/api/projects/{id}/invites",get(list_invites).post(create_invite))
         .route("/api/projects/{id}/invites/{invite}/revoke",post(revoke_invite))
         .route("/api/invites/accept",post(accept_invite))
@@ -605,6 +652,28 @@ fn request_header(req:&Request,name:&str)->Option<String>{
     req.headers().get(name).and_then(|value|value.to_str().ok()).map(str::trim).filter(|value|!value.is_empty()).map(str::to_owned)
 }
 
+fn canonical_request_sha256(content_type:&str,body:&[u8])->Result<String,ApiError>{
+    let canonical=if content_type.split(';').next().is_some_and(|value|value.trim().eq_ignore_ascii_case("application/json"))&&!body.is_empty(){
+        let value:serde_json::Value=serde_json::from_slice(body).map_err(|error|ApiError::bad_request(format!("invalid JSON request body: {error}")))?;
+        serde_json::to_vec(&value).map_err(|error|ApiError::bad_request(format!("request body cannot be canonicalized: {error}")))?
+    }else{body.to_vec()};
+    Ok(format!("{:x}",Sha256::digest(canonical)))
+}
+
+#[cfg(test)]
+mod request_contract_tests {
+    use super::canonical_request_sha256;
+
+    #[test]
+    fn json_idempotency_hash_is_canonical_but_content_sensitive() {
+        let first=canonical_request_sha256("application/json",br#"{"b":2,"a":1}"#).unwrap();
+        let equivalent=canonical_request_sha256("application/json; charset=utf-8",br#"{ "a": 1, "b": 2 }"#).unwrap();
+        let different=canonical_request_sha256("application/json",br#"{"a":1,"b":3}"#).unwrap();
+        assert_eq!(first,equivalent);
+        assert_ne!(first,different);
+    }
+}
+
 async fn authenticate_request(State(s):State<AppState>,mut req:Request,next:Next)->Response{
     let path=req.uri().path().to_owned();
     if path.starts_with("/health") {return next.run(req).await;}
@@ -613,6 +682,9 @@ async fn authenticate_request(State(s):State<AppState>,mut req:Request,next:Next
     let user=if s.auth.mode=="local_single_user"{
         AuthUser{id:s.auth.local_user_id.clone(),email:s.auth.local_email.clone(),display_name:s.auth.local_display_name.clone(),organization_id:s.auth.local_organization_id.clone(),username:None,system_role:"system_admin".into(),must_change_password:false}
     }else if s.auth.mode=="trusted_headers"{
+        let supplied=request_header(&req,"x-grantspace-gateway-secret").unwrap_or_default();
+        let expected=s.auth.trusted_gateway_secret.as_deref().unwrap_or_default();
+        if !auth::constant_time_eq(supplied.as_bytes(),expected){return ApiError::new(StatusCode::UNAUTHORIZED,"trusted gateway proof is missing or invalid").into_response();}
         let Some(id)=request_header(&req,"x-grantspace-user-id") else{return ApiError::new(StatusCode::UNAUTHORIZED,"trusted identity header is missing").into_response();};
         let Some(organization_id)=request_header(&req,"x-grantspace-organization-id") else{return ApiError::new(StatusCode::UNAUTHORIZED,"trusted organization header is missing").into_response();};
         AuthUser{id,email:request_header(&req,"x-grantspace-user-email"),display_name:request_header(&req,"x-grantspace-user-name").unwrap_or_else(||"Authenticated user".into()),organization_id,username:None,system_role:"user".into(),must_change_password:false}
@@ -646,8 +718,19 @@ async fn authenticate_request(State(s):State<AppState>,mut req:Request,next:Next
         return ApiError::bad_request("Idempotency-Key is required on mutating requests").into_response();
     };
     let method=req.method().as_str().to_owned();
-    let path=req.uri().path().to_owned();
-    match s.store.claim_idempotency(&user.id,&key,&method,&path){
+    let path=req.uri().path_and_query().map(|value|value.as_str()).unwrap_or(req.uri().path()).to_owned();
+    let request_content_type=request_header(&req,"content-type").unwrap_or_default();
+    let (parts,request_body)=req.into_parts();
+    let request_bytes=match to_bytes(request_body,128*1024*1024).await{
+        Ok(bytes)=>bytes,
+        Err(error)=>return ApiError::bad_request(format!("request body exceeds the supported limit or is unreadable: {error}")).into_response(),
+    };
+    let request_sha256=match canonical_request_sha256(&request_content_type,&request_bytes){
+        Ok(value)=>value,
+        Err(error)=>return error.into_response(),
+    };
+    req=Request::from_parts(parts,Body::from(request_bytes));
+    match s.store.claim_idempotency(&user.id,&key,&method,&path,&request_sha256){
         Ok(IdempotencyClaim::New)=>{}
         Ok(IdempotencyClaim::InProgress)=>return ApiError::conflict("an identical request is still in progress").into_response(),
         Ok(IdempotencyClaim::Conflict)=>return ApiError::conflict("Idempotency-Key was already used for a different operation").into_response(),
@@ -860,6 +943,27 @@ async fn get_workflow_definitions(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(s.store.workflow_registry_json()?))
 }
+async fn export_portable_project(
+    State(s):State<AppState>,
+    Path(id):Path<String>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    Ok(Json(s.store.portable_project_package(&id)?))
+}
+
+async fn validate_project_import(
+    State(s):State<AppState>,
+    Json(req):Json<PortableProjectInput>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    Ok(Json(s.store.validate_portable_project_package(&req.package).map_err(|error|ApiError::bad_request(error.to_string()))?))
+}
+
+async fn import_project(
+    State(s):State<AppState>,
+    Extension(user):Extension<AuthUser>,
+    Json(req):Json<PortableProjectInput>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    Ok(Json(s.store.import_portable_project_package(&req.package,&user.id).map_err(|error|ApiError::bad_request(error.to_string()))?))
+}
 async fn get_project_workflow(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -1029,6 +1133,7 @@ async fn run_review_simulation(
         let solicitation: workflow_artifacts::SolicitationProfile = serde_json::from_value(solicitation_value.clone())?;
         let sections = snapshot.get("sections").cloned().unwrap_or_else(|| serde_json::json!([]));
         let rubric = serde_json::to_value(&solicitation.review_criteria)?;
+        let (proposal_anchors, evidence_anchors) = review_anchor_sets(snapshot);
         let mut reviews = Vec::with_capacity(plan.roles.len());
 
         for reviewer_role in &plan.roles {
@@ -1062,9 +1167,17 @@ ALLOWED PROPOSAL SECTIONS AND ANCHORS:
             let output = s.router.generate_for_project(
                 s.store.as_ref(),
                 &id,
-                ModelTask { kind: "review_simulation".into(), prompt, high_value: true },
+                ModelTask::structured::<workflow_artifacts::SimulatedReviewerResult>(
+                    "review_simulation",prompt,true,"simulated_reviewer_result",1,
+                )?,
             ).await?;
             let review: workflow_artifacts::SimulatedReviewerResult = parse_json_from_model(&output.text)?;
+            workflow_artifacts::validate_grounded_individual_review(
+                &review,
+                reviewer_role,
+                &solicitation,
+                &proposal_anchors,
+            )?;
             reviews.push(review);
         }
 
@@ -1088,10 +1201,11 @@ VALIDATED INDEPENDENT REVIEWS:
         let consensus_output = s.router.generate_for_project(
             s.store.as_ref(),
             &id,
-            ModelTask { kind: "review_simulation".into(), prompt: consensus_prompt, high_value: true },
+            ModelTask::structured::<PanelSynthesis>(
+                "review_simulation",consensus_prompt,true,"panel_synthesis",1,
+            )?,
         ).await?;
         let consensus: PanelSynthesis = parse_json_from_model(&consensus_output.text)?;
-        let (proposal_anchors, evidence_anchors) = review_anchor_sets(snapshot);
         validate_revision_tasks(&consensus.revision_tasks, &proposal_anchors)?;
 
         let causal_analysis = if plan.mode == "consensus_causal" {
@@ -1115,7 +1229,9 @@ APPROVED SNAPSHOT:
             let output = s.router.generate_for_project(
                 s.store.as_ref(),
                 &id,
-                ModelTask { kind: "causal_analysis".into(), prompt, high_value: true },
+                ModelTask::structured::<workflow_artifacts::CausalAnalysisResult>(
+                    "causal_analysis",prompt,true,"causal_analysis",1,
+                )?,
             ).await?;
             Some(parse_json_from_model::<workflow_artifacts::CausalAnalysisResult>(&output.text)?)
         } else {
@@ -1160,6 +1276,21 @@ async fn get_review_simulation(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_module_enabled(&s.store, &id, "review_simulator")?;
     Ok(Json(s.store.review_run_json(&id, &run)?))
+}
+
+async fn approve_review_simulation(
+    State(s): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Extension(role): Extension<String>,
+    Path((id, run)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_module_enabled(&s.store, &id, "review_simulator")?;
+    require_roles(&role, &["owner", "pi", "approver", "research_administrator"])?;
+    Ok(Json(
+        s.store
+            .approve_review_run(&id, &run, &user.id)
+            .map_err(ApiError::conflict_err)?,
+    ))
 }
 
 async fn create_review_revision_tasks(
@@ -1259,6 +1390,18 @@ async fn get_workflow_artifact(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(s.store.workflow_artifact_json(&id, &artifact_type)?))
 }
+async fn get_workflow_editor_context(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(s.store.workflow_editor_context_json(&id)?))
+}
+async fn get_generation_run(
+    State(s):State<AppState>,
+    Path((id,run)):Path<(String,String)>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    Ok(Json(s.store.generation_run_json(&id,&run)?))
+}
 async fn save_workflow_artifact(
     State(s): State<AppState>,
     Extension(user):Extension<AuthUser>,
@@ -1355,16 +1498,17 @@ Capture the investigator's actual claims and unresolved uncertainty. Do not inve
         serde_json::to_string_pretty(&sections)?,
         interview
     );
+    let model_task=match artifact_type.as_str(){
+        "research_framework"=>ModelTask::structured::<workflow_artifacts::ResearchFramework>(task_kind,prompt,req.high_value.unwrap_or(true),"research_framework",1)?,
+        "aim_set"=>ModelTask::structured::<workflow_artifacts::AimSet>(task_kind,prompt,req.high_value.unwrap_or(true),"aim_set",1)?,
+        _=>unreachable!(),
+    };
     let generated = s
         .router
         .generate_for_project(
             s.store.as_ref(),
             &id,
-            ModelTask {
-                kind: task_kind.into(),
-                prompt,
-                high_value: req.high_value.unwrap_or(true),
-            },
+            model_task,
         )
         .await?;
     let mut body: serde_json::Value = parse_json_from_model(&generated.text)?;
@@ -1793,11 +1937,7 @@ CURRENT AUTHORITATIVE CONTEXT:
             .generate_for_project(
                 s.store.as_ref(),
                 id,
-                ModelTask {
-                    kind: "competitive_section_refresh".into(),
-                    prompt,
-                    high_value: cfg.section_refresh_high_value,
-                },
+                ModelTask::text("competitive_section_refresh",prompt,cfg.section_refresh_high_value),
             )
             .await
         {
@@ -1807,7 +1947,7 @@ CURRENT AUTHORITATIVE CONTEXT:
                 continue;
             }
         };
-        let revised = generated.text.trim();
+        let revised = generated.text.as_str();
         // The investigator may edit while the competitive refresh model is running.
         // Never publish a proposal against a superseded base version; leave the event
         // retryable so the next access self-heals against the newest human/model text.
@@ -1835,7 +1975,7 @@ CURRENT AUTHORITATIVE CONTEXT:
             }
             continue;
         }
-        let version = match s.store.save_section(
+        let version = match s.store.save_generated_section(
             id,
             key,
             title,
@@ -1845,6 +1985,9 @@ CURRENT AUTHORITATIVE CONTEXT:
                 "agentic_competitive_update:run:{}:{}",
                 delta.to_run_id, generated.model
             ),
+            &generated.generation_run_id,
+            Some(base_version),
+            None,
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -2132,11 +2275,9 @@ FUNDING OPPORTUNITY SOURCE DOCUMENTS:
         .generate_for_project(
             s.store.as_ref(),
             &id,
-            ModelTask {
-                kind: "sponsor_compliance_compilation".into(),
-                prompt,
-                high_value: false,
-            },
+            ModelTask::structured::<ComplianceDraftEnvelope>(
+                "sponsor_compliance_compilation",prompt,false,"compliance_profile_draft",1,
+            )?,
         )
         .await?;
     let profile = source_locator::compile_model_output(&out.text, &documents)
@@ -2290,11 +2431,9 @@ SOURCE MATERIAL:
         .generate_for_project(
             s.store.as_ref(),
             &id,
-            ModelTask {
-                kind: "requirement_decomposition".into(),
-                prompt,
-                high_value: false,
-            },
+            ModelTask::structured::<RequirementsEnvelope>(
+                "requirement_decomposition",prompt,false,"requirements_envelope",1,
+            )?,
         )
         .await?;
     let parsed: RequirementsEnvelope = parse_json_from_model(&out.text)?;
@@ -2456,11 +2595,9 @@ PRIOR ANSWERS:
         .generate_for_project(
             s.store.as_ref(),
             &id,
-            ModelTask {
-                kind: "investigator_interview".into(),
-                prompt,
-                high_value: false,
-            },
+            ModelTask::structured::<InterviewEnvelope>(
+                "investigator_interview",prompt,false,"interview_envelope",1,
+            )?,
         )
         .await?;
     let parsed: InterviewEnvelope = parse_json_from_model(&out.text)?;
@@ -2668,11 +2805,9 @@ CLINICAL STUDY DESIGN / FEASIBILITY CONTEXT:
         .generate_for_project(
             s.store.as_ref(),
             &id,
-            ModelTask {
-                kind: "research_planning".into(),
-                prompt,
-                high_value: false,
-            },
+            ModelTask::structured::<ResearchPlanEnvelope>(
+                "research_planning",prompt,false,"research_plan_envelope",1,
+            )?,
         )
         .await?;
     let mut plan: ResearchPlanEnvelope = parse_json_from_model(&out.text)?;
@@ -2791,11 +2926,9 @@ RESEARCH QUERY: {}
                     .generate_for_project(
                         s.store.as_ref(),
                         &id,
-                        ModelTask {
-                            kind: "evidence_validation".into(),
-                            prompt: validation_prompt,
-                            high_value: false,
-                        },
+                        ModelTask::structured::<EvidenceValidationEnvelope>(
+                            "evidence_validation",validation_prompt,false,"evidence_validation_envelope",1,
+                        )?,
                     )
                     .await?;
                     let validations: EvidenceValidationEnvelope =
@@ -2881,12 +3014,17 @@ async fn get_evidence(
 
 async fn draft_section(
     State(s): State<AppState>,
+    Extension(user):Extension<AuthUser>,
+    Extension(role):Extension<String>,
     Path(id): Path<String>,
     Json(req): Json<DraftSectionInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_roles(&role,&["owner","pi","contributor","research_administrator"])?;
     require_core_step_complete(&s.store,&id,"literature")?;
     require_optional_domain_gates(&s.store,&id)?;
     if s.store.workflow_module_required(&id,"competitive_intelligence")?{let _=ensure_competitive_fresh(&s,&id,false).await?;}
+    let section_state=s.store.section_state_json(&id,&req.section_key).map_err(|_|ApiError::bad_request("draft target is not present in the approved research framework"))?;
+    let base_version=section_state.pointer("/latest/version").and_then(serde_json::Value::as_i64);
     let config=s.store.workflow_config(&id)?;
     let extra = req.additional_context.unwrap_or_default();
     let retrieval_query = format!(
@@ -2916,23 +3054,25 @@ ADDITIONAL HUMAN CONTEXT:
         .generate_for_project(
             s.store.as_ref(),
             &id,
-            ModelTask {
-                kind: "section_draft".into(),
-                prompt,
-                high_value: req.high_value.unwrap_or(false),
-            },
+            ModelTask::text("section_draft",prompt,req.high_value.unwrap_or(false)),
         )
         .await?;
-    let version = s.store.save_section(
+    let version = s.store.save_generated_section(
         &id,
         &req.section_key,
         &req.title,
         &out.text,
         None,
-        &format!("model:{}", out.model),
-    )?;
+        &format!("model:{}:{}",out.provider,out.model),
+        &out.generation_run_id,
+        base_version,
+        Some(&user.id),
+    ).map_err(|error|{
+        let current=s.store.section_state_json(&id,&req.section_key).ok().and_then(|value|value.pointer("/latest/version").and_then(serde_json::Value::as_i64));
+        ApiError::conflict_details(error.to_string(),serde_json::json!({"code":"stale_generated_section","base_version_id":base_version,"current_version_id":current,"generation_run_id":out.generation_run_id}))
+    })?;
     Ok(Json(
-        serde_json::json!({"model":out.model,"text":out.text,"version":version,"approved":false,"retrieval":compiled.retrieved}),
+        serde_json::json!({"provider":out.provider,"model":out.model,"generation_run_id":out.generation_run_id,"text":out.text,"version":version,"approved":false,"retrieval":compiled.retrieved}),
     ))
 }
 
@@ -2948,6 +3088,18 @@ async fn get_section_versions(
     Path((id, section)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(s.store.section_versions_json(&id, &section)?))
+}
+async fn compare_section_versions(
+    State(s):State<AppState>,Path((id,section)):Path<(String,String)>,Query(query):Query<SectionCompareQuery>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    Ok(Json(s.store.section_compare_json(&id,&section,query.from_version,query.to_version).map_err(|error|ApiError::bad_request(error.to_string()))?))
+}
+async fn preview_section_merge(
+    State(s):State<AppState>,Extension(role):Extension<String>,Path((id,section)):Path<(String,String)>,Json(req):Json<SectionMergePreviewInput>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    require_roles(&role,&["owner","pi","contributor","research_administrator"])?;
+    if req.proposed_body.trim().is_empty(){return Err(ApiError::bad_request("proposed section body cannot be empty"));}
+    Ok(Json(s.store.section_merge_preview_json(&id,&section,req.base_version_id,req.latest_version_id,&req.proposed_body).map_err(|error|ApiError::conflict(error.to_string()))?))
 }
 async fn restore_section(
     State(s): State<AppState>,
@@ -2967,7 +3119,10 @@ async fn restore_section(
             req.base_version_id,
             Some(&user.id),
         )
-        .map_err(|e| ApiError::conflict_err(e))?;
+        .map_err(|error|{
+            let current=s.store.section_state_json(&id,&section).ok().and_then(|value|value.pointer("/latest/version").and_then(serde_json::Value::as_i64));
+            ApiError::conflict_details(error.to_string(),serde_json::json!({"code":"stale_section_version","base_version_id":req.base_version_id,"current_version_id":current}))
+        })?;
     Ok(Json(
         serde_json::json!({"ok":true,"version":version,"restored_from":req.version_id,"approved":false}),
     ))
@@ -2998,9 +3153,11 @@ async fn join_collaboration(
 async fn post_collaboration_message(
     State(s): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(role): Extension<String>,
     Path(id): Path<String>,
     Json(req): Json<CollaborationMessageInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
     require_module_enabled(&s.store,&id,"team_collaboration")?;
     let _ = s.store.project_json(&id)?;
     s.store
@@ -3008,21 +3165,50 @@ async fn post_collaboration_message(
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     Ok(Json(s.store.collaboration_json(&id)?))
 }
+async fn get_collaboration_workspace(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path(id):Path<String>)->Result<Json<serde_json::Value>,ApiError>{
+    require_module_enabled(&s.store,&id,"team_collaboration")?;
+    let collaboration=s.store.collaboration_json(&id)?;
+    let can_manage_members=matches!(role.as_str(),"owner"|"pi"|"research_administrator");
+    let can_post=role!="viewer";
+    let can_create_tasks=matches!(role.as_str(),"owner"|"pi"|"contributor"|"research_administrator");
+    let invites=if can_manage_members{s.store.project_invites_json(&id)?}else{serde_json::json!([])};
+    Ok(Json(serde_json::json!({
+        "members":collaboration.get("members").cloned().unwrap_or_else(||serde_json::json!([])),
+        "activity":collaboration.get("activity").cloned().unwrap_or_else(||serde_json::json!([])),
+        "tasks":s.store.tasks_json(&id)?,
+        "notifications":s.store.notifications_json(&user.id,Some(&id))?,
+        "invites":invites,
+        "approval_routing":s.store.approval_routing_status_json(&id)?,
+        "permissions":{"role":role,"can_manage_members":can_manage_members,"can_post":can_post,"can_create_tasks":can_create_tasks}
+    })))
+}
 async fn create_invite(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path(id):Path<String>,Json(req):Json<InviteInput>)->Result<Json<serde_json::Value>,ApiError>{
     require_roles(&role,&["owner","pi","research_administrator"])?;require_module_enabled(&s.store,&id,"team_collaboration")?;
-    Ok(Json(s.store.create_project_invite(&id,&req.email,&req.role,&user.id,req.expires_in_days.unwrap_or(7)).map_err(|e|ApiError::bad_request(e.to_string()))?))
+    let days=req.expires_in_days.unwrap_or(7).clamp(1,30);
+    let mut invite=s.store.create_project_invite(&id,&req.email,&req.role,&user.id,days).map_err(|e|ApiError::bad_request(e.to_string()))?;
+    let token=invite.get("token").and_then(serde_json::Value::as_str).context("created invite token is missing")?.to_owned();
+    let project_title=s.store.project_json(&id)?.get("title").and_then(serde_json::Value::as_str).unwrap_or("Grantspace project").to_owned();
+    if let Some(email)=s.email.clone(){
+        let address=req.email.clone();let invite_role=req.role.clone();
+        match tokio::task::spawn_blocking(move||email.send_project_invite(&address,&project_title,&invite_role,&token,days)).await{
+            Ok(Ok(()))=>invite["email_sent"]=serde_json::Value::Bool(true),
+            Ok(Err(error))=>{warn!(error=%error,"project invitation email delivery failed");invite["email_sent"]=serde_json::Value::Bool(false);invite["delivery_error"]=serde_json::Value::String(error.to_string());},
+            Err(error)=>{warn!(error=%error,"project invitation email task failed");invite["email_sent"]=serde_json::Value::Bool(false);invite["delivery_error"]=serde_json::Value::String(error.to_string());}
+        }
+    }else{invite["email_sent"]=serde_json::Value::Bool(false);invite["delivery_error"]=serde_json::Value::String("SMTP delivery is not configured; deliver the one-time link through an approved secure channel".into());}
+    Ok(Json(invite))
 }
 async fn list_invites(State(s):State<AppState>,Extension(role):Extension<String>,Path(id):Path<String>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","research_administrator"])?;Ok(Json(s.store.project_invites_json(&id)?))}
 async fn revoke_invite(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,invite)):Path<(String,String)>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","research_administrator"])?;s.store.revoke_project_invite(&id,&invite,&user.id).map_err(|e|ApiError::bad_request(e.to_string()))?;Ok(Json(serde_json::json!({"revoked":true,"invite_id":invite})))}
 async fn accept_invite(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Json(req):Json<AcceptInviteInput>)->Result<Json<serde_json::Value>,ApiError>{Ok(Json(s.store.accept_project_invite(&req.token,&user.id,user.email.as_deref()).map_err(|e|ApiError::bad_request(e.to_string()))?))}
 async fn get_channel_messages(State(s):State<AppState>,Path((id,kind)):Path<(String,String)>,Query(query):Query<ChannelQuery>)->Result<Json<serde_json::Value>,ApiError>{require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.channel_messages_json(&id,&kind,query.subject_key.as_deref())?))}
-async fn post_channel_message(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Path((id,kind)):Path<(String,String)>,Query(query):Query<ChannelQuery>,Json(req):Json<CollaborationMessageInput>)->Result<Json<serde_json::Value>,ApiError>{require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.post_channel_message(&id,&kind,query.subject_key.as_deref(),&user.id,&req.body,req.parent_message_id,&req.mentioned_user_ids).map_err(|e|ApiError::bad_request(e.to_string()))?))}
+async fn post_channel_message(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,kind)):Path<(String,String)>,Query(query):Query<ChannelQuery>,Json(req):Json<CollaborationMessageInput>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.post_channel_message(&id,&kind,query.subject_key.as_deref(),&user.id,&req.body,req.parent_message_id,&req.mentioned_user_ids).map_err(|e|ApiError::bad_request(e.to_string()))?))}
 async fn get_comments(State(s):State<AppState>,Path((id,artifact_type,artifact_key)):Path<(String,String,String)>,Query(query):Query<CommentQuery>)->Result<Json<serde_json::Value>,ApiError>{require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.comments_json(&id,&artifact_type,&artifact_key,query.version_id)?))}
-async fn post_comment(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Path((id,artifact_type,artifact_key)):Path<(String,String,String)>,Json(req):Json<CommentInput>)->Result<Json<serde_json::Value>,ApiError>{require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.add_comment(&id,&artifact_type,&artifact_key,req.version_id,req.start_offset,req.end_offset,req.quoted_text.as_deref(),&user.id,&req.body,req.parent_comment_id,&req.mentioned_user_ids).map_err(|e|ApiError::bad_request(e.to_string()))?))}
-async fn resolve_comment(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Path((id,comment_id)):Path<(String,i64)>)->Result<Json<serde_json::Value>,ApiError>{require_module_enabled(&s.store,&id,"team_collaboration")?;s.store.resolve_comment(&id,comment_id,&user.id).map_err(|e|ApiError::bad_request(e.to_string()))?;Ok(Json(serde_json::json!({"resolved":true,"comment_id":comment_id})))}
+async fn post_comment(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,artifact_type,artifact_key)):Path<(String,String,String)>,Json(req):Json<CommentInput>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.add_comment(&id,&artifact_type,&artifact_key,req.version_id,req.start_offset,req.end_offset,req.quoted_text.as_deref(),&user.id,&req.body,req.parent_comment_id,&req.mentioned_user_ids).map_err(|e|ApiError::bad_request(e.to_string()))?))}
+async fn resolve_comment(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,comment_id)):Path<(String,i64)>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;require_module_enabled(&s.store,&id,"team_collaboration")?;s.store.resolve_comment(&id,comment_id,&user.id).map_err(|e|ApiError::bad_request(e.to_string()))?;Ok(Json(serde_json::json!({"resolved":true,"comment_id":comment_id})))}
 async fn get_tasks(State(s):State<AppState>,Path(id):Path<String>)->Result<Json<serde_json::Value>,ApiError>{require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.tasks_json(&id)?))}
-async fn create_task(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Path(id):Path<String>,Json(req):Json<TaskInput>)->Result<Json<serde_json::Value>,ApiError>{require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.create_task(&id,&req.title,&req.description,&req.owner_user_id,&req.source,&req.priority,req.due_at.as_deref(),&user.id,&req.dependencies).map_err(|e|ApiError::bad_request(e.to_string()))?))}
-async fn update_task_status(State(s):State<AppState>,Path((id,task_id)):Path<(String,String)>,Json(req):Json<TaskStatusInput>)->Result<Json<serde_json::Value>,ApiError>{require_module_enabled(&s.store,&id,"team_collaboration")?;s.store.update_task_status(&id,&task_id,&req.status).map_err(|e|ApiError::bad_request(e.to_string()))?;Ok(Json(serde_json::json!({"task_id":task_id,"status":req.status})))}
+async fn create_task(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path(id):Path<String>,Json(req):Json<TaskInput>)->Result<Json<serde_json::Value>,ApiError>{require_roles(&role,&["owner","pi","contributor","research_administrator"])?;require_module_enabled(&s.store,&id,"team_collaboration")?;Ok(Json(s.store.create_task(&id,&req.title,&req.description,&req.owner_user_id,&req.source,&req.priority,req.due_at.as_deref(),&user.id,&req.dependencies).map_err(|e|ApiError::bad_request(e.to_string()))?))}
+async fn update_task_status(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,task_id)):Path<(String,String)>,Json(req):Json<TaskStatusInput>)->Result<Json<serde_json::Value>,ApiError>{require_module_enabled(&s.store,&id,"team_collaboration")?;s.store.update_task_status(&id,&task_id,&req.status,&user.id,&role).map_err(|e|ApiError::bad_request(e.to_string()))?;Ok(Json(serde_json::json!({"task_id":task_id,"status":req.status})))}
 async fn get_notifications(State(s):State<AppState>,Extension(user):Extension<AuthUser>)->Result<Json<serde_json::Value>,ApiError>{Ok(Json(s.store.notifications_json(&user.id,None)?))}
 async fn read_notification(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Path(notification_id):Path<i64>)->Result<Json<serde_json::Value>,ApiError>{s.store.mark_notification_read(&user.id,notification_id).map_err(|e|ApiError::bad_request(e.to_string()))?;Ok(Json(serde_json::json!({"read":true,"notification_id":notification_id})))}
 async fn save_section(
@@ -3039,25 +3225,13 @@ async fn save_section(
     if req.body.trim().is_empty() {
         return Err(ApiError::bad_request("section body cannot be empty"));
     }
-    let current = s.store.section_state_json(&id, &section)?;
-    let latest_version = current
-        .get("latest")
-        .and_then(|x| x.get("version"))
-        .and_then(serde_json::Value::as_i64);
-    if let Some(latest) = latest_version {
-        if req.base_version_id != Some(latest) {
-            return Err(ApiError::conflict(format!("section changed since editing began: expected base version {latest}; reload the section before saving")));
-        }
+    if versioning::contains_conflict_markers(&req.body){
+        return Err(ApiError::bad_request("resolve every three-way merge conflict marker before saving the section"));
     }
-    let version = s.store.save_section_by(
-        &id,
-        &section,
-        &req.title,
-        &req.body,
-        req.html.as_deref(),
-        "human_edit",
-        Some(&user.id),
-    )?;
+    let version = s.store.save_section_edit(&id,&section,&req.title,&req.body,req.html.as_deref(),req.base_version_id,&user.id).map_err(|error|{
+        let current=s.store.section_state_json(&id,&section).ok().and_then(|value|value.pointer("/latest/version").and_then(serde_json::Value::as_i64));
+        ApiError::conflict_details(error.to_string(),serde_json::json!({"code":"stale_section_version","base_version_id":req.base_version_id,"current_version_id":current}))
+    })?;
     Ok(Json(
         serde_json::json!({"ok":true,"version":version,"approved":false}),
     ))
@@ -3072,6 +3246,15 @@ async fn approve_section(
     require_roles(&role,&["owner","pi","approver","research_administrator"])?;
     require_core_step_complete(&s.store,&id,"literature")?;
     require_optional_domain_gates(&s.store,&id)?;
+    let current=s.store.section_state_json(&id,&section)?;
+    let latest=current.pointer("/latest/version").and_then(serde_json::Value::as_i64);
+    if latest!=Some(req.version_id){
+        return Err(ApiError::conflict_details("the selected version is no longer the latest section version; compare or reconcile it before approval",serde_json::json!({"code":"stale_section_approval","requested_version_id":req.version_id,"current_version_id":latest})));
+    }
+    let candidate=s.store.section_version_json(&id,&section,req.version_id)?;
+    if candidate.get("body").and_then(serde_json::Value::as_str).is_some_and(versioning::contains_conflict_markers){
+        return Err(ApiError::bad_request("a section containing unresolved merge conflict markers cannot be approved"));
+    }
     let competitive_enabled=s.store.workflow_module_enabled(&id,"competitive_intelligence")?;
     if s.store.workflow_module_required(&id,"competitive_intelligence")?{let _=ensure_competitive_fresh(&s,&id,false).await?;}
     let pending=if competitive_enabled{s.store.pending_competitive_update_for_section_json(&id,&section)?}else{serde_json::json!({})};
@@ -3215,11 +3398,7 @@ async fn generate(
         .generate_for_project(
             s.store.as_ref(),
             &id,
-            ModelTask {
-                kind: req.task,
-                prompt: req.prompt,
-                high_value: req.high_value.unwrap_or(false),
-            },
+            ModelTask::text(req.task,req.prompt,req.high_value.unwrap_or(false)),
         )
         .await?;
     Ok(Json(serde_json::json!({"provider":out.provider,"model":out.model,"routing_mode":out.routing_mode,"generation_run_id":out.generation_run_id,"text":out.text})))
@@ -3277,12 +3456,14 @@ async fn system_info(State(s): State<AppState>) -> Result<Json<serde_json::Value
 struct ApiError {
     status: StatusCode,
     message: String,
+    details: Option<serde_json::Value>,
 }
 impl ApiError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
+            details: None,
         }
     }
     fn bad_request(m: impl Into<String>) -> Self {
@@ -3290,6 +3471,9 @@ impl ApiError {
     }
     fn conflict(m: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, m)
+    }
+    fn conflict_details(m:impl Into<String>,details:serde_json::Value)->Self{
+        Self{status:StatusCode::CONFLICT,message:m.into(),details:Some(details)}
     }
     fn not_found(m: impl Into<String>) -> Self { Self::new(StatusCode::NOT_FOUND,m) }
     fn unavailable(m: impl Into<String>) -> Self {
@@ -3314,9 +3498,11 @@ impl From<serde_json::Error> for ApiError {
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
+        let mut body=serde_json::json!({"error":self.message,"status":self.status.as_u16()});
+        if let Some(details)=self.details{body["details"]=details;}
         (
             self.status,
-            Json(serde_json::json!({"error":self.message,"status":self.status.as_u16()})),
+            Json(body),
         )
             .into_response()
     }

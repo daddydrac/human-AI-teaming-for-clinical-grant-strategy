@@ -10,7 +10,7 @@ Clinical Grant Workbench is a local, human-in-the-loop application for developin
 - **4 · Clinical Study Design:** Define the study, aims, arms, endpoints, timeline, resources, recruitment assumptions, and statistical parameters; run feasibility and sample-size checks.
 - **5 · Competitive Applicant Intelligence:** Build a likely strong-applicant profile, inspect capability-matched organizations and public evidence, and generate differentiating strategy.
 - **6 · Sponsor Compliance & Submission:** Compile deterministic sponsor rules, correct and approve the compliance profile, register required attachments, resolve human-confirmation items, and run rendered preflight checks.
-- **7 · Write, Edit & Approve:** Compile context and draft each section, optionally escalate a section to Claude, edit the result, and explicitly approve the exact version intended for submission.
+- **7 · Write, Edit & Approve:** Compile context and draft each section, optionally escalate a section to Claude, edit the result, compare immutable versions, safely reconcile concurrent edits, restore an older version as a new auditable head, and explicitly approve the exact version intended for submission.
 - **8 · Final Export:** Preview the approved grant, pass all readiness gates, and export a DOCX, PDF, or both with the sponsor-compliant submission package.
 - **9 · System & Diagnostics:** Inspect non-secret runtime/build information and run the local HPC benchmark.
 
@@ -106,6 +106,46 @@ GRANT_EXPORT_HOME=./exports
 ```
 
 Most other settings already have production defaults and should remain unchanged unless benchmarking or deployment requirements tell you otherwise.
+
+## Authentication and shared deployment
+
+`AUTH_MODE=internal_accounts` is the default. The first-start setup token creates
+the only bootstrap administrator; public self-registration closes immediately.
+That administrator creates later users with usernames, email addresses, and
+temporary passwords. First login is restricted to password change, and reset
+links are single-use, expiring links delivered through the configured TLS SMTP
+relay.
+
+For an institutional OIDC deployment, configure the `OIDC_*` settings and use
+`./scripts/start_oidc_gateway.sh`. The enterprise Compose override publishes only
+the TLS gateway and changes the UI/API to `trusted_headers`; direct backend host
+ports are removed. OAuth2 Proxy verifies the issuer, audience, nonce, PKCE flow,
+email-domain allowlist, and session before Nginx overwrites the Grantspace
+identity headers. A deployment-generated 256-bit proof secret prevents any
+request that bypasses that authentication chain from asserting trusted headers
+to the UI or API. The stable user identity must be an immutable subject claim,
+normally `sub`, and must not be an email address or display name.
+
+The same application contract supports an institution-managed SAML gateway when
+it maps an immutable NameID/directory object ID and is the only network path to
+the UI. See `dev_docs/ADR_003_IDENTITY_AND_SHARED_DEPLOYMENT.md` for required
+headers and isolation invariants.
+
+Projects with **Team collaboration and approvals** enabled expose a shared Team
+Workspace. Project leadership can add an existing account or send a single-use,
+expiring email invitation. The invited address must match the authenticated
+account accepting the link. General, framework, aims, and section channels
+support threaded messages and member mentions. Comments are validated against
+an exact immutable artifact range, tasks enforce owner/leadership transitions,
+and notifications and configured approval thresholds remain auditable.
+
+The solicitation, framework, aims, and literature editors load their selectable
+identifiers from `GET /api/projects/{id}/workflow/editor-context`. That response
+contains only approved upstream artifact IDs, active project members, and
+project-scoped evidence, sources, and citations. Approval fails closed when an
+artifact contains an unknown, stale, inactive-member, or cross-project
+reference; fact-classified aims require supporting evidence, and literature run
+timestamps must be valid and ordered RFC 3339 values.
 
 ---
 
@@ -834,6 +874,25 @@ ships three machine-oriented templates:
 - `env.m4Mac.qwen3.txt`: MLX Qwen 3 8B + Claude.
 - `env.m2Mac.8gb.txt`: Ollama Qwen 3 1.7B, local-only by default with an
   documented hybrid toggle.
+
+### Structured model-output contracts
+
+Every task that returns machine-readable data uses a versioned JSON Schema
+generated from the Rust type that the application will deserialize. The same
+schema is encoded through the provider's native mechanism:
+
+- MLX/vLLM-compatible servers receive `response_format.type=json_schema`.
+- Ollama receives the schema in the native `/api/chat` `format` field.
+- Claude is forced to call a single `submit_structured_output` tool whose
+  `input_schema` is that same contract.
+
+The core validates the returned JSON against the schema again before marking the
+generation complete or allowing it to affect project state. Each generation run
+stores the contract name, version, exact schema, schema SHA-256, prompt SHA-256,
+response SHA-256, provider/model, and an immutable manifest of authoritative
+project inputs. Invalid provider output fails closed and remains in the audit
+history. Plain proposal prose uses the text path, but its section version is
+still transactionally linked to the exact completed generation run.
 
 ---
 
