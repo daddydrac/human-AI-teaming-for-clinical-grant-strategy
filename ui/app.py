@@ -1,11 +1,11 @@
 import contextvars, difflib, hashlib, hmac, html, inspect, json, math, os, secrets, shutil, uuid, zipfile, requests, gradio as gr
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, quote
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from bs4 import BeautifulSoup
 from docx import Document as DocxDocument
@@ -21,7 +21,8 @@ WORKSPACE=Path(os.getenv("GRANT_WORKSPACE","/workspace"))
 ORGANIZATION_NAME=os.getenv("ORGANIZATION_NAME","Organization")
 CONFIG_ROOT=Path(os.getenv("UI_CONFIG_ROOT",str(Path(__file__).resolve().parents[1]/"config")))
 COMPETITIVE_UI_POLL_SECONDS=max(60,min(86400,int(os.getenv("COMPETITIVE_UI_POLL_SECONDS","14400"))))
-COLLABORATION_UI_POLL_SECONDS=max(2,min(60,int(os.getenv("COLLABORATION_UI_POLL_SECONDS","5"))))
+COLLABORATION_UI_POLL_SECONDS=max(12,min(60,int(os.getenv("COLLABORATION_UI_POLL_SECONDS","12"))))
+COMPILATION_UI_POLL_SECONDS=max(65,min(300,int(os.getenv("COMPILATION_UI_POLL_SECONDS","65"))))
 COMPETITIVE_UPDATE_LABEL=os.getenv("COMPETITIVE_UPDATE_LABEL","Competitive Edge Auto-Update").strip() or "Competitive Edge Auto-Update"
 GRANT_BUILD_VERSION=os.getenv("GRANT_BUILD_VERSION","0.8.0")
 REQUEST_IDENTITY_HEADERS=contextvars.ContextVar("request_identity_headers",default=None)
@@ -45,11 +46,24 @@ def load_default_sections():
     except Exception:return []
 DEFAULT_SECTIONS=load_default_sections()
 
+# Project roles are an API contract, not free-form user data. All project-role
+# controls share these constrained values.
+PROJECT_ROLE_CHOICES=[
+    ("Project owner","owner"),
+    ("Principal investigator","pi"),
+    ("Contributor / scientific writer","contributor"),
+    ("Reviewer","reviewer"),
+    ("Approver","approver"),
+    ("Research administrator","research_administrator"),
+    ("Viewer","viewer"),
+]
+PROJECT_ROLE_LABELS={value:label for label,value in PROJECT_ROLE_CHOICES}
+
 CSS="""
 :root{--gs-bg:#0d0b14;--gs-panel:#15121d;--gs-panel-2:#1b1724;--gs-border:#30293b;--gs-muted:#9a92a5;--gs-copy:#f7f3fb;--gs-purple:#a855f7;--gs-magenta:#d946ef;--gs-cyan:#55d9f2;--gs-green:#42d59c}
 .gradio-container{max-width:100%!important;background:var(--gs-bg)!important;color:var(--gs-copy)!important}
 .wizard-lightbox{position:fixed!important;inset:0!important;z-index:9999!important;background:radial-gradient(circle at 63% 15%,rgba(88,28,135,.14),transparent 34%),var(--gs-bg)!important;overflow:auto!important}
-.wizard-shell{min-height:100vh!important;display:grid!important;grid-template-columns:minmax(230px,16vw) 1fr!important;gap:0!important}
+.wizard-shell{min-height:100vh!important;display:grid;grid-template-columns:minmax(230px,16vw) 1fr!important;gap:0!important}
 .wizard-rail{height:100vh;position:sticky;top:0;border-right:1px solid var(--gs-border);padding:38px 24px;background:#100d17}
 .wizard-rail-label{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:#746c7e;margin-bottom:28px}
 .wizard-rail-step{display:grid;grid-template-columns:34px 1fr;gap:12px;align-items:center;padding:10px 4px;color:#716a7a}
@@ -77,6 +91,8 @@ CSS="""
 .module-catalog{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:16px 0 24px}.module-card{border:1px solid var(--gs-border);border-radius:15px;padding:18px;background:var(--gs-panel);min-height:155px}.module-card.gated{border-left:3px solid #8f45bc}.module-card b{color:#f4eef8}.module-card .placement{color:#b25ee8;font-size:11px;margin:8px 0}.module-card p{color:var(--gs-muted);font-size:12px;line-height:1.55}.module-card small{color:#746c7e}
 .workflow-preview{border:1px solid var(--gs-border);border-radius:18px;background:var(--gs-panel);padding:20px}.workflow-preview-row{display:grid;grid-template-columns:38px 1fr auto;gap:14px;align-items:center;padding:14px 4px;border-bottom:1px solid #292332}.workflow-preview-row:last-child{border-bottom:0}.workflow-preview-row .n{height:34px;width:34px;border:1px solid #6a3a83;border-radius:9px;display:grid;place-items:center;color:#c06cf4}.workflow-preview-row small{color:var(--gs-muted)}
 .privacy-note{border:1px solid #24444d;border-radius:14px;padding:16px;background:rgba(25,92,105,.12);color:#bcecf3}
+#wizard-create-progress{display:none;margin:18px 0;padding:14px 16px;border:1px solid #3d3150;border-radius:12px;background:#15121d}#wizard-create-progress.active,#wizard-create-progress.complete,#wizard-create-progress.failed{display:block}#wizard-create-progress .track{height:10px;overflow:hidden;border-radius:999px;background:#282231;margin-top:10px}#wizard-create-progress .bar{height:100%;width:34%;border-radius:999px;background:linear-gradient(90deg,#7c3aed,#d946ef,#55d9f2);animation:wizard-progress 1.4s ease-in-out infinite alternate}#wizard-create-progress.complete .bar{width:100%;animation:none;background:#42d59c}#wizard-create-progress.failed .bar{width:100%;animation:none;background:#ef476f}@keyframes wizard-progress{from{transform:translateX(-90%)}to{transform:translateX(280%)}}
+#refresh-shared-updates{position:fixed!important;top:14px;right:18px;z-index:10005;width:auto!important;min-width:210px!important;background:#19151f!important;border:1px solid #65417a!important;color:#f7f3fb!important;box-shadow:0 10px 30px #0007!important}
 .wizard-footer{position:fixed!important;z-index:10001;bottom:0;left:0;right:0;border-top:1px solid var(--gs-border);background:rgba(13,11,20,.96);backdrop-filter:blur(14px);padding:14px 28px!important}
 .wizard-footer button.primary{background:linear-gradient(100deg,#7c3aed,#d946ef)!important;border:0!important;color:white!important}
 .workspace-shell{background:var(--gs-bg)!important;min-height:100vh}.workspace-shell h1,.workspace-shell h2,.workspace-shell h3{color:#f7f3fb}
@@ -305,6 +321,22 @@ def full_document_preview(project,payload):
     return f'<div class="page-frame"><iframe sandbox="" srcdoc="{doc}"></iframe></div>'
 
 def requirement_rows(reqs):return [[r.get("id"),r.get("category"),r.get("mandatory"),r.get("requirement"),", ".join(r.get("evidence_needed") or []),r.get("status"),r.get("approved")] for r in reqs]
+
+def model_response_preview(value,word_limit=20):
+    words=str(value or "").split()
+    return html.escape(" ".join(words[:word_limit]))+("…" if words else "")
+
+def requirements_response_preview(requirements):
+    text=" ".join(str(item.get("requirement") or "") for item in (requirements or []))
+    return model_response_preview(text)
+
+def generation_elapsed(started_at):
+    try:
+        started=datetime.strptime(str(started_at),"%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        seconds=max(0,int((datetime.now(timezone.utc)-started).total_seconds()))
+        minutes,seconds=divmod(seconds,60)
+        return f"{minutes} min {seconds} sec"
+    except (TypeError,ValueError):return "an unknown duration"
 def evidence_rows(items):return [[e.get("id"),e.get("requirement_id"),e.get("source_type"),e.get("claim"),e.get("status"),round(float(e.get("confidence",0)),2),e.get("url") or ""] for e in items]
 def slug(s):
     out=[];last=False
@@ -393,6 +425,76 @@ def wizard_nav_from_progress_js():
       return [];
     }"""
 
+WIZARD_CREATE_CLICK_JS="""() => {
+  if (window.__grantspaceCreateClickHandler) return [];
+  window.__grantspaceCreateClickHandler = (event) => {
+    const target = event.target;
+    const control = target instanceof Element ? target.closest('#wizard-create-button') : null;
+    const button = control && control.matches('button') ? control : control?.querySelector('button');
+    if (!button) return;
+    if (button.dataset.creationBusy === 'true' && !button.disabled) button.dataset.creationBusy = 'false';
+    if (button.dataset.creationBusy === 'true') return;
+    button.dataset.creationBusy = 'true';
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = 'Creating shared grant…';
+    const status = document.querySelector('#wizard-create-status .prose, #wizard-create-status');
+    if (status) status.innerHTML = '<h3>Creating your shared grant…</h3><p>Validating the workflow, storing the project, and ingesting its sources. Grant-ask compilation starts from the saved workspace.</p>';
+    const progress = document.getElementById('wizard-create-progress');
+    if (progress) {
+      progress.className = 'active';
+      const label = progress.querySelector('.label');
+      if (label) label.textContent = 'Stage 1 of 4 · Saving the shared grant and authoritative source…';
+    }
+    setTimeout(() => { button.disabled = true; }, 0);
+  };
+  document.addEventListener('click', window.__grantspaceCreateClickHandler, false);
+  window.__grantspaceCreateStatusObserver = new MutationObserver(() => {
+    const status = document.getElementById('wizard-create-status');
+    const progress = document.getElementById('wizard-create-progress');
+    if (!status || !progress) return;
+    const text = status.textContent || '';
+    const label = progress.querySelector('.label');
+    if (text.includes('Shared grant created')) {
+      progress.className = 'complete';
+      if (label) label.textContent = 'Stage 4 of 4 · Shared grant saved. Opening the workspace…';
+      setTimeout(() => {
+        const overlay = document.getElementById('wizard-overlay');
+        if (overlay) {
+          overlay.style.setProperty('display', 'none', 'important');
+          overlay.setAttribute('aria-hidden', 'true');
+        }
+        window.scrollTo({top: 0, behavior: 'smooth'});
+      }, 250);
+    } else if (text.includes('Grant creation failed')) {
+      progress.className = 'failed';
+      if (label) label.textContent = 'Creation failed · Read the error below, correct it, and retry.';
+    }
+  });
+  window.__grantspaceCreateStatusObserver.observe(document.body, {subtree: true, childList: true, characterData: true});
+  return [];
+}"""
+
+WIZARD_HIDE_JS="""() => {
+  const overlay = document.getElementById('wizard-overlay');
+  if (overlay) {
+    overlay.style.setProperty('display', 'none', 'important');
+    overlay.setAttribute('aria-hidden', 'true');
+  }
+  window.scrollTo({top: 0, behavior: 'smooth'});
+  return [];
+}"""
+
+WIZARD_HIDE_AFTER_CREATE_JS="""(status) => {
+  if (!String(status || '').includes('Shared grant created and loaded')) return [];
+  const overlay = document.getElementById('wizard-overlay');
+  if (overlay) {
+    overlay.style.setProperty('display', 'none', 'important');
+    overlay.setAttribute('aria-hidden', 'true');
+  }
+  window.scrollTo({top: 0, behavior: 'smooth'});
+  return [];
+}"""
+
 def apply_workflow_preset(preset_key):
     preset=WORKFLOW_PRESETS.get(preset_key)
     if not preset:raise gr.Error("Choose a valid workflow preset.")
@@ -425,13 +527,42 @@ def validate_grant_ask_and_continue(title,source,source_url,source_text,deadline
         except ValueError:raise gr.Error("Sponsor deadline must use YYYY-MM-DD.")
     return wizard_page_updates(3)
 
-def validate_team_and_preview(owner_id,title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows):
-    if not (owner_id or "").strip():raise gr.Error("Enter the stable authenticated project owner ID.")
+def validate_team_and_preview(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows):
+    identity=api("GET","/api/me")
+    if not identity.get("id"):raise gr.Error("Your authenticated account could not be resolved. Sign in again.")
     return wizard_to_preview(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows)
 
 def authenticated_identity():
     identity=api("GET","/api/me")
-    return identity.get("id") or "",f"Authenticated as **{identity.get('display_name')}** in organization `{identity.get('organization_id')}`. This stable identity will own edits and approvals."
+    display=identity.get("display_name") or identity.get("username") or identity.get("email") or "signed-in user"
+    account=identity.get("username") or identity.get("email") or "authenticated account"
+    return identity.get("id") or "",f"**Project owner:** {display} (`{account}`)  \nOwnership, edits, and approvals use your authenticated account automatically. No internal user ID is required."
+
+def _normalized_team_rows(team_rows):
+    rows=[]
+    for row in _records(team_rows,["Email","Role"]):
+        email=_cell(row.get("Email")).strip().lower()
+        role=_cell(row.get("Role")).strip()
+        if email:rows.append([email,role])
+    return rows
+
+def add_wizard_team_invitation(team_rows,email,role):
+    email=(email or "").strip().lower()
+    if not email or "@" not in email or email.startswith("@") or email.endswith("@"):
+        raise gr.Error("Enter a valid teammate email address.")
+    if role not in PROJECT_ROLE_LABELS:raise gr.Error("Choose a project role from the list.")
+    rows=_normalized_team_rows(team_rows)
+    if any(existing_email==email for existing_email,_ in rows):raise gr.Error("That email is already in the invitation list.")
+    rows.append([email,role])
+    remove_choices=[(f"{existing_email} · {PROJECT_ROLE_LABELS.get(existing_role,existing_role)}",existing_email) for existing_email,existing_role in rows]
+    return rows,"",gr.update(choices=remove_choices,value=None),f"Added **{email}** as **{PROJECT_ROLE_LABELS[role]}**."
+
+def remove_wizard_team_invitation(team_rows,email):
+    target=(email or "").strip().lower()
+    if not target:raise gr.Error("Choose a teammate to remove.")
+    rows=[[existing_email,role] for existing_email,role in _normalized_team_rows(team_rows) if existing_email!=target]
+    remove_choices=[(f"{existing_email} · {PROJECT_ROLE_LABELS.get(role,role)}",existing_email) for existing_email,role in rows]
+    return rows,gr.update(choices=remove_choices,value=None),f"Removed **{target}** from the invitation list."
 
 def account_rows():
     payload=api("GET","/api/admin/users")
@@ -852,6 +983,19 @@ def poll_shared_artifact_versions(project,local_search_plan_version,local_manife
         if local_version and remote_version and int(local_version)!=int(remote_version):notices.append(f"A teammate published {label} v{remote_version} while this browser has v{int(local_version)} loaded. Reload before editing; stale saves are rejected server-side.")
     return "\n\n".join(f"> ⚠ {notice}" for notice in notices) if notices else "Live collaboration sync is current."
 
+def poll_collaboration_snapshot(project,kind,subject_key,local_search_plan_version,local_manifest_version):
+    """Fetch one collaboration snapshot and release all per-run state on return.
+
+    The Gradio timer owns scheduling. This callback never sleeps, loops, retains a
+    background task, or schedules itself, so each 12-second refresh is an isolated
+    request whose locals become collectible immediately after its response.
+    """
+    if not (project or "").strip():return tuple(gr.skip() for _ in range(13))
+    workspace=poll_team_workspace(project)
+    channel=poll_team_channel(project,kind,subject_key)
+    artifact_sync=poll_shared_artifact_versions(project,local_search_plan_version,local_manifest_version)
+    return (*workspace,*channel,artifact_sync)
+
 def channel_messages_html(messages):
     if not messages:return '<div class="team-chat">No messages in this channel yet.</div>'
     blocks=[]
@@ -1001,13 +1145,16 @@ def update_project_manager(project,title,archive_action,include_archived):
     action="archived" if archive_action=="Archive" else ("restored" if archive_action=="Restore" else "updated")
     return selector,rows,summary,f"Grant **{updated.get('title')}** was {action}. All documents, versions, approvals, research, and collaboration history remain stored.","",None
 
-def create_project(title,sponsor,mechanism,source,source_url,source_text,supporting,brand,workflow=None,actor=None):
+def create_project(title,sponsor,mechanism,source,source_url,source_text,supporting,brand,workflow=None,actor=None,analyze=True,progress=None):
+    if progress:progress(0.03,desc="Stage 1 of 4 · Validating the project title and authoritative grant source")
     if not title.strip():raise gr.Error("Working title is required.")
     if not source and not (source_url or "").strip() and not (source_text or "").strip():raise gr.Error("Upload, link, or paste a funding opportunity.")
+    if progress:progress(0.12,desc="Stage 1 of 4 · Saving the shared grant record and workflow configuration")
     payload={"title":title.strip(),"sponsor":sponsor or None,"mechanism":mechanism or None,"sections":DEFAULT_SECTIONS,"actor":actor or None}
     if workflow is not None:payload["workflow"]=workflow
     d=api("POST","/api/projects",json=payload)
     pid=d["id"];count=0
+    if progress:progress(0.28,desc="Stage 2 of 4 · Extracting and storing the authoritative grant source")
     if source:
         p=Path(file_path(source));count+=int(push_doc(pid,p.name,"funding_opportunity",extract_file(source)))
     if (source_url or "").strip():
@@ -1018,30 +1165,70 @@ def create_project(title,sponsor,mechanism,source,source_url,source_text,support
         count+=int(push_doc(pid,"Pasted funding opportunity","funding_paste",source_text))
     for f in supporting or []:
         p=Path(file_path(f));count+=int(push_doc(pid,p.name,"supporting",extract_file(f)))
+    if progress:progress(0.62,desc="Stage 3 of 4 · Saving supporting materials and document design settings")
     assets=copy_brand_assets(pid,brand);profile=build_design_profile(pid,sponsor,assets)
     api("POST",f"/api/projects/{pid}/design-profile",json={"profile":profile})
+    sections=api("GET",f"/api/projects/{pid}/sections");section_choices=[x["title"] for x in sections]
+    if not analyze:
+        if progress:progress(0.76,desc="Stage 4 of 4 · Opening the saved workspace; grant-ask compilation is ready to start")
+        status=(f"Project `{pid}` created with {count} unique source(s). The source is stored and ready. "
+                "Select **Compile grant ask** to extract its requirements, eligibility, deadlines, attachments, and review criteria.")
+        return pid,status,"",[],gr.update(choices=section_choices,value=(section_choices[0] if section_choices else None))
+    if progress:progress(0.76,desc="Stage 4 of 4 · Local model is extracting structured grant requirements")
     analysis=api("POST",f"/api/projects/{pid}/analyze-requirements",timeout=600)
     enabled=set((workflow or {}).get("enabled_modules") or [])
     comp=api("POST",f"/api/projects/{pid}/compliance/compile",timeout=900) if "sponsor_compliance" in enabled else {"profile":{"rules":[]}}
-    sections=api("GET",f"/api/projects/{pid}/sections");section_choices=[x["title"] for x in sections]
     rule_count=len((comp.get("profile") or {}).get("rules") or [])
     return pid,f"Project `{pid}` created. {count} unique source(s), {analysis['count']} atomic grant requirements, and {rule_count} deterministic sponsor/submission rules were compiled from the opportunity. Review and approve both before final submission.","",requirement_rows(analysis["requirements"]),gr.update(choices=section_choices,value=(section_choices[0] if section_choices else None))
 
+def compile_grant_ask(project,progress=gr.Progress()):
+    project=_require_project(project)
+    progress(0.05,desc="Stage 1 of 4 · Loading the authoritative source and approved workflow context")
+    progress(0.20,desc="Stage 2 of 4 · Local model is extracting requirements, eligibility, dates, attachments, and review criteria")
+    analysis=api("POST",f"/api/projects/{project}/analyze-requirements",timeout=600)
+    progress(0.88,desc="Stage 3 of 4 · Validating the structured response and exact source provenance")
+    progress(0.96,desc="Stage 4 of 4 · Loading the saved requirements for human review")
+    requirements=analysis.get("requirements") or [];preview=requirements_response_preview(requirements)
+    preview_text=f"  \n**Model-output preview:** {preview}" if preview else ""
+    return requirement_rows(requirements),f"Compiled **{analysis.get('count',0)}** atomic grant requirements. Review the structured solicitation profile, correct any extraction issues, and approve it before framework generation.{preview_text}"
+
+def poll_grant_ask_compilation(project):
+    """Return one 65-second compilation heartbeat; never starts a model run."""
+    if not (project or "").strip():return gr.skip(),gr.skip()
+    workflow=api("GET",f"/api/projects/{project}/workflow")
+    runs=[run for run in (workflow.get("generation_runs") or []) if run.get("task_kind")=="requirement_decomposition"]
+    if not runs:return gr.skip(),"**Stage 1 of 4 · Ready.** The authoritative grant source is stored. Select **Compile grant ask** to begin structured extraction."
+    latest=runs[0];status=latest.get("status")
+    if status=="running":
+        provider=latest.get("provider") or "configured provider";model=latest.get("model") or "configured model"
+        source=api("GET",f"/api/projects/{project}/opportunity-source");input_preview=model_response_preview(source.get("text") or "")
+        contract=latest.get("output_contract_name") or "structured requirements";version=latest.get("output_contract_version")
+        contract_label=f"{contract} v{version}" if version is not None else contract
+        preview_text=f"  \n**Input currently in flight:** {input_preview}" if input_preview else "  \n**Input currently in flight:** Source metadata is loaded; no safe text preview was available."
+        return gr.skip(),(f"**Stage 2 of 4 · Model analysis active.** **{provider} / {model}** has been processing for **{generation_elapsed(latest.get('started_at'))}** and is producing **{html.escape(str(contract_label))}**. "
+                          f"No committed response is available to preview yet. The provider does not expose a trustworthy item-level percentage; this status refreshes every 1 minute 5 seconds.{preview_text}")
+    if status=="failed":return gr.skip(),f"**Compilation failed.** {html.escape(str(latest.get('error') or 'No error detail was returned.'))} Correct the reported issue and start a new compilation run."
+    requirements=api("GET",f"/api/projects/{project}/requirements")
+    preview=requirements_response_preview(requirements);preview_text=f"  \n**Model-output preview:** {preview}" if preview else ""
+    return requirement_rows(requirements),f"**Stage 4 of 4 · Compilation complete.** The validated result contains **{len(requirements)}** atomic requirements. Review, correct, and approve the structured results.{preview_text}"
+
 def configured_project_creation(title,sponsor,mechanism,deadline,grant_type,source,source_url,source_text,supporting,brand,
-                                preset_key,selected,required,review_mode,review_required,routing_mode,owner_id,team_rows):
-    owner=(owner_id or "").strip()
-    if not owner:raise gr.Error("An authenticated owner identifier is required for project authorship and approvals.")
+                                preset_key,selected,required,review_mode,review_required,routing_mode,team_rows,progress=None):
+    # Resolve ownership from the authenticated session at creation time; hidden
+    # browser state is never authoritative for access or authorship.
+    if progress:progress(0.02,desc="Stage 1 of 4 · Confirming your authenticated project ownership")
+    owner=(api("GET","/api/me").get("id") or "").strip()
+    if not owner:raise gr.Error("Your authenticated account could not be resolved. Sign in again.")
     workflow=build_workflow_config(preset_key,selected,required,grant_type,deadline,review_mode,review_required,routing_mode)
-    pid,status,notice,requirements,sections=create_project(title,sponsor,mechanism,source,source_url,source_text,supporting,brand,workflow,owner)
+    pid,status,notice,requirements,sections=create_project(title,sponsor,mechanism,source,source_url,source_text,supporting,brand,workflow,owner,False,progress)
     selected_set=set(selected or [])
+    if progress:progress(0.80,desc="Stage 4 of 4 · Applying team invitations, approval routing, and enabled workspace modules")
     if "team_collaboration" in selected_set:
         members=_records(team_rows,["Email","Role"])
-        role_map={"project owner":"owner","owner":"owner","principal investigator":"pi","pi":"pi","scientific writer":"contributor","contributor":"contributor","statistician/methodologist":"contributor","methodologist":"contributor","research administrator":"research_administrator","approver":"approver","reviewer":"reviewer","viewer":"viewer"}
         for row in members:
-            email=_cell(row.get("Email"));label=_cell(row.get("Role")).lower()
+            email=_cell(row.get("Email"));role=_cell(row.get("Role"))
             if not email:continue
-            role=role_map.get(label)
-            if not role:raise gr.Error(f"Unsupported project role for {email}: {row.get('Role')}")
+            if role not in PROJECT_ROLE_LABELS:raise gr.Error(f"Unsupported project role for {email}: {row.get('Role')}")
             api("POST",f"/api/projects/{pid}/invites",json={"email":email,"role":role,"expires_in_days":7})
         approvers=[owner]
         routed_artifacts=["solicitation_profile","research_framework","aim_set","literature_manifest","proposal_section","proposal_snapshot"]
@@ -1057,7 +1244,8 @@ def configured_project_creation(title,sponsor,mechanism,deadline,grant_type,sour
     summary=(f"### {html.escape(title.strip())}\nWorkflow definition **v{workflow_data.get('definition_version')}** · configuration **v{workflow_data.get('config_version')}** · "
              f"{len(selected_set)} optional capabilities · model routing **{routing_mode}**. The shared server is the source of truth for every teammate.")
     visibility={key:key in selected_set for key in WORKFLOW_MODULES}
-    return (gr.update(visible=False),pid,status,notice,requirements,sections,summary,workflow_status,
+    if progress:progress(1.0,desc="Stage 4 of 4 · Shared grant saved; opening the intake workspace")
+    return (gr.update(visible=False),pid,title.strip(),sponsor or "",mechanism or "",status,notice,requirements,sections,summary,workflow_status,
             gr.update(visible=visibility.get("investigator_interview",False)),
             gr.update(visible=True),
             gr.update(visible=visibility.get("clinical_design",False)),
@@ -1065,6 +1253,22 @@ def configured_project_creation(title,sponsor,mechanism,deadline,grant_type,sour
             gr.update(visible=visibility.get("sponsor_compliance",False)),
             gr.update(visible=visibility.get("review_simulator",False)),
             gr.update(visible=visibility.get("advanced_workbench",False)))
+
+def configured_project_creation_ui(title,sponsor,mechanism,deadline,grant_type,source,source_url,source_text,supporting,brand,
+                                   preset_key,selected,required,review_mode,review_required,routing_mode,team_rows,progress=gr.Progress()):
+    """Keep the wizard usable and expose a durable result when creation fails."""
+    try:
+        creation=configured_project_creation(title,sponsor,mechanism,deadline,grant_type,source,source_url,source_text,supporting,brand,
+                                             preset_key,selected,required,review_mode,review_required,routing_mode,team_rows,progress)
+        pid=creation[1]
+        loaded=load_project(pid)
+        workflow=project_workflow_ui(pid)
+        return (gr.update(visible=False),*loaded,*workflow,
+                "Shared grant created and loaded. The authoritative source is stored; select **Compile grant ask** when you are ready to run structured extraction.",
+                gr.update(value="Create shared grant →",interactive=True))
+    except Exception as error:
+        message=html.escape(str(error).strip() or "The server did not return an error description.")
+        return (*(gr.skip() for _ in range(26)),f"### Grant creation failed\n{message}",gr.update(value="Try creating the grant again →",interactive=True))
 
 def wizard_to_preview(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows):
     return wizard_page_updates(7)+[workflow_preview_html(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows)]
@@ -1076,6 +1280,31 @@ def load_project(pid):
     state=load_section(pid,p["title"],selected) if selected else (None,"",section_preview(pid,p["title"],"Section",""),"No sections configured.","",slug("Section"),None,"")
     notice=global_competitive_update_banner(p.get("competitive_updates") or {})
     return pid,p["title"],p.get("sponsor") or "",p.get("mechanism") or "",f"Opened `{pid}` at workflow stage **{p['stage']}**.",notice,requirement_rows(reqs),gr.update(choices=choices,value=selected),*state
+
+def load_project_if_available(pid):
+    """Hydrate the workspace after creation without masking a creation error."""
+    if not pid:
+        return tuple(gr.skip() for _ in range(16))
+    return load_project(pid)
+
+def open_project_workspace(pid):
+    """Open one saved grant and hydrate its complete persisted workflow atomically."""
+    loaded=load_project(pid)
+    workflow=project_workflow_ui(pid)
+    return gr.update(visible=False),*loaded,*workflow
+
+def refresh_shared_updates(project,kind,subject_key,search_plan_version,literature_version,include_archived):
+    """Fetch one user-requested shared snapshot; no timer or background loop is involved."""
+    wizard_projects=refresh_projects()
+    catalog=project_catalog(include_archived)
+    if not (project or "").strip():
+        return (wizard_projects,*catalog,*(gr.skip() for _ in range(24)),
+                "Saved grants refreshed. Open a grant to refresh its shared workflow and collaboration data.")
+    collaboration=poll_collaboration_snapshot(project,kind,subject_key,search_plan_version,literature_version)
+    compilation=poll_grant_ask_compilation(project)
+    workflow=project_workflow_ui(project)
+    return (wizard_projects,*catalog,*collaboration,*compilation,*workflow,
+            "Shared updates loaded from the server. Teammate activity, tasks, messages, approvals, workflow gates, and compilation status are current as of this refresh.")
 
 def _portable_archive_payload(upload):
     if not upload:raise gr.Error("Choose a Grantspace portable project archive first.")
@@ -1657,7 +1886,7 @@ def export(project,fmt,_title):
     return paths,f"Created from immutable export snapshot {snap['snapshot_id']} ({snap['sha256'][:16]}…). Sponsor-compliant package: {package}"
 
 with gr.Blocks(title="Grantspace") as demo:
-    with gr.Column(visible=True,elem_classes="wizard-lightbox") as wizard_shell:
+    with gr.Column(visible=True,elem_classes="wizard-lightbox",elem_id="wizard-overlay") as wizard_shell:
         with gr.Row(elem_classes="wizard-shell"):
             wizard_rail=gr.HTML(wizard_rail_html(1),container=False)
             with gr.Column(elem_classes="wizard-main"):
@@ -1706,7 +1935,7 @@ with gr.Blocks(title="Grantspace") as demo:
                     with gr.Row():wizard_3_back=gr.Button("← Back");wizard_3_next=gr.Button("Continue →",variant="primary")
                 with gr.Column(visible=False,elem_id="wizard-page-4") as wizard_page_4:
                     gr.HTML('<div class="wizard-title"><div class="wizard-kicker">04 · Optional modules</div><h2>Compose the right level of rigor</h2><p>Selected capabilities appear in project navigation and gates. Unselected capabilities are absent and cannot block completion.</p></div>')
-                    wizard_preset=gr.Dropdown(PRESET_CHOICES,value=WORKFLOW_REGISTRY["default_preset_key"],label="Start from a preset")
+                    wizard_preset=gr.Dropdown(PRESET_CHOICES,value=WORKFLOW_REGISTRY["default_preset_key"],label="Start from a preset, or choose Custom configuration")
                     gr.HTML(module_catalog_html())
                     wizard_modules=gr.CheckboxGroup(MODULE_CHOICES,label="Selected capabilities",value=WORKFLOW_PRESETS[WORKFLOW_REGISTRY["default_preset_key"]]["enabled_modules"],elem_classes="wizard-option-grid")
                     wizard_required_modules=gr.CheckboxGroup([],label="Capabilities that add a required completion gate",value=[],elem_classes="wizard-option-grid")
@@ -1726,9 +1955,18 @@ with gr.Blocks(title="Grantspace") as demo:
                     gr.HTML('<div class="wizard-title"><div class="wizard-kicker">06 · Team & routing</div><h2>Put a name on every decision</h2><p>Configure stable identities, review responsibility, internal dates, and notifications before work begins.</p></div>')
                     with gr.Row():
                         with gr.Column(scale=3,elem_classes="wizard-panel"):
-                            wizard_owner_id=gr.Textbox(label="Authenticated project owner ID",interactive=False)
+                            wizard_owner_id=gr.State("")
                             wizard_identity_status=gr.Markdown()
-                            wizard_team=gr.Dataframe(headers=["Email","Role"],datatype=["str","str"],row_count=(3,"dynamic"),column_count=(2,"fixed"),interactive=True,label="Team invitations and roles")
+                            gr.Markdown("#### Invite teammates (optional)\nAdd one person at a time. Project roles are limited to permissions supported by the application.")
+                            with gr.Row():
+                                wizard_team_email=gr.Textbox(label="Teammate email",placeholder="name@organization.org",scale=2)
+                                wizard_team_role=gr.Dropdown(PROJECT_ROLE_CHOICES,value="contributor",label="Project role",scale=1)
+                                wizard_team_add=gr.Button("Add teammate",variant="secondary",scale=1)
+                            wizard_team=gr.Dataframe(value=[],headers=["Email","Role"],datatype=["str","str"],column_count=(2,"fixed"),interactive=False,label="Pending invitations")
+                            with gr.Row():
+                                wizard_team_remove_choice=gr.Dropdown([],label="Remove teammate",scale=3)
+                                wizard_team_remove=gr.Button("Remove",variant="secondary",scale=1)
+                            wizard_team_status=gr.Markdown()
                         with gr.Column(scale=2,elem_classes="wizard-panel"):
                             wizard_routing=gr.Dropdown(WORKFLOW_REGISTRY["model_routing_modes"],value=os.getenv("MODEL_ROUTING_MODE","local_only"),label="Model routing policy")
                             gr.Markdown(f"**Local provider:** `{os.getenv('LOCAL_LLM_PROVIDER','not configured')}`  \n**Local model:** `{os.getenv('LOCAL_LLM_MODEL','not configured')}`  \n**Cloud model:** `{os.getenv('CLAUDE_MODEL','not configured')}`")
@@ -1738,11 +1976,15 @@ with gr.Blocks(title="Grantspace") as demo:
                     gr.HTML('<div class="wizard-title"><div class="wizard-kicker">07 · Workflow preview</div><h2>Your grant, composed</h2><p>This exact configuration becomes the server-side source of truth for every teammate.</p></div>')
                     wizard_preview=gr.HTML()
                     gr.HTML('<div class="privacy-note"><b>Configuration validation</b><br>The server rejects unknown modules, hidden prerequisites, stale definitions, and required modules that are not enabled.</div>')
-                    with gr.Row():wizard_7_back=gr.Button("← Back");wizard_create_btn=gr.Button("Create shared grant →",variant="primary")
+                    gr.HTML('<div id="wizard-create-progress" role="status" aria-live="polite"><b class="label">Ready to create the shared grant.</b><div class="track"><div class="bar"></div></div></div>')
+                    wizard_create_status=gr.Markdown(elem_id="wizard-create-status")
+                    with gr.Row():wizard_7_back=gr.Button("← Back");wizard_create_btn=gr.Button("Create shared grant →",variant="primary",elem_id="wizard-create-button")
                 with gr.Row(elem_classes="wizard-footer"):
                     gr.Markdown("Configuration is not persisted until you create the grant.")
                     wizard_progress=gr.Markdown("1 of 7",elem_id="wizard-progress")
     gr.Markdown(f"# Grantspace\n{ORGANIZATION_NAME} · Compose the workflow. Write the grant. Win the review. · Build {GRANT_BUILD_VERSION}")
+    refresh_shared_updates_btn=gr.Button("↻ Refresh shared updates",variant="secondary",elem_id="refresh-shared-updates")
+    manual_refresh_status=gr.Markdown()
     project_id=gr.State("");interview_questions=gr.State([]);current_question=gr.State(None);current_version=gr.State(None);baseline_body=gr.State("");current_section_key=gr.State("");current_competitive_update_event=gr.State(None)
     workspace_workflow_summary=gr.Markdown()
     workspace_workflow_status=gr.JSON(label="Composable workflow status",visible=False)
@@ -1761,8 +2003,6 @@ with gr.Blocks(title="Grantspace") as demo:
             apply_project_management_btn=gr.Button("Apply to selected grant")
         project_management_status=gr.Markdown()
     agentic_global_notice=gr.Markdown()
-    competitive_update_timer=gr.Timer(value=COMPETITIVE_UI_POLL_SECONDS,active=True)
-    collaboration_update_timer=gr.Timer(value=COLLABORATION_UI_POLL_SECONDS,active=True)
     with gr.Tabs() as workspace_tabs:
         with gr.Tab("1 · Intake & Requirements") as intake_tab:
             with gr.Row():
@@ -1781,7 +2021,10 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
                     create=gr.Button("Create / Analyze Grant",variant="primary");project_status=gr.Markdown()
                 with gr.Column(scale=5):
                     requirements_table=gr.Dataframe(headers=["ID","Category","Mandatory","Requirement","Evidence needed","Status","Approved"],datatype=["str","str","bool","str","str","str","bool"],interactive=False,label="Parsed atomic requirements")
-                    approve_req=gr.Button("✓ Approve Requirements",variant="primary");req_status=gr.Markdown()
+                    with gr.Row():
+                        compile_grant_ask_btn=gr.Button("Compile grant ask",variant="primary")
+                        approve_req=gr.Button("✓ Approve Requirements",variant="secondary")
+                    req_status=gr.Markdown()
                     gr.Markdown("### Versioned solicitation profile\nThe profile normalizes eligibility, requirements, rubric, deadlines, budget, attachments, and unresolved human questions. Exact source offsets and hashes are validated by the server.")
                     solicitation_version=gr.State(None)
                     with gr.Row():
@@ -1897,13 +2140,13 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
                     team_members=gr.Dataframe(headers=["User ID","Name","Email","Project role","Online","Joined","Last seen"],interactive=False,label="Authenticated project members · presence is advisory; edit safety uses version checks")
                     with gr.Row():
                         existing_member_user_id=gr.Textbox(label="Existing account user ID")
-                        existing_member_role=gr.Dropdown(["owner","pi","contributor","reviewer","approver","research_administrator","viewer"],value="contributor",label="Project role")
+                        existing_member_role=gr.Dropdown(PROJECT_ROLE_CHOICES,value="contributor",label="Project role")
                         add_existing_member_btn=gr.Button("Add existing account")
                     existing_member_status=gr.Markdown()
                     gr.Markdown("#### Invite by verified email\nInvitation links are single-use, expire, and can only be accepted by an authenticated account with the same email address.")
                     with gr.Row():
                         project_invite_email=gr.Textbox(label="Invite email")
-                        project_invite_role=gr.Dropdown(["owner","pi","contributor","reviewer","approver","research_administrator","viewer"],value="contributor",label="Role")
+                        project_invite_role=gr.Dropdown(PROJECT_ROLE_CHOICES,value="contributor",label="Role")
                         project_invite_days=gr.Slider(1,30,value=7,step=1,label="Expires in days")
                     with gr.Row():
                         create_project_invite_btn=gr.Button("Create and email invitation",variant="primary")
@@ -2194,18 +2437,25 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
     wizard_5_back.click(wizard_go(4),outputs=wizard_nav_outputs,js=wizard_nav_js(4))
     wizard_5_next.click(wizard_go(6),outputs=wizard_nav_outputs,js=wizard_nav_js(6))
     wizard_6_back.click(wizard_team_back,[wizard_modules],wizard_nav_outputs).then(fn=None,js=wizard_nav_from_progress_js())
-    wizard_6_next.click(validate_team_and_preview,[wizard_owner_id,wizard_title,wizard_sponsor,wizard_mechanism,wizard_deadline,wizard_modules,wizard_required_modules,wizard_review_mode,wizard_review_required,wizard_routing,wizard_team],wizard_nav_outputs+[wizard_preview]).then(fn=None,js=wizard_nav_js(7))
+    wizard_team_add.click(add_wizard_team_invitation,[wizard_team,wizard_team_email,wizard_team_role],[wizard_team,wizard_team_email,wizard_team_remove_choice,wizard_team_status])
+    wizard_team_remove.click(remove_wizard_team_invitation,[wizard_team,wizard_team_remove_choice],[wizard_team,wizard_team_remove_choice,wizard_team_status])
+    wizard_6_next.click(gateway_callback(validate_team_and_preview),[wizard_title,wizard_sponsor,wizard_mechanism,wizard_deadline,wizard_modules,wizard_required_modules,wizard_review_mode,wizard_review_required,wizard_routing,wizard_team],wizard_nav_outputs+[wizard_preview]).then(fn=None,js=wizard_nav_from_progress_js())
     wizard_7_back.click(wizard_go(6),outputs=wizard_nav_outputs,js=wizard_nav_js(6))
     wizard_preset.change(apply_workflow_preset,[wizard_preset],[wizard_modules,wizard_required_modules]).then(reconcile_module_gates,[wizard_modules,wizard_required_modules],[wizard_required_modules])
     wizard_modules.change(reconcile_module_gates,[wizard_modules,wizard_required_modules],[wizard_required_modules])
     wizard_refresh_btn.click(gateway_callback(refresh_projects),outputs=[wizard_existing])
-    wizard_import_btn.click(gateway_callback(import_portable_project),[wizard_import],[wizard_existing,wizard_import_status]).then(lambda:gr.update(visible=False),outputs=[wizard_shell]).then(gateway_callback(load_project),[wizard_existing],[project_id,project_title,sponsor,mechanism,project_status,agentic_global_notice,requirements_table,section,current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner]).then(gateway_callback(project_workflow_ui),[project_id],[workspace_workflow_summary,workspace_workflow_status,interview_tab,team_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab]).then(gateway_callback(authenticated_identity),outputs=[wizard_owner_id,wizard_identity_status])
-    wizard_open_btn.click(lambda:gr.update(visible=False),outputs=[wizard_shell]).then(gateway_callback(load_project),[wizard_existing],[project_id,project_title,sponsor,mechanism,project_status,agentic_global_notice,requirements_table,section,current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner]).then(gateway_callback(project_workflow_ui),[project_id],[workspace_workflow_summary,workspace_workflow_status,interview_tab,team_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab]).then(gateway_callback(authenticated_identity),outputs=[wizard_owner_id,wizard_identity_status])
-    wizard_create_btn.click(gateway_callback(configured_project_creation),
-        [wizard_title,wizard_sponsor,wizard_mechanism,wizard_deadline,wizard_grant_type,wizard_source,wizard_source_url,wizard_source_text,wizard_supporting,wizard_brand,wizard_preset,wizard_modules,wizard_required_modules,wizard_review_mode,wizard_review_required,wizard_routing,wizard_owner_id,wizard_team],
-        [wizard_shell,project_id,project_status,agentic_global_notice,requirements_table,section,workspace_workflow_summary,workspace_workflow_status,interview_tab,team_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab])
+    wizard_import_event=wizard_import_btn.click(gateway_callback(import_portable_project),[wizard_import],[wizard_existing,wizard_import_status]).then(lambda:gr.update(visible=False),outputs=[wizard_shell]).then(gateway_callback(load_project),[wizard_existing],[project_id,project_title,sponsor,mechanism,project_status,agentic_global_notice,requirements_table,section,current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner]).then(gateway_callback(project_workflow_ui),[project_id],[workspace_workflow_summary,workspace_workflow_status,interview_tab,team_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab]).then(gateway_callback(authenticated_identity),outputs=[wizard_owner_id,wizard_identity_status])
+    wizard_import_event.success(fn=None,js=WIZARD_HIDE_JS,queue=False)
+    wizard_open_event=wizard_open_btn.click(gateway_callback(open_project_workspace),[wizard_existing],
+        [wizard_shell,project_id,project_title,sponsor,mechanism,project_status,agentic_global_notice,requirements_table,section,current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner,workspace_workflow_summary,workspace_workflow_status,interview_tab,team_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab])
+    wizard_open_event.success(fn=None,js=WIZARD_HIDE_JS,queue=False)
+    wizard_create_event=wizard_create_btn.click(gateway_callback(configured_project_creation_ui),
+        [wizard_title,wizard_sponsor,wizard_mechanism,wizard_deadline,wizard_grant_type,wizard_source,wizard_source_url,wizard_source_text,wizard_supporting,wizard_brand,wizard_preset,wizard_modules,wizard_required_modules,wizard_review_mode,wizard_review_required,wizard_routing,wizard_team],
+        [wizard_shell,project_id,project_title,sponsor,mechanism,project_status,agentic_global_notice,requirements_table,section,current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner,workspace_workflow_summary,workspace_workflow_status,interview_tab,team_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab,wizard_create_status,wizard_create_btn])
+    wizard_create_event.then(fn=None,inputs=[wizard_create_status],js=WIZARD_HIDE_AFTER_CREATE_JS,queue=False)
 
     create.click(gateway_callback(create_project),[project_title,sponsor,mechanism,source,source_url,source_text,supporting,brand],[project_id,project_status,agentic_global_notice,requirements_table,section])
+    compile_grant_ask_btn.click(gateway_callback(compile_grant_ask),[project_id],[requirements_table,req_status])
     approve_req.click(gateway_callback(approve_requirements),[project_id],[req_status])
     solicitation_form=[solicitation_working_title,solicitation_sponsor,solicitation_mechanism,solicitation_purpose,solicitation_facts,solicitation_criteria,solicitation_questions]
     solicitation_outputs=solicitation_form+[solicitation_version,solicitation_status,solicitation_artifact_json]
@@ -2241,9 +2491,6 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
     return_literature_btn.click(gateway_callback(lambda project,version,rationale:return_artifact_for_revision(project,"literature_manifest",version,rationale)),[project_id,literature_version,literature_return_reason],[literature_artifact_status,literature_artifact_json,workspace_workflow_status,literature_return_reason])
     team_workspace_outputs=[team_members,team_activity,project_invites,team_tasks,team_notifications,approval_routing_table,project_health_table,project_health_summary_md,task_owner,team_mentions,active_project_task,task_dependencies,active_project_invite,unread_notification_id,team_permissions,team_workspace_status,create_project_invite_btn,add_existing_member_btn,post_team_channel_btn,create_project_task_btn]
     refresh_team_workspace_btn.click(gateway_callback(load_team_workspace),[project_id],team_workspace_outputs)
-    collaboration_update_timer.tick(gateway_callback(poll_team_workspace),[project_id],[team_members,team_activity,project_invites,team_tasks,team_notifications,approval_routing_table,project_health_table,project_health_summary_md,team_workspace_status],show_progress="hidden")
-    collaboration_update_timer.tick(gateway_callback(poll_team_channel),[project_id,team_channel_kind,team_channel_subject],[team_channel_html,team_messages,team_channel_status],show_progress="hidden")
-    collaboration_update_timer.tick(gateway_callback(poll_shared_artifact_versions),[project_id,search_plan_version,literature_version],[shared_literature_sync_status],show_progress="hidden")
     load_team_channel_btn.click(gateway_callback(load_team_channel),[project_id,team_channel_kind,team_channel_subject],[team_channel_html,team_messages,team_reply_message_id,team_channel_status])
     post_team_channel_btn.click(gateway_callback(post_team_channel_message),[project_id,team_channel_kind,team_channel_subject,team_message_body,team_reply_message_id,team_mentions],[team_channel_html,team_messages,team_reply_message_id,team_channel_status,team_message_body])
     create_project_invite_btn.click(gateway_callback(create_project_invite_ui),[project_id,project_invite_email,project_invite_role,project_invite_days],[project_invite_status]+team_workspace_outputs)
@@ -2304,9 +2551,12 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
     send_account_reset_btn.click(gateway_callback(send_account_reset),[account_target_id],[account_admin_status])
     disable_account_btn.click(gateway_callback(lambda user_id:set_account_status(user_id,False)),[account_target_id],[accounts_table,account_admin_status])
     enable_account_btn.click(gateway_callback(lambda user_id:set_account_status(user_id,True)),[account_target_id],[accounts_table,account_admin_status])
-    competitive_update_timer.tick(gateway_callback(poll_competitive_updates),[project_id],[agentic_global_notice],show_progress="hidden")
+    refresh_shared_updates_btn.click(gateway_callback(refresh_shared_updates),[project_id,team_channel_kind,team_channel_subject,search_plan_version,literature_version,include_archived_projects],
+        [wizard_existing,recent,project_catalog_table,project_catalog_summary,team_members,team_activity,project_invites,team_tasks,team_notifications,approval_routing_table,project_health_table,project_health_summary_md,team_workspace_status,team_channel_html,team_messages,team_channel_status,shared_literature_sync_status,requirements_table,req_status,workspace_workflow_summary,workspace_workflow_status,interview_tab,team_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab,manual_refresh_status])
     demo.load(gateway_callback(project_catalog),[include_archived_projects],[recent,project_catalog_table,project_catalog_summary],show_progress="hidden")
     demo.load(gateway_callback(refresh_projects),outputs=[wizard_existing],show_progress="hidden")
+    demo.load(gateway_callback(authenticated_identity),outputs=[wizard_owner_id,wizard_identity_status],show_progress="hidden")
+    demo.load(fn=None,js=WIZARD_CREATE_CLICK_JS,queue=False)
 
 APP_THEME=gr.themes.Base(primary_hue=gr.themes.colors.purple,secondary_hue=gr.themes.colors.fuchsia,neutral_hue=gr.themes.colors.gray)
 
@@ -2363,6 +2613,13 @@ def _login_fields(username=""):
 
 def build_internal_account_app():
     web=FastAPI(title="Grantspace")
+
+    @web.get("/manifest.json",include_in_schema=False)
+    async def web_manifest():
+        return JSONResponse({"name":"Grantspace","short_name":"Grantspace","start_url":"/","scope":"/","display":"standalone","background_color":"#0d0b14","theme_color":"#0d0b14","icons":[]})
+
+    @web.get("/favicon.ico",include_in_schema=False)
+    async def favicon():return Response(status_code=204)
 
     @web.get("/")
     async def root(request:Request):

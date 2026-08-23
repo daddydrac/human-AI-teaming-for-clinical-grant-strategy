@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 CORE_URL="${CORE_URL:-http://localhost:8080}" python3 - <<'PY'
-import json, os, uuid
+import json, os, sys, uuid
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 core=os.environ['CORE_URL'].rstrip('/')
+access_token=os.environ.get('SMOKE_ACCESS_TOKEN','').strip()
 
 def call(method,path,payload=None,key=None,expected=(200,)):
     raw=None if payload is None else json.dumps(payload,separators=(',',':'),sort_keys=True).encode()
     headers={'accept':'application/json'}
+    if access_token: headers['authorization']=f'Bearer {access_token}'
     if raw is not None: headers['content-type']='application/json'
     if method not in {'GET','HEAD','OPTIONS'}: headers['idempotency-key']=key or str(uuid.uuid4())
     request=Request(core+path,data=raw,headers=headers,method=method)
@@ -25,7 +27,14 @@ def call(method,path,payload=None,key=None,expected=(200,)):
 print('[1/10] service health and workflow registry')
 _,health,_=call('GET','/health')
 assert health['status']=='ok'
-_,registry,_=call('GET','/api/workflow-definitions')
+_,ready,_=call('GET','/health/ready')
+assert ready['status']=='ready' and ready['model']['ok'] and ready['embedding']['ok']
+registry_status,registry,_=call('GET','/api/workflow-definitions',expected=(200,401))
+if registry_status==401:
+    _,bootstrap,_=call('GET','/api/auth/bootstrap/status')
+    assert isinstance(bootstrap.get('bootstrap_required'),bool)
+    print('Public pre-login smoke test passed; set SMOKE_ACCESS_TOKEN to run the authenticated project mutation suite.')
+    sys.exit(0)
 assert len(registry['core_steps'])==5 and registry['optional_modules']
 
 print('[2/10] create a lean composable project with an idempotent request')

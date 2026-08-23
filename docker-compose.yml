@@ -44,6 +44,7 @@ services:
       HOME: /tmp
     volumes:
       - grant-embedding-models:/models
+      - ./embedding_cpu/app.py:/app/app.py:ro
     ports: ["127.0.0.1:8010:8010"]
     mem_limit: ${EMBEDDING_MEMORY_LIMIT:-768m}
     cpus: ${EMBEDDING_CPU_LIMIT:-2.0}
@@ -75,6 +76,8 @@ services:
       RESEARCH_USER_AGENT: ${RESEARCH_USER_AGENT:-ClinicalGrantWorkbench/0.8.0}
       PYTHONDONTWRITEBYTECODE: "1"
       HOME: /tmp
+    volumes:
+      - ./ingestion/app.py:/app/app.py:ro
     mem_limit: ${INGESTION_MEMORY_LIMIT:-1g}
     cpus: ${INGESTION_CPU_LIMIT:-1.5}
     pids_limit: 384
@@ -186,7 +189,7 @@ services:
       ingestion:
         condition: service_healthy
     volumes:
-      - grant-data:/workspace
+      - ${GRANT_DATA_HOME:-./.grantspace-data}:/workspace
       - ./config:/app/config:ro
     ports: ["127.0.0.1:8080:8080"]
     extra_hosts: ["host.docker.internal:host-gateway"]
@@ -222,7 +225,8 @@ services:
       PYTHONDONTWRITEBYTECODE: "1"
       HOME: /tmp
     volumes:
-      - grant-data:/workspace
+      - ${GRANT_DATA_HOME:-./.grantspace-data}:/workspace
+      - ./renderer/app.py:/app/app.py:ro
       - ./config:/app/config:ro
       - ${GRANT_EXPORT_HOME:-./exports}:/exports
     ports: ["127.0.0.1:8090:8090"]
@@ -272,7 +276,8 @@ services:
       renderer:
         condition: service_healthy
     volumes:
-      - grant-data:/workspace
+      - ${GRANT_DATA_HOME:-./.grantspace-data}:/workspace
+      - ./ui/app.py:/app/app.py:ro
       - ./config:/app/config:ro
       - ${GRANT_EXPORT_HOME:-./exports}:/exports
     ports: ["127.0.0.1:7860:7860"]
@@ -290,6 +295,5 @@ services:
       options: {max-size: "10m", max-file: "3"}
 
 volumes:
-  grant-data:
   grant-embedding-models:
   grant-ollama-models:

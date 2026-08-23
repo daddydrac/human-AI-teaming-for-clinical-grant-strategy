@@ -12,6 +12,7 @@ backups/
 benchmarks/
 releases/
 workspace/
+.grantspace-data/
 *.db
 *.sqlite
 .DS_Store

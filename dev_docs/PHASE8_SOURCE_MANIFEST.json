@@ -37,7 +37,7 @@
     "signed_release_supported": true
   },
   "runtime_defaults": {
-    "apple_silicon_profile": "apple_mlx",
+    "apple_silicon_profile": "container_ollama",
     "competitive_refresh_seconds": 14400,
     "ports": {
       "core": 8080,

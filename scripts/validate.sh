@@ -12,7 +12,7 @@ for rel in ('ui/app.py','renderer/app.py','embedding_cpu/app.py','ingestion/app.
 print('Python syntax validation passed.')
 PYSYNTAX
 ( set -a; source "$ROOT/.env.example"; set +a; test -n "$ORGANIZATION_NAME"; test -n "$GRANT_SECTIONS"; test -n "$COMPETITIVE_UPDATE_LABEL" )
-bash -n "$ROOT/start.sh" "$ROOT/stop.sh" "$ROOT/scripts/configure_runtime.sh" "$ROOT/scripts/tune_mac.sh" "$ROOT/scripts/start_mlx.sh" "$ROOT/scripts/smoke_test.sh" "$ROOT/scripts/preflight.sh"
+bash -n "$ROOT/start.sh" "$ROOT/stop.sh" "$ROOT/scripts/configure_runtime.sh" "$ROOT/scripts/ensure_admin_setup_token.sh" "$ROOT/scripts/tune_mac.sh" "$ROOT/scripts/start_mlx.sh" "$ROOT/scripts/smoke_test.sh" "$ROOT/scripts/preflight.sh"
 if [[ "$(uname -s)" == "Darwin" ]]; then
   echo "Native OpenMP/OpenBLAS syntax check runs in the pinned Linux builder on macOS."
 else
@@ -215,7 +215,7 @@ PYM2
 
 if command -v docker >/dev/null 2>&1; then
   (cd "$ROOT" && docker compose config >/dev/null && docker compose --profile cpu-embedding --profile local-model config >/dev/null && docker build --target test -f Dockerfile.core . && docker compose build)
-  (cd "$ROOT" && docker compose run --rm --no-deps -e AUTH_MODE=local_single_user ui python - <<'PYCOLLAB'
+  (cd "$ROOT" && docker compose run --rm -T --no-deps -e AUTH_MODE=local_single_user ui python - <<'PYCOLLAB'
 import app,inspect
 assert hasattr(app,'load_team_workspace') and hasattr(app,'post_artifact_comment')
 assert hasattr(app,'poll_team_workspace') and hasattr(app,'poll_team_channel') and hasattr(app,'poll_shared_artifact_versions')

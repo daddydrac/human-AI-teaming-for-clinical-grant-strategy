@@ -1,60 +1,96 @@
 # Quickstart
 
-## M4 with Claude + OLMo 3
+Run commands from the repository directory. `./install.sh` installs/starts
+Docker Desktop when needed, downloads the selected model, builds missing
+containers, starts the application, and opens the GUI. It uses fast startup
+checks so you can validate behavior in the GUI without first running the full
+release test suite.
 
-Add the Anthropic key in `env.m4Mac.txt`, then:
-
-```bash
-brew install uv
-cp env.m4Mac.txt .env
-./install.sh
-./start.sh
-```
-
-## M4 with Claude + Qwen 3
-
-Add the Anthropic key in `env.m4Mac.qwen3.txt`, then:
-
-```bash
-brew install uv
-cp env.m4Mac.qwen3.txt .env
-./install.sh
-./start.sh
-```
-
-## M2 with 8 GB, local only
-
-Install Ollama for macOS from <https://ollama.com/download/mac>, then:
+## M2, 8 GB, local Qwen 3
 
 ```bash
 cp env.m2Mac.8gb.txt .env
 ./install.sh
-./start.sh
+awk -F= '$1=="INITIAL_ADMIN_SETUP_TOKEN" {print $2}' .env
+open http://localhost:7860/setup
 ```
 
-The first start downloads `qwen3:1.7b`. For higher-stakes sponsor analysis and
-scientific review on the M2, switch the same template to `MODEL_ROUTING_MODE=hybrid`,
-set `REQUIRE_CLAUDE_IN_HYBRID=true`, and provide `ANTHROPIC_API_KEY`.
+Run each line separately. Paste the plain URL exactly as shown; do not paste
+Markdown link syntax such as `[http://...](http://...)` into the shell.
 
-## Shared enterprise server with OIDC
+In the GUI, paste the displayed setup token and enter the initial administrator
+username, email, and temporary password. Sign in with that username and temporary
+password; the GUI immediately requires a permanent password.
 
-Register an OIDC client whose callback is
-`https://YOUR_HOST:8443/oauth2/callback`. Copy `.env.example` to `.env` and set
-the `OIDC_*` values, including an explicit email-domain allowlist, an immutable
-subject claim (normally `sub`), a stable organization ID, the client-secret file,
-and institution-issued TLS certificate/key files. Then run:
+## M4, 24 GB, Ollama OLMo 3 + Claude
 
 ```bash
-./scripts/start_oidc_gateway.sh
+cp env.m4Mac.txt .env
+open -W -a TextEdit .env
+./install.sh
+awk -F= '$1=="INITIAL_ADMIN_SETUP_TOKEN" {print $2}' .env
+open http://localhost:7860/setup
 ```
 
-This profile publishes only the TLS gateway. Core, UI, renderer, ingestion, and
-embedding ports remain private. The startup preflight validates OIDC discovery,
-PKCE support, secret files, the certificate/key pair, and the resolved Compose
-isolation policy before starting services. It generates the OAuth session secret
-and the internal gateway-proof secret on first use when their configured paths do
-not yet exist.
+Before closing TextEdit, set `ANTHROPIC_API_KEY` in `.env`. In the GUI, paste the
+displayed setup token and enter the initial administrator username, email, and
+temporary password. Sign in with that username and temporary password; the GUI
+immediately requires a permanent password.
 
-For a SAML-based institutional gateway, deploy that gateway in place of OAuth2
-Proxy and implement the trusted-header contract in
-`dev_docs/ADR_003_IDENTITY_AND_SHARED_DEPLOYMENT.md`.
+## M4, 24 GB, Ollama Qwen 3 + Claude
+
+```bash
+cp env.m4Mac.qwen3.txt .env
+open -W -a TextEdit .env
+./install.sh
+awk -F= '$1=="INITIAL_ADMIN_SETUP_TOKEN" {print $2}' .env
+open http://localhost:7860/setup
+```
+
+Before closing TextEdit, set `ANTHROPIC_API_KEY` in `.env`. Complete the same
+first-administrator and mandatory first-password-change screens in the GUI.
+
+## Later starts
+
+```bash
+./start.sh
+open http://localhost:7860/login
+```
+
+## Test application-code changes
+
+The Python application files are bind-mounted into their containers. After
+editing UI, renderer, ingestion, or embedding code, restart only the affected
+service; rebuilding is unnecessary when dependencies did not change:
+
+```bash
+docker compose restart ui
+open http://localhost:7860/login
+```
+
+Use the corresponding service name for other Python services:
+
+```bash
+docker compose restart renderer
+docker compose restart ingestion
+docker compose restart embedding-cpu
+```
+
+Rust core changes and dependency-file changes must be rebuilt:
+
+```bash
+REBUILD=1 ./start.sh
+```
+
+The optional full build/test/release validation remains available for every
+hardware profile:
+
+```bash
+RUN_FULL_VALIDATION=true START_AFTER_INSTALL=false ./install.sh
+```
+
+## Stop without deleting grants or models
+
+```bash
+./stop.sh
+```

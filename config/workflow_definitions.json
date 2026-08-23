@@ -205,6 +205,7 @@
     }
   ],
   "presets": [
+    {"key": "custom_configuration_v1", "title": "Custom configuration (choose modules yourself)", "enabled_modules": [], "required_modules": []},
     {"key": "lean_research_v1", "title": "Lean research proposal", "enabled_modules": [], "required_modules": []},
     {"key": "clinical_study_v1", "title": "Clinical study", "enabled_modules": ["investigator_interview", "clinical_design", "sponsor_compliance", "team_collaboration"], "required_modules": ["investigator_interview", "clinical_design", "sponsor_compliance"]},
     {"key": "full_institutional_v1", "title": "Full institutional submission", "enabled_modules": ["opportunity_fit", "investigator_interview", "clinical_design", "institutional_memory", "competitive_intelligence", "sponsor_compliance", "review_simulator", "team_collaboration", "task_automation", "advanced_workbench"], "required_modules": ["investigator_interview", "clinical_design", "sponsor_compliance", "team_collaboration"]},

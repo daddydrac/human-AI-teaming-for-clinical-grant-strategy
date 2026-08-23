@@ -397,7 +397,10 @@ async fn main() -> anyhow::Result<()> {
         CompetitiveEngine::from_env(research.clone(), embedding.clone(), router.clone())?;
     let competitive_locks = Arc::new(ParkingMutex::new(HashMap::new()));
     let auth=AuthSettings::from_env()?;
-    let email=EmailSettings::from_env(auth.mode=="internal_accounts")?;
+    // Internal accounts remain usable for local evaluation without an SMTP relay.
+    // Email-backed account delivery and password reset fail closed at their
+    // endpoints until SMTP is configured; they must not prevent the stack from starting.
+    let email=EmailSettings::from_env(false)?;
     let state = AppState {
         store,
         router,
@@ -880,9 +883,12 @@ async fn admin_create_user(State(s):State<AppState>,Extension(user):Extension<Au
     s.auth.password_policy.validate(&req.temporary_password,&username,&email).map_err(|error|ApiError::bad_request(error.to_string()))?;
     let display_name=req.display_name.as_deref().map(str::trim).filter(|value|!value.is_empty()).unwrap_or(&username);
     let account=s.store.create_internal_user(&user.id,&user.organization_id,&username,&email,display_name,&auth::hash_password(&req.temporary_password)?).map_err(|error|ApiError::conflict(error.to_string()))?;
-    let email_settings=s.email.clone().context("SMTP delivery is not configured").map_err(ApiError::from)?;let address=account.email.clone();let temporary_password=req.temporary_password.clone();let mail_username=account.username.clone();
-    let delivery=tokio::task::spawn_blocking(move||email_settings.send_new_account(&address,&mail_username,&temporary_password)).await.map_err(|error|ApiError::bad_gateway(error.to_string()))?;
-    Ok(Json(serde_json::json!({"created":true,"email_sent":delivery.is_ok(),"delivery_error":delivery.err().map(|error|error.to_string()),"user":{"id":account.id,"username":account.username,"email":account.email,"display_name":account.display_name,"system_role":account.system_role,"must_change_password":true}})))
+    let (email_sent,delivery_error)=if let Some(email_settings)=s.email.clone(){
+        let address=account.email.clone();let temporary_password=req.temporary_password.clone();let mail_username=account.username.clone();
+        let delivery=tokio::task::spawn_blocking(move||email_settings.send_new_account(&address,&mail_username,&temporary_password)).await.map_err(|error|ApiError::bad_gateway(error.to_string()))?;
+        (delivery.is_ok(),delivery.err().map(|error|error.to_string()))
+    }else{(false,Some("SMTP delivery is not configured; provide the temporary password to the user through an approved channel and configure SMTP before enabling email resets".to_owned()))};
+    Ok(Json(serde_json::json!({"created":true,"email_sent":email_sent,"delivery_error":delivery_error,"user":{"id":account.id,"username":account.username,"email":account.email,"display_name":account.display_name,"system_role":account.system_role,"must_change_password":true}})))
 }
 
 async fn admin_disable_user(State(s):State<AppState>,Extension(user):Extension<AuthUser>,Path(user_id):Path<String>)->Result<Json<serde_json::Value>,ApiError>{require_internal_mode(&s)?;require_system_admin(&user)?;s.store.set_internal_user_active(&user.id,&user_id,false).map_err(|error|ApiError::bad_request(error.to_string()))?;Ok(Json(serde_json::json!({"disabled":true,"user_id":user_id})))}

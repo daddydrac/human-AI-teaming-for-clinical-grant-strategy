@@ -15,18 +15,11 @@ if [[ ! -f .env ]]; then
   cp "$TEMPLATE" .env
   echo "Created .env from $TEMPLATE."
 fi
+./scripts/ensure_admin_setup_token.sh .env
 set -a
 source .env
 set +a
-if [[ "${AUTH_MODE:-internal_accounts}" == "internal_accounts" && -z "${INITIAL_ADMIN_SETUP_TOKEN:-}" ]]; then
-  command -v openssl >/dev/null 2>&1 || { echo "ERROR: openssl is required to generate the one-time administrator setup token." >&2; exit 3; }
-  INITIAL_ADMIN_SETUP_TOKEN="$(openssl rand -hex 32)"
-  export INITIAL_ADMIN_SETUP_TOKEN
-  printf '\nINITIAL_ADMIN_SETUP_TOKEN=%s\n' "$INITIAL_ADMIN_SETUP_TOKEN" >> .env
-  echo "Generated the one-time initial administrator setup token and saved it in .env."
-  echo "Enter this token on the first-start setup screen: $INITIAL_ADMIN_SETUP_TOKEN"
-fi
-mkdir -p "${GRANT_EXPORT_HOME:-./exports}"
+mkdir -p "${GRANT_DATA_HOME:-$ROOT/.grantspace-data}" "${GRANT_EXPORT_HOME:-./exports}"
 
 ./scripts/bootstrap_dependencies.sh
 
@@ -63,6 +56,11 @@ if [[ "${REBUILD:-0}" == "1" ]]; then
 else
   docker compose up -d
 fi
+# Refresh the two configuration-consuming entry services sequentially so
+# credentials and routing changed in .env cannot remain stale. --no-deps avoids
+# Docker Desktop races while Ollama or another large dependency is already up.
+docker compose up -d --no-deps --force-recreate core
+docker compose up -d --no-deps --force-recreate ui
 
 for _ in $(seq 1 60); do
   curl -fsS http://127.0.0.1:7860 >/dev/null 2>&1 && break

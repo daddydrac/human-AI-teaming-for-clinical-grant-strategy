@@ -16,8 +16,9 @@ if [[ ! -f .env ]]; then
   cp "$TEMPLATE" .env
   echo "Created .env from $TEMPLATE; review its routing and credential settings before startup."
 fi
+./scripts/ensure_admin_setup_token.sh .env
 set -a; source .env; set +a
-mkdir -p "${GRANT_EXPORT_HOME:-$ROOT/exports}" "${BACKUP_DIR:-$ROOT/backups}" "${BENCHMARK_OUTPUT_DIR:-$ROOT/benchmarks}" "${RELEASE_DIR:-$ROOT/releases}"
+mkdir -p "${GRANT_DATA_HOME:-$ROOT/.grantspace-data}" "${GRANT_EXPORT_HOME:-$ROOT/exports}" "${BACKUP_DIR:-$ROOT/backups}" "${BENCHMARK_OUTPUT_DIR:-$ROOT/benchmarks}" "${RELEASE_DIR:-$ROOT/releases}"
 FREE_KB="$(df -Pk "$ROOT" | awk 'NR==2{print $4}')"
 if [[ "${FREE_KB:-0}" -lt 10485760 ]]; then echo "WARNING: less than 10 GB free disk space is available; model/container installation may fail." >&2; fi
 ./scripts/bootstrap_dependencies.sh
@@ -25,7 +26,14 @@ if [[ "${FREE_KB:-0}" -lt 10485760 ]]; then echo "WARNING: less than 10 GB free 
 set -a; source .runtime.env; set +a
 command -v docker >/dev/null 2>&1 || { echo "ERROR: automatic Docker Desktop installation did not provide the Docker CLI." >&2; exit 3; }
 docker info >/dev/null 2>&1 || { echo "ERROR: Docker Desktop is installed but its daemon is not running." >&2; exit 4; }
-./scripts/validate.sh
+if [[ "${RUN_FULL_VALIDATION:-false}" == "true" ]]; then
+  echo "Running the full build, test, and release validation suite..."
+  ./scripts/validate.sh
+else
+  python3 -m py_compile ui/app.py renderer/app.py embedding_cpu/app.py ingestion/app.py
+  docker compose config >/dev/null
+  echo "Fast installation checks passed. Full validation was skipped; set RUN_FULL_VALIDATION=true to run it."
+fi
 echo
 printf 'Installation/bootstrap complete.\nRuntime profile: %s\n' "$GRANT_RUNTIME_PROFILE"
 if [[ "${START_AFTER_INSTALL:-true}" == "true" ]]; then

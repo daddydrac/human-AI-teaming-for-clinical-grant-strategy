@@ -300,7 +300,7 @@ For an **Apple Silicon Mac**, it is strongly recommended.
 The system can use:
 
 ```text
-OLMo 3 locally through MLX
+OLMo 3 or Qwen 3 in containerized Ollama
 +
 Claude selectively for higher-value tasks
 ```
@@ -521,11 +521,10 @@ For enterprise use, prefer a service/team account instead of an individual's per
 
 ---
 
-# 6. OLMo 3 on Apple MLX
+# 6. Containerized local model
 
-These settings apply primarily to supported Apple-Silicon Macs.
-
-Intel Macs automatically use the CPU/Claude deployment profile instead.
+The supported local runtime is the pinned Ollama Docker image. Model weights
+are retained in the `grant-ollama-models` Docker volume.
 
 ---
 
@@ -537,7 +536,8 @@ OLMO_MODEL_REPO=mlx-community/Olmo-3-7B-Instruct-4bit
 
 ### What it does
 
-Specifies the MLX-compatible OLMo model repository.
+Legacy compatibility setting; the supported deployment selects an Ollama model
+with `LOCAL_LLM_API_MODEL` instead.
 
 ### Recommended
 
@@ -613,7 +613,8 @@ VLLM_MLX_VERSION=0.4.1
 
 ### What it does
 
-Pins the native Apple MLX model-serving runtime.
+Legacy external-adapter setting. It is not installed or used by the supported
+containerized deployment.
 
 ### Recommended
 
@@ -661,7 +662,7 @@ OLMO_MAX_TOKENS=4096
 
 ---
 
-# 7. Apple-Silicon Embedding Model
+# 7. Containerized embedding model
 
 ## `EMBEDDING_MODEL_REPO`
 
@@ -671,7 +672,8 @@ EMBEDDING_MODEL_REPO=mlx-community/all-MiniLM-L6-v2-4bit
 
 ### What it does
 
-Defines the local MLX embedding model used for semantic retrieval.
+Legacy external-adapter setting. The supported `embedding-cpu` container uses
+`CPU_EMBEDDING_MODEL=BAAI/bge-small-en-v1.5`.
 
 ### Recommended
 
@@ -686,7 +688,7 @@ Do not change the embedding model casually because doing so changes the semantic
 ## `EMBEDDING_API_MODEL`
 
 ```bash
-EMBEDDING_API_MODEL=grant-embedding
+EMBEDDING_API_MODEL=grant-embedding-cpu
 ```
 
 Stable API alias for the embedding service.
@@ -694,7 +696,7 @@ Stable API alias for the embedding service.
 ### Recommended
 
 ```bash
-EMBEDDING_API_MODEL=grant-embedding
+EMBEDDING_API_MODEL=grant-embedding-cpu
 ```
 
 ---
@@ -724,18 +726,19 @@ EMBEDDING_MODEL_REVISION=<tested-commit-sha>
 ## `EMBEDDING_URL`
 
 ```bash
-EMBEDDING_URL=http://host.docker.internal:8000/v1/embeddings
+EMBEDDING_URL=http://embedding-cpu:8010/v1/embeddings
 ```
 
 ### What it does
 
-Allows the Dockerized Rust backend to communicate with the native macOS MLX embedding server.
+Allows the Dockerized Rust backend to communicate with the CPU embedding
+container on the private Compose network.
 
 ### Recommended
 
 Leave unchanged.
 
-The weak-Mac profile automatically switches to the Docker CPU embedding service.
+Both M2 and M4 templates use this Docker service.
 
 ---
 
