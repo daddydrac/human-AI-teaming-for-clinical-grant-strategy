@@ -171,47 +171,52 @@ PYPH7
 fi
 
 TMP="$(mktemp)"; TMP_M4="$(mktemp)"; TMP_M2="$(mktemp)"; trap 'rm -f "$TMP" "$TMP_M4" "$TMP_M2"' EXIT
-GRANT_RUNTIME_PROFILE=docker_cpu "$ROOT/scripts/configure_runtime.sh" "$TMP" >/dev/null
+GRANT_RUNTIME_PROFILE=docker_cpu MODEL_ROUTING_MODE=claude_only "$ROOT/scripts/configure_runtime.sh" "$TMP" >/dev/null
 grep -q '^COMPOSE_PROFILES=cpu-embedding$' "$TMP"
 grep -q '^MODEL_ROUTING_MODE=claude_only$' "$TMP"
 grep -q '^EMBEDDING_URL=http://embedding-cpu:8010/v1/embeddings$' "$TMP"
 grep -q '^OMP_NUM_THREADS=' "$TMP"
-GRANT_RUNTIME_PROFILE=container_ollama LOCAL_LLM_API_MODEL=olmo-3:7b-instruct-q4_K_M "$ROOT/scripts/configure_runtime.sh" "$TMP_M4" >/dev/null
+GRANT_RUNTIME_OS_OVERRIDE=Darwin GRANT_RUNTIME_ARCH_OVERRIDE=arm64 GRANT_RUNTIME_PROFILE=apple_ollama MODEL_ROUTING_MODE=local_only LOCAL_LLM_API_MODEL=olmo-3:7b-instruct-q4_K_M "$ROOT/scripts/configure_runtime.sh" "$TMP_M4" >/dev/null
 python3 - "$ROOT/env.m4Mac.txt" "$ROOT/env.m4Mac.qwen3.txt" "$TMP_M4" <<'PYM4'
 import sys
 def values(path):
     return dict(line.strip().split('=',1) for line in open(path) if '=' in line and not line.lstrip().startswith('#'))
 template,qwen,runtime=map(values,sys.argv[1:])
-assert template['GRANT_RUNTIME_PROFILE']=='container_ollama'
-assert template['MODEL_ROUTING_MODE']=='hybrid'
-assert template['REQUIRE_CLAUDE_IN_HYBRID']=='true'
+assert template['GRANT_RUNTIME_PROFILE']=='apple_ollama'
+assert template['MODEL_ROUTING_MODE']=='local_only'
+assert template['REQUIRE_CLAUDE_IN_HYBRID']=='false'
 assert template['OMP_NUM_THREADS']==template['RAYON_NUM_THREADS']=='8'
 assert float(template['CORE_CPU_LIMIT'])>=int(template['OMP_NUM_THREADS'])
-assert qwen['GRANT_RUNTIME_PROFILE']=='container_ollama'
-assert qwen['MODEL_ROUTING_MODE']=='hybrid'
-assert qwen['REQUIRE_CLAUDE_IN_HYBRID']=='true'
+assert qwen['GRANT_RUNTIME_PROFILE']=='apple_ollama'
+assert qwen['MODEL_ROUTING_MODE']=='local_only'
+assert qwen['REQUIRE_CLAUDE_IN_HYBRID']=='false'
 assert qwen['LOCAL_LLM_PROVIDER']=='ollama' and qwen['LOCAL_LLM_API_MODEL']=='qwen3:8b'
-assert runtime['COMPOSE_PROFILES']=='cpu-embedding,local-model'
-assert runtime['LOCAL_LLM_URL']=='http://ollama:11434/v1/chat/completions'
+assert runtime['COMPOSE_PROFILES']=='cpu-embedding'
+assert runtime['LOCAL_LLM_URL']=='http://host.docker.internal:11434/v1/chat/completions'
 assert runtime['OMP_NUM_THREADS']==runtime['RAYON_NUM_THREADS']
 assert float(runtime['CORE_CPU_LIMIT'])>=int(runtime['OMP_NUM_THREADS'])
 PYM4
-GRANT_RUNTIME_PROFILE=container_ollama MODEL_ROUTING_MODE=local_only LOCAL_LLM_API_MODEL=qwen3:1.7b "$ROOT/scripts/configure_runtime.sh" "$TMP_M2" >/dev/null
+GRANT_RUNTIME_OS_OVERRIDE=Darwin GRANT_RUNTIME_ARCH_OVERRIDE=arm64 GRANT_RUNTIME_PROFILE=apple_ollama MODEL_ROUTING_MODE=local_only LOCAL_LLM_API_MODEL=qwen3:1.7b "$ROOT/scripts/configure_runtime.sh" "$TMP_M2" >/dev/null
 python3 - "$ROOT/env.m2Mac.8gb.txt" "$TMP_M2" <<'PYM2'
 import sys
 def values(path):
     return dict(line.strip().split('=',1) for line in open(path) if '=' in line and not line.lstrip().startswith('#'))
 template,runtime=map(values,sys.argv[1:])
-assert template['GRANT_RUNTIME_PROFILE']=='container_ollama'
+assert template['GRANT_RUNTIME_PROFILE']=='apple_ollama'
 assert template['MODEL_ROUTING_MODE']=='local_only'
 assert template['LOCAL_LLM_API_MODEL']=='qwen3:1.7b'
 assert template['OLLAMA_CONTEXT_LENGTH']=='4096'
-assert runtime['COMPOSE_PROFILES']=='cpu-embedding,local-model'
+assert runtime['COMPOSE_PROFILES']=='cpu-embedding'
 assert runtime['LOCAL_LLM_PROVIDER']=='ollama'
 assert runtime['LOCAL_LLM_API_MODEL']=='qwen3:1.7b'
 assert int(runtime['CONTEXT_MAX_CHARS'])<=8000
 assert int(runtime['OMP_NUM_THREADS'])<=2
 PYM2
+
+GRANT_RUNTIME_OS_OVERRIDE=Linux GRANT_RUNTIME_ARCH_OVERRIDE=x86_64 GRANT_RUNTIME_PROFILE=linux_nvidia_ollama MODEL_ROUTING_MODE=hybrid LOCAL_LLM_API_MODEL=qwen3:8b "$ROOT/scripts/configure_runtime.sh" "$TMP_M4" >/dev/null
+grep -q '^COMPOSE_PROFILES=cpu-embedding,local-model$' "$TMP_M4"
+grep -q '^LOCAL_LLM_URL=http://ollama:11434/v1/chat/completions$' "$TMP_M4"
+grep -q '^REQUIRE_CLAUDE_IN_HYBRID=true$' "$TMP_M4"
 
 if command -v docker >/dev/null 2>&1; then
   (cd "$ROOT" && docker compose config >/dev/null && docker compose --profile cpu-embedding --profile local-model config >/dev/null && docker build --target test -f Dockerfile.core . && docker compose build)

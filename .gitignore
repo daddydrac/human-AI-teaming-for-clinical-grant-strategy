@@ -13,6 +13,7 @@ benchmarks/
 releases/
 workspace/
 .grantspace-data/
+.grantspace-build/
 *.db
 *.sqlite
 .DS_Store

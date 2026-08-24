@@ -1,12 +1,10 @@
 # Quickstart
 
-Run commands from the repository directory. `./install.sh` installs/starts
-Docker Desktop when needed, downloads the selected model, builds missing
-containers, starts the application, and opens the GUI. It uses fast startup
-checks so you can validate behavior in the GUI without first running the full
-release test suite.
+Run one profile from the repository directory. The installer installs host
+dependencies, generates the first-administrator token, prepares the model,
+builds the application containers, and starts the GUI.
 
-## M2, 8 GB, local Qwen 3
+## Apple M2, 8 GB
 
 ```bash
 cp env.m2Mac.8gb.txt .env
@@ -15,82 +13,104 @@ awk -F= '$1=="INITIAL_ADMIN_SETUP_TOKEN" {print $2}' .env
 open http://localhost:7860/setup
 ```
 
-Run each line separately. Paste the plain URL exactly as shown; do not paste
-Markdown link syntax such as `[http://...](http://...)` into the shell.
+This runs Qwen 3 1.7B in native Ollama with Apple Metal. The application and
+embedding services remain in Docker.
 
-In the GUI, paste the displayed setup token and enter the initial administrator
-username, email, and temporary password. Sign in with that username and temporary
-password; the GUI immediately requires a permanent password.
-
-## M4, 24 GB, Ollama OLMo 3 + Claude
-
-```bash
-cp env.m4Mac.txt .env
-open -W -a TextEdit .env
-./install.sh
-awk -F= '$1=="INITIAL_ADMIN_SETUP_TOKEN" {print $2}' .env
-open http://localhost:7860/setup
-```
-
-Before closing TextEdit, set `ANTHROPIC_API_KEY` in `.env`. In the GUI, paste the
-displayed setup token and enter the initial administrator username, email, and
-temporary password. Sign in with that username and temporary password; the GUI
-immediately requires a permanent password.
-
-## M4, 24 GB, Ollama Qwen 3 + Claude
+## Apple M4, 24 GB
 
 ```bash
 cp env.m4Mac.qwen3.txt .env
-open -W -a TextEdit .env
 ./install.sh
 awk -F= '$1=="INITIAL_ADMIN_SETUP_TOKEN" {print $2}' .env
 open http://localhost:7860/setup
 ```
 
-Before closing TextEdit, set `ANTHROPIC_API_KEY` in `.env`. Complete the same
-first-administrator and mandatory first-password-change screens in the GUI.
+This runs Qwen 3 8B in native Ollama with Apple Metal.
+
+## Linux x86-64 with NVIDIA GPU
+
+Start from an NVIDIA-enabled Linux image whose host driver is already working
+(`nvidia-smi` must succeed), then run:
+
+```bash
+cp env.linux.nvidia.txt .env
+./install.sh
+awk -F= '$1=="INITIAL_ADMIN_SETUP_TOKEN" {print $2}' .env
+```
+
+Open `http://SERVER_IP:7860/setup`. The installer adds Docker and NVIDIA
+Container Toolkit when missing. If it installs Docker for the first time, start
+a new login shell and rerun `./install.sh` when prompted.
+
+For a cloud VM, set these values in `.env` before startup:
+
+```bash
+APP_BIND_ADDRESS=0.0.0.0
+APP_PUBLIC_URL=http://SERVER_IP:7860
+```
+
+## Model routing
+
+Each hardware template defaults to local-only operation. To use local Qwen plus
+Claude, edit `.env` before `./install.sh`:
+
+```bash
+MODEL_ROUTING_MODE=hybrid
+ANTHROPIC_API_KEY=your_key
+```
+
+To use only Claude and skip local model startup/download:
+
+```bash
+MODEL_ROUTING_MODE=claude_only
+ANTHROPIC_API_KEY=your_key
+```
+
+Accepted routing values are `local_only`, `hybrid`, and `claude_only`. Startup
+rejects hybrid or Claude-only configuration when the Claude key is blank.
+
+## First login
+
+Paste the printed setup token into the setup page and enter the initial
+administrator username, email, and temporary password. Sign in with that
+username and temporary password; the GUI immediately requires a permanent
+password.
 
 ## Later starts
 
 ```bash
 ./start.sh
-open http://localhost:7860/login
 ```
 
-## Test application-code changes
+Open `http://localhost:7860/login` on a local Mac, or the configured
+`APP_PUBLIC_URL` for a Linux VM.
 
-The Python application files are bind-mounted into their containers. After
-editing UI, renderer, ingestion, or embedding code, restart only the affected
-service; rebuilding is unnecessary when dependencies did not change:
+## Apply application-code changes
+
+Python application code is bind-mounted. Restart only the changed service:
 
 ```bash
 docker compose restart ui
-open http://localhost:7860/login
 ```
 
-Use the corresponding service name for other Python services:
-
-```bash
-docker compose restart renderer
-docker compose restart ingestion
-docker compose restart embedding-cpu
-```
-
-Rust core changes and dependency-file changes must be rebuilt:
-
-```bash
-REBUILD=1 ./start.sh
-```
-
-The optional full build/test/release validation remains available for every
-hardware profile:
-
-```bash
-RUN_FULL_VALIDATION=true START_AFTER_INSTALL=false ./install.sh
-```
+Use `renderer`, `ingestion`, or `embedding-cpu` instead of `ui` when applicable.
+`./start.sh` fingerprints Rust API inputs and rebuilds the core automatically.
 
 ## Stop without deleting grants or models
 
 ```bash
 ./stop.sh
 ```
+
+On macOS, this stops native Ollama only if Grantspace started that exact process.
+An externally managed Ollama service is left running.
+
+## Start completely fresh
+
+```bash
+./reset-local-data.sh
+./start.sh
+```
+
+Open `http://localhost:7860/setup`. The reset moves existing application data to
+`backups/local-resets/`, prints a new setup token, and preserves model downloads.

@@ -1,6 +1,6 @@
 # Clinical Grant Workbench
 
-Clinical Grant Workbench is a local, human-in-the-loop application for developing sponsor-ready grant proposals. It turns a funding opportunity and supporting project materials into structured requirements, evidence, clinical-study design, competitive intelligence, reviewed grant sections, and a final DOCX/PDF submission package. The UI, Rust API, rendering, ingestion, embeddings, and local Ollama inference all run in Docker containers with persistent Docker volumes.
+Clinical Grant Workbench is a local, human-in-the-loop application for developing sponsor-ready grant proposals. It turns a funding opportunity and supporting project materials into structured requirements, evidence, clinical-study design, competitive intelligence, reviewed grant sections, and a final DOCX/PDF submission package. The UI, Rust API, rendering, ingestion, and embeddings run in Docker. On Apple Silicon, Ollama runs natively for Metal acceleration; on NVIDIA Linux it runs in a GPU-enabled container.
 
 ## UI workflow
 
@@ -20,19 +20,20 @@ Public opportunity URLs are rendered in Chromium and converted to Markdown befor
 
 ### Prerequisites
 
-- macOS with at least 10 GB of free disk space
+- Apple Silicon macOS, or x86-64 Linux with a working NVIDIA driver
+- At least 10 GB of free disk space
 - An internet connection for the first image and model download
 - Permission to install and start Docker Desktop if it is not already present
 
 ### Install and run
 
 ```bash
-cp env.m4Mac.txt .env
+cp env.m4Mac.qwen3.txt .env
 ```
 
 Edit `.env` before starting:
 
-- Set `ANTHROPIC_API_KEY`; the M4 hybrid profile requires both OLMo and Claude.
+- To enable hybrid or Claude-only routing, set `ANTHROPIC_API_KEY` and change `MODEL_ROUTING_MODE`.
 - Optionally set `BRAVE_SEARCH_API_KEY` for online evidence and patent/technology research.
 - Optionally set `OPENALEX_API_KEY` for publication discovery.
 - Adjust `ORGANIZATION_NAME`, `GRANT_SECTIONS`, and `GRANT_EXPORT_HOME` as needed.
@@ -43,10 +44,11 @@ Then bootstrap and start the application with one command:
 ./install.sh
 ```
 
-The installer installs Docker Desktop when necessary, builds every application
-service, downloads the selected Ollama model into a persistent Docker volume,
-starts the stack, and opens the UI. It does not install Python, Rust, Ollama,
-MLX, Node, Chromium, or application libraries on the host.
+The installer installs Docker and the selected model runtime when necessary,
+builds the application services, downloads the selected model, starts the
+stack, and opens the UI. On Apple Silicon it installs native Ollama and keeps
+models in Ollama's host store. On Linux it configures NVIDIA Container Toolkit
+and keeps Ollama/model data in Docker volumes.
 
 Open [http://localhost:7860](http://localhost:7860). The first startup may take longer while containers and local models are downloaded.
 
@@ -156,6 +158,23 @@ docker compose up -d --build --force-recreate core ui
 
 The non-secret `/api/system/info` response reports only whether email delivery
 is configured and its transport mode; it never returns relay credentials.
+
+For a local delivery test, Mailpit can accept SMTP messages and display them
+without sending to public inboxes:
+
+```bash
+docker run --rm --name mailpit \
+  -p 127.0.0.1:1025:1025 \
+  -p 127.0.0.1:8025:8025 \
+  axllent/mailpit
+```
+
+Set `SMTP_HOST=host.docker.internal`, `SMTP_PORT=1025`,
+`SMTP_SECURITY=none`, and a valid `SMTP_FROM`, then open
+`http://127.0.0.1:8025`. The UI has a Python-standard-library fallback using
+`EmailMessage` and `smtplib.SMTP.send_message()` if the API mail attempt is not
+accepted; success means the configured SMTP server accepted the message, not
+that a public inbox delivered it.
 
 For an institutional OIDC deployment, configure the `OIDC_*` settings and use
 `./scripts/start_oidc_gateway.sh`. The enterprise Compose override publishes only
@@ -338,7 +357,7 @@ For an **Apple Silicon Mac**, it is strongly recommended.
 The system can use:
 
 ```text
-OLMo 3 or Qwen 3 in containerized Ollama
+OLMo 3 or Qwen 3 in native Ollama with Apple Metal
 +
 Claude selectively for higher-value tasks
 ```
@@ -862,7 +881,7 @@ GRANT_RUNTIME_PROFILE=auto
 
 ### What it does
 
-Tells `start.sh` to detect the Mac and choose the correct architecture automatically.
+Tells `start.sh` to detect the host and choose the correct runtime automatically.
 
 ### Recommended
 
@@ -877,11 +896,15 @@ Typical behavior:
 ```text
 Apple Silicon (M2 or M4)
         ↓
-container_ollama + CPU embeddings
+apple_ollama (native Metal) + containerized CPU embeddings
 
-Other supported Docker hosts
+Linux x86-64 with NVIDIA
         ↓
-docker_cpu or container_ollama
+linux_nvidia_ollama + containerized CPU embeddings
+
+Hosts configured for Claude only
+        ↓
+docker_cpu + containerized CPU embeddings
 ```
 
 An explicit private/local profile is also available for the 8 GB Apple-Silicon
@@ -890,19 +913,19 @@ case:
 ```text
 M2 8 GB + env.m2Mac.8gb.txt
         ↓
-container_ollama + qwen3:1.7b + CPU embeddings
+apple_ollama + qwen3:1.7b + CPU embeddings
 ```
 
 Manual overrides are available:
 
 ```bash
-GRANT_RUNTIME_PROFILE=container_ollama
+GRANT_RUNTIME_PROFILE=apple_ollama
 ```
 
 or:
 
 ```bash
-GRANT_RUNTIME_PROFILE=docker_cpu
+GRANT_RUNTIME_PROFILE=linux_nvidia_ollama
 ```
 
 Only override automatic selection for troubleshooting or controlled deployments.
@@ -934,20 +957,20 @@ OLMo 3 or Qwen 3 locally
 +
 Claude escalation
 
-Intel / weak Mac
-────────────────
-Claude generation
-+
-local HPC retrieval
+Linux NVIDIA
+────────────
+Qwen 3 on the configured NVIDIA GPU, with optional Claude escalation
 ```
 
 Supported values are `hybrid`, `claude_only`, and `local_only`. The repository
 ships three machine-oriented templates:
 
-- `env.m4Mac.txt`: containerized Ollama OLMo 3 7B + Claude.
-- `env.m4Mac.qwen3.txt`: containerized Ollama Qwen 3 8B + Claude.
-- `env.m2Mac.8gb.txt`: containerized Ollama Qwen 3 1.7B, local-only by default with a
-  documented hybrid toggle.
+- `env.m4Mac.qwen3.txt`: native Ollama/Metal Qwen 3 8B, local-only by default.
+- `env.m2Mac.8gb.txt`: native Ollama/Metal Qwen 3 1.7B, local-only by default.
+- `env.linux.nvidia.txt`: NVIDIA-container Ollama Qwen 3 8B for workstations and GPU VMs.
+
+Set `MODEL_ROUTING_MODE=hybrid` plus `ANTHROPIC_API_KEY` to add Claude
+escalation, or use `claude_only` to skip local model startup entirely.
 
 ### Structured model-output contracts
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
@@ -49,6 +50,14 @@ fi
 if ! ollama show "$MODEL" >/dev/null 2>&1; then
   echo "Downloading $MODEL. This happens once and may take several minutes..."
   ollama pull "$MODEL"
+fi
+
+echo "Verifying native inference and Apple GPU placement..."
+OLLAMA_HOST="$OLLAMA_HOST" ollama run "$MODEL" "Reply with exactly: READY" >/dev/null
+if ! ollama ps 2>/dev/null | awk -v model="$MODEL" '$1 == model {found=1; if ($0 ~ /GPU/) gpu=1} END {exit !(found && gpu)}'; then
+  echo "ERROR: Ollama answered, but $MODEL is not reported on the Apple GPU. Refusing a silent CPU fallback." >&2
+  echo "Run 'ollama ps' and inspect $LOG_DIR/ollama.log before retrying." >&2
+  exit 6
 fi
 
 curl -fsS "$MODELS_URL" | python3 -c '

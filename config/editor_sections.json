@@ -1,0 +1,26 @@
+[
+  {
+    "title": "Specific Aims",
+    "description": "State the overall objective, central hypothesis or thesis, focused aims, expected outcomes, and impact in a concise sponsor-facing narrative."
+  },
+  {
+    "title": "Significance",
+    "description": "Explain the unmet need, why it matters, the evidence supporting the problem, and how the proposed work advances the sponsor's priorities."
+  },
+  {
+    "title": "Innovation",
+    "description": "Describe the conceptual, methodological, technological, or implementation advances and distinguish them from current practice without unsupported claims."
+  },
+  {
+    "title": "Approach",
+    "description": "Present the design, methods, analyses, milestones, risks, alternatives, rigor, feasibility, and decision points needed to accomplish each aim."
+  },
+  {
+    "title": "Human Subjects",
+    "description": "Describe participants, protections, inclusion, consent, privacy, risk mitigation, monitoring, and applicable ethical or regulatory considerations."
+  },
+  {
+    "title": "Environment",
+    "description": "Explain the facilities, resources, institutional support, collaborations, and operational setting that make the proposed work feasible."
+  }
+]

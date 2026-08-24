@@ -54,7 +54,7 @@ use domain::{
 };
 use embedding::EmbeddingClient;
 use json_extract::parse_json_from_model;
-use models::{ModelRouter, ModelTask};
+use models::{GenerationAudit, ModelRouter, ModelTask};
 use research::ResearchClient;
 use retrieval::RetrievalService;
 use auth::{EmailSettings, PasswordPolicy};
@@ -171,10 +171,65 @@ struct UpdateProjectInput { title:Option<String>,archived:Option<bool> }
 #[derive(Deserialize)]
 struct SectionInput {
     title: String,
+    #[serde(default)]
+    description: Option<String>,
     body: String,
     html: Option<String>,
     base_version_id: Option<i64>,
     actor: Option<String>,
+}
+#[derive(Deserialize)]
+struct EditorSectionInput { key:String,title:String,#[serde(default)] description:String }
+#[derive(Deserialize)]
+struct EditorInitializeInput { #[serde(default)] sections:Vec<EditorSectionInput> }
+#[derive(Deserialize)]
+struct EditorSectionMetadataInput { title:String,#[serde(default)] description:String }
+#[derive(Deserialize)]
+struct EditorSectionOrderInput { section_keys:Vec<String> }
+#[derive(Deserialize)]
+struct EditorDocumentSectionInput {
+    key:String,
+    title:String,
+    #[serde(default)] description:String,
+    #[serde(default)] body:String,
+    base_version_id:Option<i64>,
+}
+#[derive(Deserialize)]
+struct EditorDocumentSaveInput { #[serde(default)] sections:Vec<EditorDocumentSectionInput> }
+#[derive(Deserialize)]
+struct EditorRewriteInput {
+    title:String,
+    #[serde(default)] description:String,
+    base_version_id:Option<i64>,
+    #[serde(default)] high_value:bool,
+    #[serde(default)] initial_build:bool,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+struct EditorDocumentPlan {
+    sections: Vec<EditorPlannedSection>,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+struct EditorPlannedSection {
+    title: String,
+    #[serde(default)]
+    description: String,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+struct EditorChunkAnalysis {
+    #[serde(default)] sponsor_requirements:Vec<String>,
+    #[serde(default)] supported_facts:Vec<String>,
+    #[serde(default)] source_anchors:Vec<String>,
+    #[serde(default)] team_directives_verbatim:Vec<String>,
+    #[serde(default)] uncertainties:Vec<String>,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+struct EditorSectionDraftPlan { chunks:Vec<EditorSectionDraftChunk> }
+#[derive(Deserialize, Serialize, JsonSchema)]
+struct EditorSectionDraftChunk {
+    heading:String,
+    purpose:String,
+    #[serde(default)] evidence_focus:Vec<String>,
+    transition_to_next:Option<String>,
 }
 #[derive(Deserialize)]
 struct ApproveSectionInput {
@@ -608,15 +663,22 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/projects/{id}/index/status", get(index_status))
         .route("/api/projects/{id}/retrieve", post(retrieve_context))
         .route("/api/projects/{id}/draft-section", post(draft_section))
+        .route("/api/projects/{id}/editor/plan",post(plan_editor_document))
+        .route("/api/projects/{id}/editor/initialize",post(initialize_editor))
+        .route("/api/projects/{id}/editor/document",get(get_editor_document).post(save_editor_document))
+        .route("/api/projects/{id}/sections/reorder",post(reorder_editor_sections))
         .route("/api/projects/{id}/sections", get(project_sections))
         .route(
             "/api/projects/{id}/sections/{section}",
             get(get_section).post(save_section),
         )
+        .route("/api/projects/{id}/sections/{section}/metadata",axum::routing::patch(update_editor_section_metadata))
+        .route("/api/projects/{id}/sections/{section}/rewrite",post(rewrite_editor_section))
         .route(
             "/api/projects/{id}/sections/{section}/versions",
             get(get_section_versions),
         )
+        .route("/api/projects/{id}/sections/{section}/versions/{version}",get(get_section_version))
         .route(
             "/api/projects/{id}/sections/{section}/compare",
             get(compare_section_versions),
@@ -665,6 +727,7 @@ async fn main() -> anyhow::Result<()> {
             get(approved_document),
         )
         .route("/api/projects/{id}/export-snapshot", post(export_snapshot))
+        .route("/api/projects/{id}/publish-snapshot",post(publish_editor_snapshot))
         .route("/api/projects/{id}/generate", post(generate))
         .route("/api/hpc/benchmark", post(hpc_benchmark))
         .route("/api/system/info", get(system_info))
@@ -1709,6 +1772,201 @@ async fn project_sections(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(s.store.project_sections_json(&id)?))
+}
+
+fn editor_section_key(title:&str,position:usize,used:&mut BTreeSet<String>)->String{
+    let mut base=title.chars().flat_map(char::to_lowercase).map(|character|{
+        if character.is_ascii_alphanumeric(){character}else{'_'}
+    }).collect::<String>();
+    while base.contains("__"){base=base.replace("__","_");}
+    base=base.trim_matches('_').to_owned();
+    if base.is_empty(){base=format!("section_{}",position+1);}
+    if base.len()>80{base.truncate(80);base=base.trim_matches('_').to_owned();}
+    let mut candidate=base.clone();
+    let mut suffix=2usize;
+    while !used.insert(candidate.clone()){
+        candidate=format!("{base}_{suffix}");
+        suffix+=1;
+    }
+    candidate
+}
+
+fn editor_context_fingerprint(store:&Store,project:&str,workflow:&WorkflowConfig)->Result<String,ApiError>{
+    let documents=store.opportunity_documents(project)?;
+    let manifest=serde_json::to_vec(&serde_json::json!({
+        "documents":documents.into_iter().map(|document|serde_json::json!({"name":document.name,"sha256":document.sha256})).collect::<Vec<_>>(),
+        "workflow":workflow,
+        "compiler":"editor_initial_context_v1"
+    }))?;
+    Ok(hex::encode(Sha256::digest(manifest)))
+}
+
+fn save_editor_context_cache(s:&AppState,project:&str,fingerprint:&str,context:&str,generation_run_ids:&[String])->Result<(),ApiError>{
+    let path=s.workspace.join("projects").join(project).join("editor-initial-context.json");
+    let payload=serde_json::to_vec(&serde_json::json!({
+        "schema_version":1,"fingerprint":fingerprint,"context":context,"generation_run_ids":generation_run_ids,
+    }))?;
+    std::fs::write(path,payload).map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
+fn load_editor_context_cache(s:&AppState,project:&str,fingerprint:&str)->Option<String>{
+    let path=s.workspace.join("projects").join(project).join("editor-initial-context.json");
+    let payload=std::fs::read(path).ok()?;
+    let value:serde_json::Value=serde_json::from_slice(&payload).ok()?;
+    if value.get("schema_version").and_then(serde_json::Value::as_i64)!=Some(1)||value.get("fingerprint").and_then(serde_json::Value::as_str)!=Some(fingerprint){return None;}
+    value.get("context").and_then(serde_json::Value::as_str).map(str::to_owned).filter(|context|!context.trim().is_empty())
+}
+
+async fn plan_editor_document(
+    State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path(id):Path<String>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
+    let existing=s.store.project_sections_json(&id)?;
+    if existing.as_array().is_some_and(|sections|!sections.is_empty()){
+        return Ok(Json(serde_json::json!({"planned":false,"reason":"existing_document_structure","sections":existing,"generation_run_ids":[]})));
+    }
+    let project=s.store.project_json(&id)?;
+    let workflow=s.store.workflow_config(&id)?;
+    let documents=s.store.opportunity_documents(&id)?;
+    if documents.is_empty(){return Err(ApiError::bad_request("the grant has no authoritative grant-ask source to plan from"));}
+    let authoritative_source=documents.into_iter().map(|document|format!(
+        "AUTHORITATIVE GRANT SOURCE: {}\nSHA-256: {}\n{}",document.name,document.sha256,document.text
+    )).collect::<Vec<_>>().join("\n\n");
+    let policy=s.router.project_policy(&workflow)?;
+    let decision=s.router.route(&policy,&ModelTask::text("editor_document_plan","",false))?;
+    let disclosure=s.router.routing_disclosure(&workflow)?;
+    let ollama_chunking=decision.provider=="local"&&disclosure.get("local_provider").and_then(serde_json::Value::as_str)==Some("ollama");
+    let context_chunk_words=std::env::var("EDITOR_OLLAMA_CONTEXT_CHUNK_WORDS").ok().and_then(|value|value.parse().ok()).unwrap_or(500usize).clamp(128,1_600);
+    let context_chunk_overlap=std::env::var("EDITOR_OLLAMA_CONTEXT_CHUNK_OVERLAP_WORDS").ok().and_then(|value|value.parse().ok()).unwrap_or(50usize).min(context_chunk_words/3);
+    let reduction_rounds=std::env::var("EDITOR_OLLAMA_CONTEXT_REDUCTION_ROUNDS").ok().and_then(|value|value.parse().ok()).unwrap_or(5usize).clamp(1,12);
+    let planning_material=format!(
+        "PROJECT METADATA:\n{}\n\nPERSISTED WORKFLOW CONFIGURATION:\n{}\n\nFULL AUTHORITATIVE GRANT ASK:\n{}",
+        serde_json::to_string_pretty(&project)?,serde_json::to_string_pretty(&workflow)?,authoritative_source
+    );
+    let (effective_context,mut generation_run_ids,reduction_rounds_used)=if ollama_chunking{
+        compile_editor_context_for_ollama(
+            &s,&id,"the complete proposal structure and every sponsor-required section",
+            &planning_material,context_chunk_words,context_chunk_overlap,reduction_rounds,
+        ).await?
+    }else{
+        let cloud_chars=std::env::var("EDITOR_CLOUD_GRANT_SOURCE_MAX_CHARS").ok().and_then(|value|value.parse().ok()).unwrap_or(60_000usize).clamp(8_000,160_000);
+        (planning_material.chars().take(cloud_chars).collect::<String>(),Vec::new(),0)
+    };
+    if ollama_chunking{
+        let fingerprint=editor_context_fingerprint(s.store.as_ref(),&id,&workflow)?;
+        save_editor_context_cache(&s,&id,&fingerprint,&effective_context,&generation_run_ids)?;
+    }
+    let prompt=format!(r#"Design the complete ordered document outline for this real grant application from the authoritative grant ask below.
+
+Return the sponsor-responsive sections that must be drafted as one continuous proposal. Each section needs a concise editable title and a concrete description telling the drafting model what sponsor requirements, review criteria, arguments, evidence, and requested content belong there. Derive the structure from the supplied solicitation and configured workflow; do not substitute a generic NIH outline when the sponsor asks for something different. Include requested narrative sections and enabled optional capabilities only where they belong in the proposal. Do not create administrative workflow screens, internal IDs, placeholder sections, or prose. Do not invent sponsor requirements. Preserve the sponsor's requested order when it is available. Produce no more than 20 sections.
+
+AUTHORITATIVE COMPILED PLANNING CONTEXT:
+{}"#,effective_context);
+    let first=s.router.generate_for_project(
+        s.store.as_ref(),&id,
+        ModelTask::structured::<EditorDocumentPlan>("editor_document_plan",prompt.clone(),false,"editor_document_plan",1)?,
+    ).await;
+    let mut first_error=None;
+    let mut plan=match first{
+        Ok(output)=>{
+            generation_run_ids.push(output.generation_run_id);
+            match parse_json_from_model::<EditorDocumentPlan>(&output.text){Ok(plan)=>Some(plan),Err(error)=>{first_error=Some(error.to_string());None}}
+        }
+        Err(error)=>{first_error=Some(error.to_string());None}
+    };
+    if plan.as_ref().is_none_or(|value|value.sections.iter().all(|section|section.title.trim().is_empty())){
+        let recovery_prompt=format!(r#"The previous outline response was unusable. Return only an ordered plain-text grant outline derived from the context below.
+
+Use exactly one section per line in this format:
+SECTION TITLE || CONCRETE SECTION PURPOSE AND SPONSOR CONTENT
+
+Do not number the lines. Do not add commentary, JSON, markdown, or generic sections unsupported by the grant ask. Return no more than 20 lines.
+
+AUTHORITATIVE COMPILED PLANNING CONTEXT:
+{}"#,effective_context.split_whitespace().take(context_chunk_words.saturating_mul(2)).collect::<Vec<_>>().join(" "));
+        let recovery=s.router.generate_for_project(s.store.as_ref(),&id,ModelTask::text("editor_document_plan_recovery",recovery_prompt,false)).await
+            .map_err(|error|ApiError::bad_request(format!("the model could not create the grant outline after a bounded retry; initial attempt: {}; retry: {}",first_error.as_deref().unwrap_or("unusable response"),error)))?;
+        generation_run_ids.push(recovery.generation_run_id);
+        let sections=recovery.text.lines().filter_map(|line|{
+            let clean=line.trim().trim_start_matches(|character:char|character.is_ascii_digit()||matches!(character,'.'|')'|'-'|'*'|'#')).trim();
+            let (title,description)=clean.split_once("||")?;
+            let title=title.trim();
+            if title.is_empty(){return None;}
+            Some(EditorPlannedSection{title:title.to_owned(),description:description.trim().to_owned()})
+        }).take(20).collect::<Vec<_>>();
+        plan=Some(EditorDocumentPlan{sections});
+    }
+    let planned=plan.unwrap_or(EditorDocumentPlan{sections:Vec::new()});
+    let mut used=BTreeSet::new();
+    let sections=planned.sections.into_iter().filter(|section|!section.title.trim().is_empty()).take(20).collect::<Vec<_>>();
+    if sections.is_empty(){return Err(ApiError::bad_request(format!("the model returned no usable sponsor-derived grant sections after outline planning; initial response: {}",first_error.as_deref().unwrap_or("empty outline"))));}
+    let mut order=Vec::with_capacity(sections.len());
+    for (position,section) in sections.into_iter().enumerate(){
+        let title=section.title.trim();
+        let key=editor_section_key(title,position,&mut used);
+        s.store.ensure_editor_section(&id,&key,title,section.description.trim()).map_err(|error|ApiError::bad_request(error.to_string()))?;
+        order.push(key);
+    }
+    let sections=s.store.reorder_editor_sections(&id,&order,&user.id).map_err(|error|ApiError::conflict(error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "planned":true,"sections":sections,"generation_run_ids":generation_run_ids,
+        "routing":{"provider":decision.provider,"model":decision.model,"mode":decision.routing_mode},
+        "chunking":{"enabled":ollama_chunking,"context_reduction_rounds":reduction_rounds_used}
+    })))
+}
+
+async fn initialize_editor(
+    State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path(id):Path<String>,Json(req):Json<EditorInitializeInput>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
+    let _=s.store.project_json(&id)?;
+    if req.sections.is_empty(){return Err(ApiError::bad_request("provide at least one grant section"));}
+    for section in req.sections{
+        s.store.ensure_editor_section(&id,&section.key,&section.title,&section.description).map_err(|error|ApiError::bad_request(error.to_string()))?;
+    }
+    let sections=s.store.project_sections_json(&id)?;
+    Ok(Json(serde_json::json!({"initialized":true,"actor_user_id":user.id,"sections":sections})))
+}
+
+async fn get_editor_document(
+    State(s):State<AppState>,Path(id):Path<String>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    Ok(Json(s.store.editor_document_json(&id)?))
+}
+
+async fn save_editor_document(
+    State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path(id):Path<String>,Json(req):Json<EditorDocumentSaveInput>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
+    if req.sections.is_empty(){
+        return Ok(Json(serde_json::json!({"saved":[],"document":s.store.editor_document_json(&id)?})));
+    }
+    for section in &req.sections{
+        if versioning::contains_conflict_markers(&section.body){
+            return Err(ApiError::bad_request(format!("resolve every three-way merge conflict marker in '{}' before saving",section.title)));
+        }
+    }
+    let changes=req.sections.into_iter().map(|section|storage::EditorDocumentSectionChange{
+        key:section.key,title:section.title,description:section.description,body:section.body,base_version_id:section.base_version_id,
+    }).collect::<Vec<_>>();
+    Ok(Json(s.store.save_editor_document(&id,&changes,&user.id).map_err(|error|{
+        ApiError::conflict_details(error.to_string(),serde_json::json!({"code":"stale_document_section","document":s.store.editor_document_json(&id).ok()}))
+    })?))
+}
+
+async fn update_editor_section_metadata(
+    State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,section)):Path<(String,String)>,Json(req):Json<EditorSectionMetadataInput>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
+    Ok(Json(s.store.update_editor_section_metadata(&id,&section,&req.title,&req.description,&user.id).map_err(|error|ApiError::bad_request(error.to_string()))?))
+}
+
+async fn reorder_editor_sections(
+    State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path(id):Path<String>,Json(req):Json<EditorSectionOrderInput>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
+    Ok(Json(s.store.reorder_editor_sections(&id,&req.section_keys,&user.id).map_err(|error|ApiError::conflict(error.to_string()))?))
 }
 
 async fn get_clinical_study(
@@ -3348,11 +3606,9 @@ async fn draft_section(
     Path(id): Path<String>,
     Json(req): Json<DraftSectionInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_roles(&role,&["owner","pi","contributor","research_administrator"])?;
-    require_core_step_complete(&s.store,&id,"literature")?;
-    require_optional_domain_gates(&s.store,&id)?;
-    if s.store.workflow_module_required(&id,"competitive_intelligence")?{let _=ensure_competitive_fresh(&s,&id,false).await?;}
-    let section_state=s.store.section_state_json(&id,&req.section_key).map_err(|_|ApiError::bad_request("draft target is not present in the approved research framework"))?;
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
+    s.store.ensure_editor_section(&id,&req.section_key,&req.title,"").map_err(|error|ApiError::bad_request(error.to_string()))?;
+    let section_state=s.store.section_state_json(&id,&req.section_key).map_err(|_|ApiError::bad_request("draft target is not present in this grant"))?;
     let base_version=section_state.pointer("/latest/version").and_then(serde_json::Value::as_i64);
     let config=s.store.workflow_config(&id)?;
     let extra = req.additional_context.unwrap_or_default();
@@ -3405,6 +3661,344 @@ ADDITIONAL HUMAN CONTEXT:
     ))
 }
 
+async fn compile_editor_context_for_ollama(
+    s:&AppState,project:&str,section_title:&str,material:&str,chunk_words:usize,overlap_words:usize,max_rounds:usize,
+)->Result<(String,Vec<String>,usize),ApiError>{
+    fn clipped(values:Vec<String>,word_budget:usize)->Vec<String>{
+        let mut remaining=word_budget;let mut output=Vec::new();
+        for value in values{
+            if remaining==0{break;}
+            let words=value.split_whitespace().collect::<Vec<_>>();
+            if words.is_empty(){continue;}
+            let take=words.len().min(remaining);output.push(words[..take].join(" "));remaining-=take;
+        }
+        output
+    }
+    fn bounded_analysis(raw:&str,total_words:usize)->Result<String,ApiError>{
+        let parsed:EditorChunkAnalysis=serde_json::from_str(raw).unwrap_or_else(|error|EditorChunkAnalysis{
+            sponsor_requirements:Vec::new(),supported_facts:vec![raw.to_owned()],source_anchors:Vec::new(),team_directives_verbatim:Vec::new(),uncertainties:vec![format!("Chunk output required deterministic recovery after structured decoding failed: {error}")],
+        });
+        let per_field=(total_words/5).max(12);
+        Ok(serde_json::to_string(&EditorChunkAnalysis{
+            sponsor_requirements:clipped(parsed.sponsor_requirements,per_field),
+            supported_facts:clipped(parsed.supported_facts,per_field),
+            source_anchors:clipped(parsed.source_anchors,per_field),
+            team_directives_verbatim:clipped(parsed.team_directives_verbatim,per_field),
+            uncertainties:clipped(parsed.uncertainties,per_field),
+        })?)
+    }
+    let mut current=material.to_owned();
+    let mut child_run_ids=Vec::new();
+    let mut rounds=0usize;
+    loop{
+        let chunks=chunker::chunk_text(&current,chunk_words,if rounds==0{overlap_words}else{0});
+        if chunks.len()<=1{return Ok((current,child_run_ids,rounds));}
+        let chunk_count=chunks.len();
+        let mut analyses=Vec::with_capacity(chunk_count);
+        for chunk in chunks{
+            let prompt=format!(r#"Extract only material that can support a rewrite of the grant section named "{section_title}" from source/context chunk {}/{}.
+
+Preserve sponsor requirements, source identifiers, citations, numeric values, and all team-authored rules or questions exactly. Do not draft prose. Do not infer facts that are absent. Keep each array concise so the complete set of chunk analyses can fit in a later synthesis request.
+
+SOURCE OR PRIOR REDUCTION CHUNK:
+{}"#,chunk.ordinal+1,chunk_count,chunk.text);
+            let task=ModelTask::structured::<EditorChunkAnalysis>(
+                "collaborative_section_context_chunk",prompt.clone(),false,"editor_chunk_analysis",1,
+            )?;
+            let output=match s.router.generate_for_project(s.store.as_ref(),project,task).await{
+                Ok(output)=>output,
+                Err(_)=>s.router.generate_for_project(
+                    s.store.as_ref(),project,
+                    ModelTask::text(
+                        "collaborative_section_context_chunk_recovery",
+                        format!("{prompt}\n\nThe prior structured attempt was unusable. Return a concise evidence digest only. Preserve supported facts, sponsor requirements, source anchors, team directives, and uncertainties; omit all unsupported claims."),
+                        false,
+                    ),
+                ).await?,
+            };
+            child_run_ids.push(output.generation_run_id);
+            // A deterministic bound guarantees that every reduction pass is
+            // smaller than its input even when a local model is overly verbose.
+            // After the configured threshold, tighten the bound further rather
+            // than failing a long real-world grant.
+            let digest_words=if rounds>=max_rounds{(chunk_words/5).max(64)}else{(chunk_words/3).max(96)};
+            analyses.push(bounded_analysis(&output.text,digest_words)?);
+        }
+        current=analyses.join("\n");
+        rounds+=1;
+    }
+}
+
+async fn rewrite_editor_section(
+    State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path((id,section)):Path<(String,String)>,Json(req):Json<EditorRewriteInput>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
+    s.store.ensure_editor_section(&id,&section,&req.title,&req.description).map_err(|error|ApiError::bad_request(error.to_string()))?;
+    let state=s.store.section_state_json(&id,&section)?;
+    let current=state.get("latest").cloned().unwrap_or(serde_json::Value::Null);
+    let current_version=current.get("version").and_then(serde_json::Value::as_i64);
+    if current_version!=req.base_version_id{
+        return Err(ApiError::conflict_details("the section changed before the rewrite started; refresh it before applying shared guidance",serde_json::json!({"code":"stale_section_version","base_version_id":req.base_version_id,"current_version_id":current_version})));
+    }
+    let current_body=current.get("body").and_then(serde_json::Value::as_str).unwrap_or("");
+    let comments=s.store.comments_json(&id,"section",&section,None)?;
+    let open_comments=comments.as_array().into_iter().flatten().filter(|comment|comment.get("resolved_at").is_none_or(serde_json::Value::is_null)).collect::<Vec<_>>();
+    let open_guidance=open_comments.iter().map(|comment|{
+        let author=comment.get("author").and_then(serde_json::Value::as_str).unwrap_or("Team member");
+        let body=comment.get("body").and_then(serde_json::Value::as_str).unwrap_or("");
+        format!("- {author}: {body}")
+    }).collect::<Vec<_>>();
+    let guidance=if open_guidance.is_empty(){"No open team guidance. Improve clarity, logical flow, specificity, and sponsor alignment without inventing facts.".to_owned()}else{open_guidance.join("\n")};
+    let research_requests=open_comments.iter().filter_map(|comment|{
+        let comment_id=comment.get("id").and_then(serde_json::Value::as_i64)?;
+        let body=comment.get("body").and_then(serde_json::Value::as_str)?.trim();
+        let upper=body.to_ascii_uppercase();
+        if !(upper.starts_with("QUESTION ·")||upper.starts_with("QUESTION:")||upper.starts_with("RULE ·")||upper.starts_with("RULE:")){return None;}
+        let request=body.split_once('·').or_else(||body.split_once(':')).map(|(_,value)|value.trim()).filter(|value|!value.is_empty()).unwrap_or(body);
+        Some((comment_id,request.to_owned()))
+    }).take(3).collect::<Vec<_>>();
+    let research_source_chars=std::env::var("EDITOR_RESEARCH_SOURCE_CHARS").ok().and_then(|value|value.parse().ok()).unwrap_or(2_000usize).clamp(500,12_000);
+    let research_context_chars=std::env::var("EDITOR_RESEARCH_CONTEXT_MAX_CHARS").ok().and_then(|value|value.parse().ok()).unwrap_or(6_000usize).clamp(1_000,36_000);
+    let rewrite_context_chars=std::env::var("EDITOR_REWRITE_CONTEXT_MAX_CHARS").ok().and_then(|value|value.parse().ok()).unwrap_or(12_000usize).clamp(4_000,96_000);
+    let mut newly_researched=Vec::new();
+    let mut research_failures=Vec::new();
+    if s.research.search_available(){
+        for (comment_id,request) in &research_requests{
+            let research_key=format!("editor_comment:{comment_id}");
+            if s.store.latest_research_query_status(&id,&research_key)?.as_deref()==Some("complete"){continue;}
+            let query=format!("{} grant section {}",request,req.title);
+            let query_id=s.store.insert_research_query(&id,&research_key,&query,&[],"Team-authored question or rule triggered section research")?;
+            match s.research.search(&query,&[],5).await{
+                Ok(hits)=>{
+                    let fetched=s.research.fetch_many(hits).await;
+                    let mut saved=0usize;
+                    for source in fetched.into_iter().filter_map(|result|result.ok()).filter(|source|!source.text.trim().is_empty()){
+                        let source_id=s.store.add_research_source(&id,query_id,&source)?.context("saved editor research source is missing an ID")?;
+                        let passage=source.text.chars().take(research_source_chars).collect::<String>();
+                        let evidence_id=s.store.add_evidence(&id,None,"editor_research_candidate",&format!("research_source:{source_id}"),request,&passage,Some(&source.url),Some("retrieved document text"),0.5,"candidate_unverified")?;
+                        s.store.add_citation(&id,evidence_id,&format!("EDITOR-{}-{}",section,source_id),&source.title,Some(&source.url),&passage,&source.sha256,false)?;
+                        newly_researched.push(format!("SOURCE {} · {} · {}\n{}",source_id,source.title,source.url,passage));
+                        saved+=1;
+                    }
+                    s.store.mark_research_query(query_id,if saved>0{"complete"}else{"failed"})?;
+                    if saved==0{research_failures.push(format!("No usable public source was retrieved for: {request}"));}
+                }
+                Err(error)=>{s.store.mark_research_query(query_id,"failed")?;research_failures.push(format!("Research failed for '{request}': {error}"));}
+            }
+        }
+    }else if !research_requests.is_empty(){research_failures.push("Online research is not configured; the rewrite used the grant's stored sources and evidence index only.".into());}
+    let mut research_context=newly_researched.join("\n\n");
+    if research_context.chars().count()>research_context_chars{research_context=research_context.chars().take(research_context_chars).collect();}
+    let retrieval_query=format!("Rewrite grant section '{}' using its description and the team's open questions, rules, and comments.",req.title);
+    let context=match context_compiler::compile(&s.store,&s.retrieval,&id,&retrieval_query,rewrite_context_chars).await{
+        Ok(compiled)=>compiled.text,
+        Err(_)=>format!("PROJECT AND GRANT SOURCES:\n{}\n\nREQUIREMENTS:\n{}",s.store.document_context(&id,rewrite_context_chars.saturating_mul(3)/4)?,s.store.requirements_context(&id)?),
+    };
+    let workflow=s.store.workflow_config(&id)?;
+    let policy=s.router.project_policy(&workflow)?;
+    let final_decision=s.router.route(&policy,&ModelTask::text("collaborative_section_rewrite","",req.high_value))?;
+    let routing_disclosure=s.router.routing_disclosure(&workflow)?;
+    let ollama_chunking=final_decision.provider=="local"&&routing_disclosure.get("local_provider").and_then(serde_json::Value::as_str)==Some("ollama");
+    let context_chunk_words=std::env::var("EDITOR_OLLAMA_CONTEXT_CHUNK_WORDS").ok().and_then(|value|value.parse().ok()).unwrap_or(500usize).clamp(128,1_600);
+    let context_chunk_overlap=std::env::var("EDITOR_OLLAMA_CONTEXT_CHUNK_OVERLAP_WORDS").ok().and_then(|value|value.parse().ok()).unwrap_or(50usize).min(context_chunk_words/3);
+    let section_chunk_words=std::env::var("EDITOR_OLLAMA_SECTION_CHUNK_WORDS").ok().and_then(|value|value.parse().ok()).unwrap_or(650usize).clamp(128,1_600);
+    let section_plan_min_chunks=std::env::var("EDITOR_OLLAMA_SECTION_PLAN_MIN_CHUNKS").ok().and_then(|value|value.parse().ok()).unwrap_or(3usize).clamp(2,8);
+    let section_plan_max_chunks=std::env::var("EDITOR_OLLAMA_SECTION_PLAN_MAX_CHUNKS").ok().and_then(|value|value.parse().ok()).unwrap_or(6usize).clamp(section_plan_min_chunks,12);
+    let section_draft_target_words=std::env::var("EDITOR_OLLAMA_SECTION_DRAFT_TARGET_WORDS").ok().and_then(|value|value.parse().ok()).unwrap_or(450usize).clamp(150,900);
+    let reduction_rounds=std::env::var("EDITOR_OLLAMA_CONTEXT_REDUCTION_ROUNDS").ok().and_then(|value|value.parse().ok()).unwrap_or(5usize).clamp(1,12);
+    let sibling_document=s.store.editor_document_json(&id)?;
+    let mut sibling_context=sibling_document.get("sections").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|item|{
+        let key=item.get("section_key").and_then(serde_json::Value::as_str)?;
+        let body=item.get("body").and_then(serde_json::Value::as_str)?.trim();
+        if key==section||body.is_empty(){return None;}
+        Some(format!("SIBLING SECTION · {}\n{}",item.get("title").and_then(serde_json::Value::as_str).unwrap_or(key),body))
+    }).collect::<Vec<_>>().join("\n\n");
+    if !ollama_chunking{
+        let cloud_sibling_chars=std::env::var("EDITOR_CLOUD_SIBLING_CONTEXT_MAX_CHARS").ok().and_then(|value|value.parse().ok()).unwrap_or(20_000usize).clamp(4_000,80_000);
+        if sibling_context.chars().count()>cloud_sibling_chars{sibling_context=sibling_context.chars().take(cloud_sibling_chars).collect();}
+    }
+    let mut authoritative_grant_ask=s.store.opportunity_documents(&id)?.into_iter().map(|document|format!("AUTHORITATIVE GRANT SOURCE · {} · SHA-256 {}\n{}",document.name,document.sha256,document.text)).collect::<Vec<_>>().join("\n\n");
+    if !ollama_chunking{
+        let cloud_source_chars=std::env::var("EDITOR_CLOUD_GRANT_SOURCE_MAX_CHARS").ok().and_then(|value|value.parse().ok()).unwrap_or(60_000usize).clamp(8_000,160_000);
+        if authoritative_grant_ask.chars().count()>cloud_source_chars{authoritative_grant_ask=authoritative_grant_ask.chars().take(cloud_source_chars).collect();}
+    }
+    let source_material=format!("TEAM GUIDANCE:\n{guidance}\n\nFULL AUTHORITATIVE GRANT ASK:\n{}\n\nRETRIEVED PROJECT CONTEXT:\n{context}\n\nOTHER CURRENT GRANT SECTIONS:\n{}\n\nWORKFLOW CONFIGURATION:\n{}\n\nNEW RESEARCH CANDIDATES:\n{}",if authoritative_grant_ask.is_empty(){"No authoritative grant source is stored."}else{authoritative_grant_ask.as_str()},if sibling_context.is_empty(){"No sibling sections have been drafted yet."}else{sibling_context.as_str()},serde_json::to_string_pretty(&workflow)?,if research_context.is_empty(){"None retrieved for this rewrite."}else{research_context.as_str()});
+    let initial_cached_context=if ollama_chunking&&req.initial_build{
+        let fingerprint=editor_context_fingerprint(s.store.as_ref(),&id,&workflow)?;
+        load_editor_context_cache(&s,&id,&fingerprint)
+    }else{None};
+    let (effective_context,mut child_run_ids,reduction_round_count)=if let Some(cached)=initial_cached_context{
+        (format!("COMPILED AUTHORITATIVE GRANT CONTEXT:\n{cached}\n\nTEAM GUIDANCE:\n{guidance}\n\nNEW RESEARCH CANDIDATES:\n{}",if research_context.is_empty(){"None."}else{research_context.as_str()}),Vec::new(),0)
+    }else if ollama_chunking{
+        compile_editor_context_for_ollama(&s,&id,&req.title,&source_material,context_chunk_words,context_chunk_overlap,reduction_rounds).await?
+    }else{(source_material,Vec::new(),0)};
+    let current_chunks=if ollama_chunking&&!current_body.trim().is_empty(){chunker::chunk_text(current_body,section_chunk_words,0)}else{Vec::new()};
+    let (generated_text,generation_run_id,generated_provider,generated_model,section_chunk_count)=if ollama_chunking&&current_body.trim().is_empty(){
+        let plan_prompt=format!(r#"Plan an evidence-grounded grant section named "{}" as {} to {} ordered, non-overlapping prose chunks.
+
+SECTION PURPOSE:
+{}
+
+        COMPILED EVIDENCE, SPONSOR REQUIREMENTS, WORKFLOW OPTIONS, RESEARCH, AND TEAM GUIDANCE:
+{}
+
+Each planned chunk must have a concise heading used only to coordinate drafting, a distinct purpose, the evidence or sponsor requirements it must cover, and an optional transition to the next chunk. The complete ordered plan must cover the section without repetition. Do not draft the prose and do not invent facts."#,req.title,section_plan_min_chunks,section_plan_max_chunks,req.description,effective_context);
+        let mut planned_chunks=Vec::new();
+        let mut planner_error=None;
+        match ModelTask::structured::<EditorSectionDraftPlan>("collaborative_section_draft_plan",plan_prompt,false,"editor_section_draft_plan",1){
+            Ok(task)=>match s.router.generate_for_project(s.store.as_ref(),&id,task).await{
+                Ok(output)=>{
+                    child_run_ids.push(output.generation_run_id);
+                    match parse_json_from_model::<EditorSectionDraftPlan>(&output.text){
+                        Ok(plan)=>planned_chunks=plan.chunks.into_iter().filter(|chunk|!chunk.purpose.trim().is_empty()).take(section_plan_max_chunks).collect(),
+                        Err(error)=>planner_error=Some(error.to_string()),
+                    }
+                }
+                Err(error)=>planner_error=Some(error.to_string()),
+            },
+            Err(error)=>planner_error=Some(error.to_string()),
+        }
+        if planned_chunks.len()<section_plan_min_chunks{
+            let recovery_prompt=format!(r#"Create {} to {} distinct ordered drafting parts for the grant section named "{}".
+
+SECTION PURPOSE:
+{}
+
+COMPILED GRANT CONTEXT:
+{}
+
+Return only one part per line using exactly:
+COORDINATION HEADING || DISTINCT PURPOSE || EVIDENCE OR SPONSOR REQUIREMENTS || TRANSITION TO NEXT PART
+
+Do not draft prose, number the lines, repeat a purpose, or invent facts."#,section_plan_min_chunks,section_plan_max_chunks,req.title,req.description,effective_context);
+            let recovery=s.router.generate_for_project(s.store.as_ref(),&id,ModelTask::text("collaborative_section_draft_plan_recovery",recovery_prompt,false)).await
+                .map_err(|error|ApiError::bad_request(format!("the model could not plan bounded drafting parts for '{}' after retry; initial attempt: {}; retry: {}",req.title,planner_error.as_deref().unwrap_or("insufficient plan"),error)))?;
+            child_run_ids.push(recovery.generation_run_id);
+            planned_chunks=recovery.text.lines().filter_map(|line|{
+                let clean=line.trim().trim_start_matches(|character:char|character.is_ascii_digit()||matches!(character,'.'|')'|'-'|'*'|'#')).trim();
+                let fields=clean.split("||").map(str::trim).collect::<Vec<_>>();
+                if fields.len()<2||fields[0].is_empty()||fields[1].is_empty(){return None;}
+                Some(EditorSectionDraftChunk{
+                    heading:fields[0].to_owned(),purpose:fields[1].to_owned(),
+                    evidence_focus:fields.get(2).map(|value|value.split(';').map(str::trim).filter(|value|!value.is_empty()).map(str::to_owned).collect()).unwrap_or_default(),
+                    transition_to_next:fields.get(3).map(|value|value.trim()).filter(|value|!value.is_empty()).map(str::to_owned),
+                })
+            }).take(section_plan_max_chunks).collect();
+        }
+        if planned_chunks.len()<section_plan_min_chunks{
+            return Err(ApiError::bad_request(format!("the model returned only {} usable drafting parts for '{}'; at least {} are required before the section can be assembled",planned_chunks.len(),req.title,section_plan_min_chunks)));
+        }
+        let chunk_count=planned_chunks.len();
+        let serialized_plan=serde_json::to_string(&EditorSectionDraftPlan{chunks:planned_chunks.iter().map(|chunk|EditorSectionDraftChunk{
+            heading:chunk.heading.clone(),purpose:chunk.purpose.clone(),evidence_focus:chunk.evidence_focus.clone(),transition_to_next:chunk.transition_to_next.clone(),
+        }).collect()})?;
+        let mut drafted_chunks=Vec::with_capacity(chunk_count);
+        for (index,chunk) in planned_chunks.into_iter().enumerate(){
+            let prompt=format!(r#"Draft only prose chunk {}/{} of the grant section named "{}".
+
+COMPLETE ORDERED SECTION PLAN:
+{}
+
+THIS CHUNK'S COORDINATION HEADING:
+{}
+
+THIS CHUNK'S DISTINCT PURPOSE:
+{}
+
+EVIDENCE AND REQUIREMENTS TO EMPHASIZE:
+{}
+
+TRANSITION TO THE NEXT CHUNK:
+{}
+
+COMPILED EVIDENCE, SPONSOR REQUIREMENTS, WORKFLOW OPTIONS, RESEARCH, AND TEAM GUIDANCE:
+{}
+
+Write approximately {} words of publication-ready grant prose for this chunk only. Return prose, not the coordination heading, planning notes, JSON, or commentary. Maintain continuity with the complete plan while avoiding content assigned to other chunks. Apply relevant team rules and answer team questions only when the supplied evidence supports an answer. Never fabricate citations, results, approvals, capabilities, dates, budgets, personnel, or sponsor requirements. Preserve explicit uncertainty and insert [TEAM INPUT NEEDED: concise question] when a requested material fact is unavailable."#,
+                index+1,chunk_count,req.title,serialized_plan,chunk.heading,chunk.purpose,
+                if chunk.evidence_focus.is_empty(){"Use the relevant supported evidence and sponsor requirements in the compiled context.".to_owned()}else{chunk.evidence_focus.join("; ")},
+                chunk.transition_to_next.as_deref().unwrap_or("Conclude this section cleanly."),effective_context,section_draft_target_words);
+            let output=match s.router.generate_for_project(s.store.as_ref(),&id,ModelTask::text("collaborative_section_draft_chunk",prompt,false)).await{
+                Ok(output)=>output,
+                Err(first_error)=>{
+                    let retry_context=effective_context.split_whitespace().take((context_chunk_words/2).max(96)).collect::<Vec<_>>().join(" ");
+                    let retry_prompt=format!(r#"Draft only part {}/{} of the grant section named "{}".
+
+PART PURPOSE:
+{}
+
+BOUNDED EVIDENCE AND REQUIREMENTS:
+{}
+
+Return approximately {} words of publication-ready prose only. Do not repeat other parts, add planning commentary, or invent facts. Mark unavailable material facts as [TEAM INPUT NEEDED: concise question]. The first attempt was discarded and must not be echoed."#,index+1,chunk_count,req.title,chunk.purpose,retry_context,(section_draft_target_words/2).max(150));
+                    s.router.generate_for_project(s.store.as_ref(),&id,ModelTask::text("collaborative_section_draft_chunk_retry",retry_prompt,false)).await.map_err(|second_error|ApiError::bad_request(format!("local drafting failed for bounded section part {} of {} after an automatic smaller-context retry; first attempt: {}; retry: {}",index+1,chunk_count,first_error,second_error)))?
+                }
+            };
+            child_run_ids.push(output.generation_run_id);
+            let text=output.text.trim();
+            if text.is_empty(){return Err(ApiError::bad_request(format!("the configured model returned an empty response for bounded section part {} of {}; the section was not assembled",index+1,chunk_count)));}
+            drafted_chunks.push(text.to_owned());
+        }
+        if drafted_chunks.len()!=chunk_count{return Err(ApiError::bad_request(format!("only {} of {} bounded responses were available; the section was not assembled",drafted_chunks.len(),chunk_count)));}
+        let text=drafted_chunks.join("\n\n");
+        let compilation_manifest=serde_json::to_vec(&serde_json::json!({"section_key":section,"base_version_id":current_version,"child_generation_run_ids":&child_run_ids,"compiler":"ordered_section_draft_compilation_v1","planned_chunks":chunk_count,"completed_chunks":drafted_chunks.len()}))?;
+        let prompt_sha256=hex::encode(Sha256::digest(&compilation_manifest));
+        let run_id=s.store.begin_generation(&id,"collaborative_section_draft_compilation",&final_decision.routing_mode,"deterministic","ordered_section_draft_compilation_v1",&prompt_sha256,false,None)?;
+        s.store.complete_generation(&run_id,&hex::encode(Sha256::digest(text.as_bytes())))?;
+        (text,run_id,"deterministic".to_owned(),"ordered_section_draft_compilation_v1".to_owned(),drafted_chunks.len())
+    }else if current_chunks.len()>1{
+        let chunk_count=current_chunks.len();
+        let mut rewritten_chunks=Vec::with_capacity(chunk_count);
+        for chunk in current_chunks{
+            let prompt=format!(r#"Rewrite only chunk {}/{} of the grant section named "{}".
+
+SECTION PURPOSE:
+{}
+
+COMPILED EVIDENCE, REQUIREMENTS, AND TEAM GUIDANCE:
+{}
+
+CURRENT SECTION CHUNK:
+{}
+
+Return only the complete replacement text for this chunk. Preserve facts, citations, logical continuity, and substantive details. Apply relevant team rules and questions. Do not add a new section heading unless this chunk already contains one. Never fabricate evidence, results, personnel, dates, budgets, sponsor requirements, or institutional capabilities. Mark unsupported requested facts as [TEAM INPUT NEEDED: concise question]."#,chunk.ordinal+1,chunk_count,req.title,req.description,effective_context,chunk.text);
+            let output=s.router.generate_for_project(s.store.as_ref(),&id,ModelTask::text("collaborative_section_rewrite_chunk",prompt,false)).await?;
+            child_run_ids.push(output.generation_run_id);
+            rewritten_chunks.push(output.text.trim().to_owned());
+        }
+        let text=rewritten_chunks.join("\n\n");
+        let compilation_manifest=serde_json::to_vec(&serde_json::json!({"section_key":section,"base_version_id":current_version,"child_generation_run_ids":&child_run_ids,"compiler":"ordered_chunk_compilation_v1"}))?;
+        let prompt_sha256=hex::encode(Sha256::digest(&compilation_manifest));
+        let run_id=s.store.begin_generation(&id,"collaborative_section_chunk_compilation",&final_decision.routing_mode,"deterministic","ordered_chunk_compilation_v1",&prompt_sha256,false,None)?;
+        s.store.complete_generation(&run_id,&hex::encode(Sha256::digest(text.as_bytes())))?;
+        (text,run_id,"deterministic".to_owned(),"ordered_chunk_compilation_v1".to_owned(),chunk_count)
+    }else{
+        let prompt=format!(r#"Rewrite one section of a real grant application.
+
+SECTION TITLE:
+{}
+
+SECTION PURPOSE / DESCRIPTION:
+{}
+
+CURRENT SECTION TEXT:
+{}
+
+COMPILED EVIDENCE, SPONSOR REQUIREMENTS, WORKFLOW OPTIONS, RESEARCH, AND TEAM GUIDANCE:
+{}
+
+Return only the complete replacement section text. Apply every relevant team rule and address every team question when the supplied evidence supports an answer. Treat comments as editorial direction, not factual evidence. Never fabricate citations, results, approvals, capabilities, dates, budgets, personnel, or sponsor requirements. Preserve explicit uncertainty and insert [TEAM INPUT NEEDED: concise question] when a requested fact is unavailable."#,req.title,req.description,current_body,effective_context);
+        let output=s.router.generate_for_project(s.store.as_ref(),&id,ModelTask::text("collaborative_section_rewrite",prompt,req.high_value)).await?;
+        (output.text,output.generation_run_id,output.provider,output.model,1usize)
+    };
+    let version=s.store.save_generated_section(&id,&section,&req.title,&generated_text,None,&format!("model:{}:{}",generated_provider,generated_model),&generation_run_id,current_version,Some(&user.id)).map_err(|error|{
+        let latest=s.store.section_state_json(&id,&section).ok().and_then(|value|value.pointer("/latest/version").and_then(serde_json::Value::as_i64));
+        ApiError::conflict_details(error.to_string(),serde_json::json!({"code":"stale_generated_section","base_version_id":current_version,"current_version_id":latest,"generation_run_id":generation_run_id}))
+    })?;
+    if !child_run_ids.is_empty(){s.store.record_section_chunk_compilation(&id,&section,&generation_run_id,&child_run_ids,&user.id)?;}
+    Ok(Json(serde_json::json!({"section_key":section,"title":req.title,"description":req.description,"text":generated_text,"version":version,"provider":generated_provider,"model":generated_model,"generation_run_id":generation_run_id,"guidance_count":open_guidance.len(),"research":{"requested":research_requests.len(),"sources_saved":newly_researched.len(),"failures":research_failures,"provider":s.research.provider_name()},"chunking":{"enabled":ollama_chunking,"context_reduction_rounds":reduction_round_count,"section_chunks":section_chunk_count,"child_generation_run_ids":child_run_ids}})))
+}
+
 async fn get_section(
     State(s): State<AppState>,
     Path((id, section)): Path<(String, String)>,
@@ -3418,6 +4012,11 @@ async fn get_section_versions(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(s.store.section_versions_json(&id, &section)?))
 }
+async fn get_section_version(
+    State(s):State<AppState>,Path((id,section,version)):Path<(String,String,i64)>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    Ok(Json(s.store.section_version_json(&id,&section,version).map_err(|error|ApiError::bad_request(error.to_string()))?))
+}
 async fn compare_section_versions(
     State(s):State<AppState>,Path((id,section)):Path<(String,String)>,Query(query):Query<SectionCompareQuery>,
 )->Result<Json<serde_json::Value>,ApiError>{
@@ -3426,7 +4025,7 @@ async fn compare_section_versions(
 async fn preview_section_merge(
     State(s):State<AppState>,Extension(role):Extension<String>,Path((id,section)):Path<(String,String)>,Json(req):Json<SectionMergePreviewInput>,
 )->Result<Json<serde_json::Value>,ApiError>{
-    require_roles(&role,&["owner","pi","contributor","research_administrator"])?;
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
     if req.proposed_body.trim().is_empty(){return Err(ApiError::bad_request("proposed section body cannot be empty"));}
     Ok(Json(s.store.section_merge_preview_json(&id,&section,req.base_version_id,req.latest_version_id,&req.proposed_body).map_err(|error|ApiError::conflict(error.to_string()))?))
 }
@@ -3437,7 +4036,7 @@ async fn restore_section(
     Path((id, section)): Path<(String, String)>,
     Json(req): Json<RestoreSectionInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_roles(&role,&["owner","pi","contributor","research_administrator"])?;
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
     let _ = s.store.project_json(&id)?;
     let version = s
         .store
@@ -3544,17 +4143,14 @@ async fn save_section(
     Path((id, section)): Path<(String, String)>,
     Json(req): Json<SectionInput>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_roles(&role,&["owner","pi","contributor","research_administrator"])?;
-    require_core_step_complete(&s.store,&id,"literature")?;
-    require_optional_domain_gates(&s.store,&id)?;
-    if s.store.workflow_module_required(&id,"competitive_intelligence")?{let _=ensure_competitive_fresh(&s,&id,false).await?;}
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
     if req.body.trim().is_empty() {
         return Err(ApiError::bad_request("section body cannot be empty"));
     }
     if versioning::contains_conflict_markers(&req.body){
         return Err(ApiError::bad_request("resolve every three-way merge conflict marker before saving the section"));
     }
-    let version = s.store.save_section_edit(&id,&section,&req.title,&req.body,req.html.as_deref(),req.base_version_id,&user.id).map_err(|error|{
+    let version = s.store.save_section_edit_with_metadata(&id,&section,&req.title,req.description.as_deref(),&req.body,req.html.as_deref(),req.base_version_id,&user.id).map_err(|error|{
         let current=s.store.section_state_json(&id,&section).ok().and_then(|value|value.pointer("/latest/version").and_then(serde_json::Value::as_i64));
         ApiError::conflict_details(error.to_string(),serde_json::json!({"code":"stale_section_version","base_version_id":req.base_version_id,"current_version_id":current}))
     })?;
@@ -3688,6 +4284,13 @@ async fn export_snapshot(
         )));
     }
     Ok(Json(s.store.create_export_snapshot(&id)?))
+}
+
+async fn publish_editor_snapshot(
+    State(s):State<AppState>,Extension(user):Extension<AuthUser>,Extension(role):Extension<String>,Path(id):Path<String>,
+)->Result<Json<serde_json::Value>,ApiError>{
+    require_roles(&role,&["owner","pi","contributor","reviewer","approver","research_administrator"])?;
+    Ok(Json(s.store.create_editor_publish_snapshot(&id,&user.id).map_err(|error|ApiError::conflict(error.to_string()))?))
 }
 
 async fn rebuild_index(

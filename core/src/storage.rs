@@ -81,6 +81,15 @@ pub struct StagedResearchRun {
     pub failures: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct EditorDocumentSectionChange {
+    pub key:String,
+    pub title:String,
+    pub description:String,
+    pub body:String,
+    pub base_version_id:Option<i64>,
+}
+
 impl Store {
     fn configure(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -142,6 +151,12 @@ impl Store {
         if !Self::has_column(conn, "project_sections", "origin")? {
             conn.execute(
                 "ALTER TABLE project_sections ADD COLUMN origin TEXT NOT NULL DEFAULT 'configured'",
+                [],
+            )?;
+        }
+        if !Self::has_column(conn, "project_sections", "description")? {
+            conn.execute(
+                "ALTER TABLE project_sections ADD COLUMN description TEXT NOT NULL DEFAULT ''",
                 [],
             )?;
         }
@@ -588,6 +603,7 @@ impl Store {
         CREATE TABLE IF NOT EXISTS project_sections(
           project_id TEXT NOT NULL, section_key TEXT NOT NULL, title TEXT NOT NULL,
           position INTEGER NOT NULL, required INTEGER NOT NULL DEFAULT 1, origin TEXT NOT NULL DEFAULT 'configured',
+          description TEXT NOT NULL DEFAULT '',
           created_at TEXT DEFAULT CURRENT_TIMESTAMP,
           PRIMARY KEY(project_id,section_key), FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
@@ -2295,20 +2311,146 @@ impl Store {
         Ok(())
     }
 
+    pub fn ensure_editor_section(
+        &self,
+        project: &str,
+        key: &str,
+        title: &str,
+        description: &str,
+    ) -> Result<()> {
+        let key=key.trim();
+        let title=title.trim();
+        if key.is_empty()||title.is_empty(){bail!("section key and title are required");}
+        let mut c=self.conn()?;
+        let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let next:i64=tx.query_row("SELECT COALESCE(MAX(position),-1)+1 FROM project_sections WHERE project_id=?1",[project],|row|row.get(0))?;
+        tx.execute("INSERT OR IGNORE INTO project_sections(project_id,section_key,title,description,position,required,origin) VALUES(?1,?2,?3,?4,?5,1,'document_editor')",params![project,key,title,description.trim(),next])?;
+        tx.execute("UPDATE project_sections SET title=?1,description=?2 WHERE project_id=?3 AND section_key=?4",params![title,description.trim(),project,key])?;
+        Self::touch_project_conn(&tx,project)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn update_editor_section_metadata(
+        &self,
+        project:&str,
+        key:&str,
+        title:&str,
+        description:&str,
+        actor:&str,
+    )->Result<Value>{
+        let title=title.trim();
+        if title.is_empty()||title.len()>500{bail!("section title must contain 1-500 characters");}
+        if description.len()>4000{bail!("section description cannot exceed 4000 characters");}
+        let mut c=self.conn()?;
+        let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed=tx.execute("UPDATE project_sections SET title=?1,description=?2 WHERE project_id=?3 AND section_key=?4",params![title,description.trim(),project,key])?;
+        if changed!=1{bail!("project section does not exist");}
+        tx.execute("INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'section_metadata_updated',?2,?3)",params![project,actor,json!({"section_key":key,"title":title,"description":description.trim()}).to_string()])?;
+        Self::touch_project_conn(&tx,project)?;
+        tx.commit()?;
+        Ok(json!({"section_key":key,"title":title,"description":description.trim()}))
+    }
+
+    pub fn reorder_editor_sections(&self,project:&str,section_keys:&[String],actor:&str)->Result<Value>{
+        if section_keys.is_empty(){bail!("section order cannot be empty");}
+        let mut seen=BTreeSet::new();
+        if section_keys.iter().any(|key|key.trim().is_empty()||!seen.insert(key.trim().to_owned())){bail!("section order contains a blank or duplicate key");}
+        let mut c=self.conn()?;
+        let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing:i64=tx.query_row("SELECT COUNT(*) FROM project_sections WHERE project_id=?1",[project],|row|row.get(0))?;
+        if existing!=section_keys.len() as i64{bail!("section order must include every active section exactly once");}
+        for key in section_keys{
+            let exists:i64=tx.query_row("SELECT COUNT(*) FROM project_sections WHERE project_id=?1 AND section_key=?2",params![project,key.trim()],|row|row.get(0))?;
+            if exists!=1{bail!("section order includes an unknown section key: {}",key);}
+        }
+        // Move through unique temporary positions before assigning the requested order.
+        tx.execute("UPDATE project_sections SET position=-(position+1) WHERE project_id=?1",[project])?;
+        for (position,key) in section_keys.iter().enumerate(){
+            tx.execute("UPDATE project_sections SET position=?1 WHERE project_id=?2 AND section_key=?3",params![position as i64,project,key.trim()])?;
+        }
+        tx.execute("INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'section_order_updated',?2,?3)",params![project,actor,json!({"section_keys":section_keys}).to_string()])?;
+        Self::touch_project_conn(&tx,project)?;
+        tx.commit()?;
+        self.project_sections_json(project)
+    }
+
     pub fn project_sections_json(&self, project: &str) -> Result<Value> {
         let c = self.conn()?;
         let mut st=c.prepare(r#"
-          SELECT ps.section_key,ps.title,ps.position,ps.required,ps.origin,
+          SELECT ps.section_key,ps.title,ps.description,ps.position,ps.required,ps.origin,
                  (SELECT sv.id FROM section_versions sv WHERE sv.project_id=ps.project_id AND sv.section_key=ps.section_key ORDER BY sv.id DESC LIMIT 1) latest_version,
                  (SELECT sv.id FROM section_versions sv WHERE sv.project_id=ps.project_id AND sv.section_key=ps.section_key AND sv.approved=1 ORDER BY sv.id DESC LIMIT 1) approved_version
           FROM project_sections ps WHERE ps.project_id=?1 ORDER BY ps.position,ps.section_key
         "#)?;
-        let rows=st.query_map([project],|r|Ok(json!({"section_key":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"position":r.get::<_,i64>(2)?,"required":r.get::<_,i64>(3)?!=0,"origin":r.get::<_,String>(4)?,"latest_version":r.get::<_,Option<i64>>(5)?,"approved_version":r.get::<_,Option<i64>>(6)?})))?;
+        let rows=st.query_map([project],|r|Ok(json!({"section_key":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"description":r.get::<_,String>(2)?,"position":r.get::<_,i64>(3)?,"required":r.get::<_,i64>(4)?!=0,"origin":r.get::<_,String>(5)?,"latest_version":r.get::<_,Option<i64>>(6)?,"approved_version":r.get::<_,Option<i64>>(7)?})))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
         }
         Ok(json!(out))
+    }
+
+    pub fn editor_document_json(&self,project:&str)->Result<Value>{
+        let c=self.conn()?;
+        let mut statement=c.prepare(r#"
+          SELECT ps.section_key,ps.title,ps.description,ps.position,ps.required,ps.origin,
+                 sv.id,sv.body,sv.source,sv.created_at,COALESCE(u.display_name,sv.editor_name,sv.author_user_id)
+          FROM project_sections ps
+          LEFT JOIN section_versions sv ON sv.id=(
+            SELECT latest.id FROM section_versions latest
+            WHERE latest.project_id=ps.project_id AND latest.section_key=ps.section_key
+            ORDER BY latest.id DESC LIMIT 1
+          )
+          LEFT JOIN users u ON u.id=sv.author_user_id
+          WHERE ps.project_id=?1
+          ORDER BY ps.position,ps.section_key
+        "#)?;
+        let rows=statement.query_map([project],|row|Ok(json!({
+            "section_key":row.get::<_,String>(0)?,"title":row.get::<_,String>(1)?,"description":row.get::<_,String>(2)?,
+            "position":row.get::<_,i64>(3)?,"required":row.get::<_,i64>(4)?!=0,"origin":row.get::<_,String>(5)?,
+            "version":row.get::<_,Option<i64>>(6)?,"body":row.get::<_,Option<String>>(7)?.unwrap_or_default(),
+            "source":row.get::<_,Option<String>>(8)?,"created_at":row.get::<_,Option<String>>(9)?,"editor":row.get::<_,Option<String>>(10)?
+        })))?;
+        let mut sections=Vec::new();
+        for row in rows{sections.push(row?);}
+        Ok(json!({"project_id":project,"sections":sections}))
+    }
+
+    pub fn save_editor_document(&self,project:&str,changes:&[EditorDocumentSectionChange],actor:&str)->Result<Value>{
+        if changes.is_empty(){return Ok(json!({"saved":[],"document":self.editor_document_json(project)?}));}
+        let mut seen=BTreeSet::new();
+        for change in changes{
+            let key=change.key.trim();
+            let title=change.title.trim();
+            if key.is_empty()||!seen.insert(key.to_owned()){bail!("document save contains a blank or duplicate section key");}
+            if title.is_empty()||title.len()>500{bail!("section title must contain 1-500 characters");}
+            if change.description.len()>4000{bail!("section description cannot exceed 4000 characters");}
+        }
+        let mut c=self.conn()?;
+        let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for change in changes{
+            let exists:i64=tx.query_row("SELECT COUNT(*) FROM project_sections WHERE project_id=?1 AND section_key=?2",params![project,change.key.trim()],|row|row.get(0))?;
+            if exists!=1{bail!("project section '{}' does not exist",change.key);}
+            let latest:Option<i64>=tx.query_row("SELECT id FROM section_versions WHERE project_id=?1 AND section_key=?2 ORDER BY id DESC LIMIT 1",params![project,change.key.trim()],|row|row.get(0)).optional()?;
+            if latest!=change.base_version_id{
+                bail!("section '{}' changed since the document loaded: expected version {}, found {}",change.title,change.base_version_id.map_or_else(||"none".into(),|value|value.to_string()),latest.map_or_else(||"none".into(),|value|value.to_string()));
+            }
+        }
+        let mut saved=Vec::with_capacity(changes.len());
+        for change in changes{
+            let key=change.key.trim();
+            let title=change.title.trim();
+            tx.execute("UPDATE project_sections SET title=?1,description=?2 WHERE project_id=?3 AND section_key=?4",params![title,change.description.trim(),project,key])?;
+            tx.execute("INSERT INTO section_versions(project_id,section_key,title,body,source,editor_name,author_user_id,base_version_id) VALUES(?1,?2,?3,?4,'human_edit',?5,?5,?6)",params![project,key,title,change.body,actor,change.base_version_id])?;
+            let version=tx.last_insert_rowid();
+            tx.execute("INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'section_version_created',?2,?3)",params![project,actor,json!({"section_key":key,"version_id":version,"base_version_id":change.base_version_id,"source":"human_edit","title":title,"description":change.description.trim(),"document_save":true}).to_string()])?;
+            saved.push(json!({"section_key":key,"version":version}));
+        }
+        tx.execute("INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'document_saved',?2,?3)",params![project,actor,json!({"section_count":saved.len(),"sections":&saved}).to_string()])?;
+        Self::touch_project_conn(&tx,project)?;
+        tx.commit()?;
+        Ok(json!({"saved":saved,"document":self.editor_document_json(project)?}))
     }
 
     pub fn save_section(
@@ -2377,16 +2519,26 @@ impl Store {
         &self,project:&str,key:&str,title:&str,body:&str,html:Option<&str>,
         expected_latest:Option<i64>,actor:&str,
     )->Result<i64>{
+        self.save_section_edit_with_metadata(project,key,title,None,body,html,expected_latest,actor)
+    }
+
+    pub fn save_section_edit_with_metadata(
+        &self,project:&str,key:&str,title:&str,description:Option<&str>,body:&str,html:Option<&str>,
+        expected_latest:Option<i64>,actor:&str,
+    )->Result<i64>{
+        let title=title.trim();
+        if title.is_empty()||title.len()>500{bail!("section title must contain 1-500 characters");}
+        if description.is_some_and(|value|value.len()>4000){bail!("section description cannot exceed 4000 characters");}
         let mut c=self.conn()?;
         let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let latest:Option<i64>=tx.query_row("SELECT id FROM section_versions WHERE project_id=?1 AND section_key=?2 ORDER BY id DESC LIMIT 1",params![project,key],|row|row.get(0)).optional()?;
         if latest!=expected_latest{bail!("section changed since editing began: expected base version {}, found {}",expected_latest.map_or_else(||"none".into(),|value|value.to_string()),latest.map_or_else(||"none".into(),|value|value.to_string()));}
         let exists:i64=tx.query_row("SELECT COUNT(*) FROM project_sections WHERE project_id=?1 AND section_key=?2",params![project,key],|row|row.get(0))?;
         if exists!=1{bail!("project section does not exist");}
-        tx.execute("UPDATE project_sections SET title=?1 WHERE project_id=?2 AND section_key=?3",params![title.trim(),project,key])?;
+        tx.execute("UPDATE project_sections SET title=?1,description=COALESCE(?2,description) WHERE project_id=?3 AND section_key=?4",params![title,description.map(str::trim),project,key])?;
         tx.execute("INSERT INTO section_versions(project_id,section_key,title,body,html,source,editor_name,author_user_id,base_version_id) VALUES(?1,?2,?3,?4,?5,'human_edit',?6,?6,?7)",params![project,key,title,body,html,actor,latest])?;
         let id=tx.last_insert_rowid();
-        tx.execute("INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'section_version_created',?2,?3)",params![project,actor,json!({"section_key":key,"version_id":id,"base_version_id":latest,"source":"human_edit"}).to_string()])?;
+        tx.execute("INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'section_version_created',?2,?3)",params![project,actor,json!({"section_key":key,"version_id":id,"base_version_id":latest,"source":"human_edit","title":title,"description":description.map(str::trim)}).to_string()])?;
         Self::touch_project_conn(&tx,project)?;
         tx.commit()?;
         Ok(id)
@@ -2396,13 +2548,16 @@ impl Store {
         let c = self.conn()?;
         let mut st = c.prepare(
             r#"
-          SELECT id,created_at,source,COALESCE(author_user_id,editor_name),approved,length(body),
-                 base_version_id,restored_from_version_id,
-                 CASE WHEN length(body)>180 THEN substr(body,1,180)||'…' ELSE body END
-          FROM section_versions WHERE project_id=?1 AND section_key=?2 ORDER BY id DESC LIMIT 100
+          SELECT sv.id,sv.created_at,sv.source,COALESCE(u.display_name,sv.editor_name,sv.author_user_id),sv.approved,length(sv.body),
+                 sv.base_version_id,sv.restored_from_version_id,
+                 CASE WHEN length(sv.body)>180 THEN substr(sv.body,1,180)||'…' ELSE sv.body END,
+                 sv.author_user_id
+          FROM section_versions sv
+          LEFT JOIN users u ON u.id=sv.author_user_id
+          WHERE sv.project_id=?1 AND sv.section_key=?2 ORDER BY sv.id DESC LIMIT 100
         "#,
         )?;
-        let rows=st.query_map(params![project,key],|r|Ok(json!({"version":r.get::<_,i64>(0)?,"created_at":r.get::<_,String>(1)?,"source":r.get::<_,String>(2)?,"editor":r.get::<_,Option<String>>(3)?,"approved":r.get::<_,i64>(4)?!=0,"characters":r.get::<_,i64>(5)?,"base_version_id":r.get::<_,Option<i64>>(6)?,"restored_from_version_id":r.get::<_,Option<i64>>(7)?,"preview":r.get::<_,String>(8)?})))?;
+        let rows=st.query_map(params![project,key],|r|Ok(json!({"version":r.get::<_,i64>(0)?,"created_at":r.get::<_,String>(1)?,"source":r.get::<_,String>(2)?,"editor":r.get::<_,Option<String>>(3)?,"approved":r.get::<_,i64>(4)?!=0,"characters":r.get::<_,i64>(5)?,"base_version_id":r.get::<_,Option<i64>>(6)?,"restored_from_version_id":r.get::<_,Option<i64>>(7)?,"preview":r.get::<_,String>(8)?,"author_user_id":r.get::<_,Option<String>>(9)?})))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -2668,8 +2823,8 @@ impl Store {
 
     pub fn section_state_json(&self, project: &str, key: &str) -> Result<Value> {
         let c = self.conn()?;
-        let meta=c.query_row("SELECT title,position,required FROM project_sections WHERE project_id=?1 AND section_key=?2",params![project,key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?!=0))).optional()?;
-        let Some((title, position, required)) = meta else {
+        let meta=c.query_row("SELECT title,description,position,required FROM project_sections WHERE project_id=?1 AND section_key=?2",params![project,key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?!=0))).optional()?;
+        let Some((title, description, position, required)) = meta else {
             return Ok(json!({"section_key":key,"exists":false}));
         };
         let latest=c.query_row("SELECT id,body,html,source,approved,created_at FROM section_versions WHERE project_id=?1 AND section_key=?2 ORDER BY id DESC LIMIT 1",params![project,key],|r|Ok(json!({"version":r.get::<_,i64>(0)?,"body":r.get::<_,String>(1)?,"html":r.get::<_,Option<String>>(2)?,"source":r.get::<_,String>(3)?,"approved":r.get::<_,i64>(4)?!=0,"created_at":r.get::<_,String>(5)?}))).optional()?;
@@ -2689,7 +2844,7 @@ impl Store {
             Ok(json!({"id":r.get::<_,i64>(0)?,"event_id":r.get::<_,i64>(1)?,"base_version":r.get::<_,i64>(2)?,"proposed_version":r.get::<_,i64>(3)?,"status":r.get::<_,String>(4)?,"from_run_id":r.get::<_,Option<i64>>(5)?,"to_run_id":r.get::<_,i64>(6)?,"summary":r.get::<_,String>(7)?,"delta":serde_json::from_str::<Value>(&delta_raw).unwrap_or(json!({})),"refresh_reason":serde_json::from_str::<Value>(&reason_raw).unwrap_or(json!([])),"created_at":r.get::<_,String>(10)?,"base_body":r.get::<_,String>(11)?,"proposed_body":r.get::<_,String>(12)?}))
         }).optional()?;
         Ok(
-            json!({"section_key":key,"exists":true,"title":title,"position":position,"required":required,"latest":latest,"approved":approved,"competitive_update":competitive_update}),
+            json!({"section_key":key,"exists":true,"title":title,"description":description,"position":position,"required":required,"latest":latest,"approved":approved,"competitive_update":competitive_update}),
         )
     }
 
@@ -3035,6 +3190,31 @@ impl Store {
         let c = self.conn()?;
         c.execute("INSERT INTO research_queries(project_id,requirement_external_id,query,preferred_domains_json,rationale) VALUES(?1,?2,?3,?4,?5)",params![project,requirement_id,query,serde_json::to_string(domains)?,rationale])?;
         Ok(c.last_insert_rowid())
+    }
+    pub fn latest_research_query_status(&self,project:&str,requirement_id:&str)->Result<Option<String>>{
+        self.conn()?.query_row(
+            "SELECT status FROM research_queries WHERE project_id=?1 AND requirement_external_id=?2 ORDER BY id DESC LIMIT 1",
+            params![project,requirement_id],
+            |row|row.get(0),
+        ).optional().map_err(Into::into)
+    }
+    pub fn record_section_chunk_compilation(
+        &self,project:&str,section_key:&str,compilation_run_id:&str,child_run_ids:&[String],actor:&str,
+    )->Result<()>{
+        if child_run_ids.is_empty(){bail!("chunk compilation requires at least one child generation run");}
+        let c=self.conn()?;
+        let child_ids_json=serde_json::to_string(child_run_ids)?;
+        let valid:i64=c.query_row(
+            "SELECT COUNT(*) FROM generation_runs WHERE project_id=?1 AND id IN (SELECT value FROM json_each(?2)) AND status='complete'",
+            params![project,child_ids_json],
+            |row|row.get(0),
+        )?;
+        if valid!=child_run_ids.len() as i64{bail!("chunk compilation references an incomplete or foreign generation run");}
+        c.execute(
+            "INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'section_chunks_compiled',?2,?3)",
+            params![project,actor,json!({"section_key":section_key,"compilation_run_id":compilation_run_id,"child_generation_run_ids":child_run_ids,"compiler":"ordered_chunk_compilation_v1"}).to_string()],
+        )?;
+        Ok(())
     }
     pub fn mark_research_query(&self, id: i64, status: &str) -> Result<()> {
         self.conn()?.execute(
@@ -3870,6 +4050,43 @@ impl Store {
         Ok(json!({"snapshot_id":snapshot_id,"sha256":sha,"snapshot":snapshot}))
     }
 
+    /// Publish the exact latest collaborative section versions without converting
+    /// advisory workflow state into an artificial export blocker. The immutable
+    /// snapshot and audit event preserve who published which versions.
+    pub fn create_editor_publish_snapshot(&self,project:&str,actor:&str)->Result<Value>{
+        let sections=self.latest_sections_json(project)?;
+        let section_rows=sections.as_array().context("latest sections must be an array")?;
+        if section_rows.is_empty(){bail!("add or generate at least one grant section before publishing");}
+        if let Some(section)=section_rows.iter().find(|section|section.get("body").and_then(Value::as_str).is_none_or(|body|body.trim().is_empty())){
+            bail!("section '{}' is empty; write or remove it before publishing",section.get("title").and_then(Value::as_str).unwrap_or("Untitled section"));
+        }
+        let project_meta=self.project_json(project)?;
+        let workflow_record=self.workflow_config_record_json(project)?;
+        let workflow_artifacts=self.workflow_artifact_manifest_json(project)?;
+        let design_profile=self.design_profile_json(project)?;
+        let snapshot=json!({
+            "publication_mode":"latest_collaborative_versions",
+            "published_by_user_id":actor,
+            "project":project_meta,
+            "workflow_definition_version":self.workflow_registry.definition_version,
+            "workflow_definition_sha256":self.workflow_registry.definition_sha256()?,
+            "workflow_configuration":workflow_record,
+            "workflow_artifacts":workflow_artifacts,
+            "design_profile":design_profile,
+            "sections":sections,
+        });
+        let bytes=serde_json::to_vec(&snapshot)?;
+        let sha=sha256_hex(&bytes);
+        let mut c=self.conn()?;
+        let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO export_snapshots(project_id,snapshot_json,content_sha256) VALUES(?1,?2,?3)",params![project,String::from_utf8(bytes)?,sha])?;
+        let snapshot_id=tx.last_insert_rowid();
+        tx.execute("INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'grant_published',?2,?3)",params![project,actor,json!({"snapshot_id":snapshot_id,"sha256":sha,"section_versions":section_rows.iter().map(|section|json!({"section_key":section.get("section_key"),"version":section.get("version")})).collect::<Vec<_>>()}).to_string()])?;
+        Self::touch_project_conn(&tx,project)?;
+        tx.commit()?;
+        Ok(json!({"snapshot_id":snapshot_id,"sha256":sha,"snapshot":snapshot}))
+    }
+
     pub fn portable_project_package(&self, project:&str)->Result<Value>{
         let c=self.conn()?;
         let project_meta=self.project_json(project)?;
@@ -3889,7 +4106,7 @@ impl Store {
         let mut research_sources=Vec::new();
         {let mut st=c.prepare("SELECT id,query_id,title,url,text,retrieved_at,content_sha256,http_status FROM research_sources WHERE project_id=?1 ORDER BY id")?;for row in st.query_map([project],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"query_id":r.get::<_,Option<i64>>(1)?,"title":r.get::<_,String>(2)?,"url":r.get::<_,String>(3)?,"text":r.get::<_,String>(4)?,"retrieved_at":r.get::<_,String>(5)?,"content_sha256":r.get::<_,String>(6)?,"http_status":r.get::<_,i64>(7)?})))?{research_sources.push(row?);}}
         let mut sections=Vec::new();
-        {let mut st=c.prepare("SELECT section_key,title,position,required,origin,created_at FROM project_sections WHERE project_id=?1 ORDER BY position,section_key")?;for row in st.query_map([project],|r|Ok(json!({"section_key":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"position":r.get::<_,i64>(2)?,"required":r.get::<_,i64>(3)?!=0,"origin":r.get::<_,String>(4)?,"created_at":r.get::<_,String>(5)?})))?{sections.push(row?);}}
+        {let mut st=c.prepare("SELECT section_key,title,description,position,required,origin,created_at FROM project_sections WHERE project_id=?1 ORDER BY position,section_key")?;for row in st.query_map([project],|r|Ok(json!({"section_key":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"description":r.get::<_,String>(2)?,"position":r.get::<_,i64>(3)?,"required":r.get::<_,i64>(4)?!=0,"origin":r.get::<_,String>(5)?,"created_at":r.get::<_,String>(6)?})))?{sections.push(row?);}}
         let mut generation_runs=Vec::new();
         {let mut st=c.prepare("SELECT id,task_kind,routing_mode,provider,model,prompt_sha256,response_sha256,input_manifest_json,input_manifest_sha256,high_value,status,error,started_at,completed_at,output_contract_name,output_contract_version,output_schema_json,output_schema_sha256 FROM generation_runs WHERE project_id=?1 ORDER BY started_at,id")?;for row in st.query_map([project],|r|Ok(json!({"id":r.get::<_,String>(0)?,"task_kind":r.get::<_,String>(1)?,"routing_mode":r.get::<_,String>(2)?,"provider":r.get::<_,String>(3)?,"model":r.get::<_,String>(4)?,"prompt_sha256":r.get::<_,String>(5)?,"response_sha256":r.get::<_,Option<String>>(6)?,"input_manifest_json":r.get::<_,Option<String>>(7)?,"input_manifest_sha256":r.get::<_,Option<String>>(8)?,"high_value":r.get::<_,i64>(9)?!=0,"status":r.get::<_,String>(10)?,"error":r.get::<_,Option<String>>(11)?,"started_at":r.get::<_,String>(12)?,"completed_at":r.get::<_,Option<String>>(13)?,"output_contract_name":r.get::<_,Option<String>>(14)?,"output_contract_version":r.get::<_,Option<i64>>(15)?,"output_schema_json":r.get::<_,Option<String>>(16)?,"output_schema_sha256":r.get::<_,Option<String>>(17)?})))?{generation_runs.push(row?);}}
         if generation_runs.iter().any(|run|run.get("status").and_then(Value::as_str)==Some("running")){bail!("project has an active model generation; wait for it to finish before creating a portable package");}
@@ -4030,7 +4247,7 @@ impl Store {
         }
 
         for section in portable_array_object(payload,"sections")?{
-            tx.execute("INSERT INTO project_sections(project_id,section_key,title,position,required,origin,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![project_id,portable_str(section,"section_key")?,portable_str(section,"title")?,portable_i64(section,"position")?,portable_bool(section,"required")? as i64,portable_str(section,"origin")?,portable_str(section,"created_at")?])?;
+            tx.execute("INSERT INTO project_sections(project_id,section_key,title,description,position,required,origin,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![project_id,portable_str(section,"section_key")?,portable_str(section,"title")?,section.get("description").and_then(Value::as_str).unwrap_or(""),portable_i64(section,"position")?,portable_bool(section,"required")? as i64,portable_str(section,"origin")?,portable_str(section,"created_at")?])?;
         }
         let mut version_map=std::collections::BTreeMap::new();
         for version in portable_array_object(payload,"section_versions")?{

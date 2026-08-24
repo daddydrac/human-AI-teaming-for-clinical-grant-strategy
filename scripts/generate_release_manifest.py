@@ -26,7 +26,7 @@ manifest={
  'generated_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
  'source_files':files,
  'locks':{'cargo_lock_present':(root/'core/Cargo.lock').exists(),'cargo_lock_sha256':sha(pathlib.Path('core/Cargo.lock')),'competitive_config_sha256':sha(pathlib.Path('config/competitive_intelligence.json')),'sponsor_formats_sha256':sha(pathlib.Path('config/sponsor_formats.json'))},
- 'runtime_defaults':{'competitive_refresh_seconds':14400,'ports':{'ui':7860,'core':8080,'renderer':8090,'embedding_cpu':8010,'ollama':11434},'weak_mac_profile':'docker_cpu','apple_silicon_profile':'container_ollama','apple_silicon_8gb_local_profile':'container_ollama'},
+ 'runtime_defaults':{'competitive_refresh_seconds':14400,'ports':{'ui':7860,'core':8080,'renderer':8090,'embedding_cpu':8010,'ollama':11434},'claude_only_profile':'docker_cpu','apple_silicon_profile':'apple_ollama','apple_silicon_8gb_local_profile':'apple_ollama','linux_nvidia_profile':'linux_nvidia_ollama'},
  'container_base_references':base_images,
  'build_environment':{'platform':platform.platform(),'machine':platform.machine()},
  'model_provenance':'Apple MLX startup resolves model repositories to immutable revisions and records them at runtime; release operators should preserve the generated runtime manifest with regulated runs.',

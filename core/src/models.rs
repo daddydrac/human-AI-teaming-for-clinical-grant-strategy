@@ -232,8 +232,8 @@ fn vllm_request_body(model:&str,system:&str,prompt:&str,max_tokens:usize,contrac
     body
 }
 
-fn ollama_request_body(model:&str,system:&str,prompt:&str,max_tokens:usize,contract:Option<&StructuredOutputContract>)->Value{
-    let mut body=json!({"model":model,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"stream":false,"options":{"temperature":0.1,"num_predict":max_tokens}});
+fn ollama_request_body(model:&str,system:&str,prompt:&str,max_tokens:usize,context_tokens:usize,contract:Option<&StructuredOutputContract>)->Value{
+    let mut body=json!({"model":model,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"stream":false,"options":{"temperature":0.1,"num_predict":max_tokens,"num_ctx":context_tokens}});
     if let Some(contract)=contract{body["format"]=contract.schema.clone();}
     body
 }
@@ -530,6 +530,12 @@ impl ModelRouter {
             .ok()
             .and_then(|x| x.parse().ok())
             .unwrap_or(4096usize);
+        let context_tokens = std::env::var("LOCAL_LLM_CONTEXT_TOKENS")
+            .or_else(|_| std::env::var("OLLAMA_CONTEXT_LENGTH"))
+            .ok()
+            .and_then(|x| x.parse::<usize>().ok())
+            .unwrap_or(max_tokens.saturating_add(2048))
+            .max(max_tokens.saturating_add(512));
         let prompt = if self.local_prompt_prefix.trim().is_empty() {
             t.prompt
         } else {
@@ -542,7 +548,7 @@ impl ModelRouter {
             }
             LocalBackend::Ollama=>{
                 let base=self.local_url.split("/v1/").next().unwrap_or(&self.local_url).split("/api/").next().unwrap_or(&self.local_url).trim_end_matches('/');
-                (format!("{base}/api/chat"),ollama_request_body(&self.local_model,system,&prompt,max_tokens,t.output_contract.as_ref()))
+                (format!("{base}/api/chat"),ollama_request_body(&self.local_model,system,&prompt,max_tokens,context_tokens,t.output_contract.as_ref()))
             }
         };
         let r=self.client.post(url).json(&payload).send().await?.error_for_status()?;
@@ -670,9 +676,10 @@ mod contract_mock_tests {
         assert_eq!(vllm.pointer("/response_format/json_schema/name").and_then(Value::as_str),Some("contract_fixture"));
         assert_eq!(vllm.pointer("/response_format/json_schema/schema"),Some(&contract.schema));
 
-        let ollama=ollama_request_body("qwen3:1.7b","system","prompt",512,Some(&contract));
+        let ollama=ollama_request_body("qwen3:1.7b","system","prompt",512,4096,Some(&contract));
         assert_eq!(ollama.get("format"),Some(&contract.schema));
         assert_eq!(ollama.pointer("/options/num_predict").and_then(Value::as_u64),Some(512));
+        assert_eq!(ollama.pointer("/options/num_ctx").and_then(Value::as_u64),Some(4096));
 
         let claude=claude_request_body("claude-test","prompt",512,Some(&contract));
         assert_eq!(claude.pointer("/tools/0/input_schema"),Some(&contract.schema));

@@ -1,5 +1,9 @@
-import contextvars, difflib, hashlib, hmac, html, inspect, json, math, os, secrets, shutil, uuid, zipfile, requests, gradio as gr
+import contextvars, difflib, hashlib, hmac, html, inspect, json, math, os, re, secrets, shutil, smtplib, ssl, uuid, zipfile, requests, gradio as gr
 from datetime import date, datetime, timezone
+from email.headerregistry import Address
+from email.message import EmailMessage
+from email.utils import parseaddr
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, quote
@@ -46,6 +50,16 @@ def load_default_sections():
     except Exception:return []
 DEFAULT_SECTIONS=load_default_sections()
 
+def load_editor_sections():
+    key_for=lambda title:re.sub(r"[^a-z0-9]+","_",str(title).lower()).strip("_")
+    try:
+        items=json.loads((CONFIG_ROOT/"editor_sections.json").read_text())
+        return [{"key":key_for(item["title"]),"title":str(item["title"]).strip(),"description":str(item.get("description") or "").strip()} for item in items if str(item.get("title") or "").strip()]
+    except Exception:
+        return [{"key":key_for(title),"title":title,"description":""} for title in DEFAULT_SECTIONS]
+
+EDITOR_SECTIONS=load_editor_sections()
+
 # Project roles are an API contract, not free-form user data. All project-role
 # controls share these constrained values.
 PROJECT_ROLE_CHOICES=[
@@ -87,6 +101,8 @@ CSS="""
 .wizard-hero{border-color:#573468!important;background:linear-gradient(145deg,rgba(168,85,247,.11),rgba(21,18,29,.96))!important;min-height:220px}
 .wizard-option-grid .wrap{gap:14px!important}
 .wizard-option-grid label{border:1px solid var(--gs-border)!important;border-radius:14px!important;background:var(--gs-panel)!important;padding:18px!important;min-height:72px;transition:.18s ease}.wizard-option-grid label:has(input:checked){border-color:#8e4db8!important;background:#23162d!important;box-shadow:inset 0 0 0 1px rgba(192,108,244,.25)}
+.wizard-option-grid input[type=radio],.wizard-choice input[type=radio]{accent-color:#c06cf4!important;width:18px!important;height:18px!important;opacity:1!important}.wizard-option-grid label:has(input:checked) input[type=radio],.wizard-choice label:has(input:checked) input[type=radio]{outline:2px solid #f0c8ff!important;outline-offset:2px!important}
+.wizard-summary-table{display:flex!important;flex-direction:column!important;gap:0!important;background:transparent!important}.wizard-summary-row{display:grid!important;grid-template-columns:minmax(0,1fr) minmax(330px,430px)!important;gap:24px!important;align-items:center!important;padding:16px 4px!important;border:0!important;border-bottom:1px solid rgba(75,63,87,.42)!important;background:transparent!important}.wizard-summary-row:last-child{border-bottom:0!important}.wizard-summary-copy h3{margin:0 0 4px!important;font-size:16px!important}.wizard-summary-copy p{margin:0!important;color:#a69dac!important;font-size:12px!important;line-height:1.5!important}.wizard-summary-copy small{display:block!important;margin-top:6px!important;color:#766d7e!important}.wizard-choice{min-width:0!important}.wizard-choice .wrap{padding:5px!important}.wizard-choice label{min-height:42px!important;padding:8px 10px!important;border-radius:8px!important}.core-included{justify-self:end;padding:8px 12px;border-radius:999px;background:#18362d;color:#62deb0;font-size:12px;font-weight:800}.skip-all-panel{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:13px 16px;margin-bottom:6px;border-radius:10px;background:#18141f}.skip-all-panel p{margin:0;color:#bcb3c4;font-size:12px}.skip-all-panel button{width:auto!important;min-width:230px!important}
 .core-flow{display:grid;grid-template-columns:1fr;gap:0;margin:24px 0;border:1px solid var(--gs-border);border-radius:18px;overflow:hidden;background:var(--gs-panel)}
 .core-step{display:grid;grid-template-columns:54px 1fr minmax(150px,240px);gap:16px;align-items:center;padding:20px 24px;border-bottom:1px solid var(--gs-border);min-height:98px}.core-step:last-child{border-bottom:0}.core-step .step-no{height:44px;width:44px;border:1px solid #56326c;border-radius:12px;display:grid;place-items:center;color:#c06cf4}.core-step b{display:block;color:#f5eff9;margin-bottom:5px}.core-step span,.core-step small{font-size:13px;color:var(--gs-muted)}.core-step .output{text-align:right;font-size:12px;color:#b2a8bc}
 .module-catalog{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:16px 0 24px}.module-card{border:1px solid var(--gs-border);border-radius:15px;padding:18px;background:var(--gs-panel);min-height:155px}.module-card.gated{border-left:3px solid #8f45bc}.module-card b{color:#f4eef8}.module-card .placement{color:#b25ee8;font-size:11px;margin:8px 0}.module-card p{color:var(--gs-muted);font-size:12px;line-height:1.55}.module-card small{color:#746c7e}
@@ -103,7 +119,16 @@ CSS="""
 .version-diff{overflow:auto;border:1px solid var(--gs-border);border-radius:12px;background:#fff;color:#17131c;padding:12px}.version-diff table{border-collapse:collapse;width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.version-diff th,.version-diff td{padding:3px 6px;vertical-align:top;white-space:pre-wrap}.version-diff .diff_header{background:#ece8f0}.version-diff .diff_add{background:#d9f8e9}.version-diff .diff_sub{background:#ffe1e1}.version-diff .diff_chg{background:#fff2b8}
 .status{font-size:12px;padding:8px 12px;border-radius:8px;background:var(--gs-panel)}
 .question-card{padding:18px;border:1px solid var(--gs-border);border-radius:10px;background:var(--gs-panel)}
+.global-nav{width:100%;box-sizing:border-box;display:flex;align-items:center;gap:18px;padding:9px 20px;margin:0 0 12px;border-bottom:1px solid #33283d;background:#100d17}.global-nav .brand{margin-right:auto;color:#f5f0fa;font-size:13px;font-weight:800;letter-spacing:.04em}.global-nav button{appearance:none;border:0!important;background:transparent!important;padding:2px 0!important;min-height:22px!important;min-width:0!important;font-size:12px!important;font-weight:750!important;cursor:pointer;background-image:linear-gradient(90deg,#d7b5ff,#8b5cf6)!important;background-clip:text!important;-webkit-background-clip:text!important;color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:1px 1px 1px #fff8!important}.global-nav button:hover{filter:brightness(1.25)}.global-nav a{font-size:12px;font-weight:700;color:#a998b8;text-decoration:none}.global-nav a:hover{color:#fff}
+.grant-editor-shell{width:calc(100vw - 40px)!important;max-width:none!important;margin-left:calc(50% - 50vw + 20px)!important;margin-right:20px!important;padding:4px 0 110px!important}.grant-editor-header{display:flex;align-items:center;justify-content:space-between;padding:6px 0 12px;border-bottom:1px solid var(--gs-border);margin-bottom:10px}.grant-editor-header h2{font-size:20px!important;margin:0 0 2px!important}
+.grant-editor-layout{display:grid!important;grid-template-columns:minmax(220px,300px) minmax(700px,1fr) minmax(220px,280px)!important;align-items:start!important;gap:12px!important}.grant-outline-panel{width:100%!important;min-width:0!important;max-width:300px!important;position:sticky!important;top:12px!important;background:#111019!important;border:1px solid var(--gs-border)!important;border-radius:10px!important;padding:9px!important}.grant-document-panel{width:100%!important;min-width:0!important;max-width:none!important;background:#e7e8eb!important;color:#19151f!important;border-radius:10px!important;padding:10px!important;box-shadow:0 14px 38px #0004}.grant-guidance-panel{width:100%!important;min-width:0!important;max-width:280px!important;position:sticky!important;top:12px!important;background:#15121d!important;border:1px solid var(--gs-border)!important;border-radius:10px!important;padding:10px!important}
+.grant-editor-shell button{min-height:30px!important;padding:4px 10px!important;border-radius:6px!important;font-size:12px!important}.grant-editor-toolbar{align-items:center!important;gap:7px!important;margin-bottom:8px!important}.grant-editor-toolbar>div{min-width:0!important}.grant-editor-toolbar label{font-size:10px!important}.grant-editor-toolbar input{min-height:30px!important;font-size:12px!important}.grant-document-scroll{height:calc(100vh - 315px);min-height:620px;overflow:auto;scroll-behavior:smooth;padding:24px 22px 70px;background:#dfe1e5;border:1px solid #c5c7cb;border-radius:8px}.grant-doc-section{box-sizing:border-box;max-width:920px;min-height:420px;margin:0 auto 24px;padding:54px 68px 70px;background:#fff;color:#1d1b20;border:1px solid #c9c9c9;box-shadow:0 2px 9px #0002;scroll-margin-top:18px}.grant-doc-section.selected{box-shadow:0 0 0 2px #8b5cf6,0 3px 12px #0002}.grant-doc-version{font:600 10px/1.2 system-ui,-apple-system,sans-serif;color:#7c7680;text-transform:uppercase;letter-spacing:.08em;margin-bottom:22px}.unsaved-label{display:none;margin-left:10px;color:#8a6110}.grant-doc-section.unsaved .unsaved-label{display:inline}.grant-doc-section [contenteditable=true]{outline:none;border-radius:3px}.grant-doc-section [contenteditable=true]:focus{box-shadow:0 0 0 2px #9bc1ff;background:#f8fbff}.grant-doc-section h2{font:700 30px/1.25 Georgia,'Times New Roman',serif;margin:0 0 7px}.grant-doc-description{min-height:20px;margin-bottom:28px;color:#6b6570;font:italic 13px/1.45 system-ui,-apple-system,sans-serif}.grant-doc-body{min-height:250px;white-space:pre-wrap;font:17px/1.72 Georgia,'Times New Roman',serif}.grant-doc-body:empty:before{content:'Write here, or choose Rewrite selected to create an evidence-grounded draft.';color:#aaa4ad}.grant-doc-description:empty:before{content:'Optional section purpose or drafting direction';color:#aaa4ad}
+.editor-outline{display:flex;flex-direction:column;gap:7px}.editor-outline-head{display:flex;justify-content:space-between;align-items:center;padding:4px 4px 10px;color:#c9c1d0}.editor-outline-item{display:grid;grid-template-columns:20px 1fr auto;gap:8px;align-items:center;padding:10px 8px;border:1px solid transparent;border-radius:10px;background:#191620;color:#ded7e4;cursor:pointer}.editor-outline-item:hover{border-color:#52465f}.editor-outline-item.active{background:#263a2b;border-color:#5e8f63;color:white}.editor-outline-item.dragging{opacity:.45}.editor-outline-item .drag{cursor:grab;color:#7e7488}.editor-outline-item .outline-actions{display:flex;gap:2px}.editor-outline-item button{border:0!important;background:transparent!important;color:#aba1b5!important;padding:2px 4px!important;min-width:20px!important}.editor-outline-item button:hover{color:white!important}.editor-outline-description{font-size:10px;color:#8d8496;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:185px}.guidance-card{border:1px solid #332b3e;background:#1a1622;border-radius:10px;padding:10px;margin:8px 0}.guidance-meta{font-size:10px;color:#a89fb1;margin-bottom:5px}.guidance-type{font-size:10px;letter-spacing:.08em;font-weight:800;color:#a6d490}.guidance-resolved{opacity:.55}.editor-empty{padding:24px;border:1px dashed #aaa;border-radius:12px;background:#fff;color:#554d59}
+#publish-grant-floating{position:fixed!important;left:22px!important;bottom:22px!important;z-index:9000!important;width:auto!important;min-width:190px!important;background:linear-gradient(to right,#b1ce8c 0%,#8ab66b 56%,#63bf4e 100%)!important;border:1px solid #7ca567!important;color:white!important;font-weight:800!important;text-shadow:2px 2px 2px #000!important;box-shadow:0 10px 28px #0007!important}
+#editor-outline-command,#editor-document-payload,#global-navigation-command{display:none!important}.editor-secondary{font-size:12px;color:#9d94a6}
 @media(max-width:900px){.wizard-shell{grid-template-columns:1fr!important}.wizard-rail{height:auto;position:static;padding:12px;display:flex;overflow:auto}.wizard-rail-label,.wizard-rail-step b,.wizard-rail-step small{display:none}.wizard-rail-step{display:block}.wizard-main{padding:35px 20px 100px!important}.module-catalog{grid-template-columns:1fr}.core-step{grid-template-columns:48px 1fr}.core-step .output{display:none}}
+@media(max-width:1250px){.grant-editor-layout{grid-template-columns:minmax(190px,240px) minmax(560px,1fr) minmax(190px,230px)!important}.grant-doc-section{padding:42px 46px 58px}.grant-document-scroll{padding:18px 14px 60px}}
+@media(max-width:980px){.grant-editor-shell{width:calc(100vw - 24px)!important;margin-left:calc(50% - 50vw + 12px)!important}.grant-editor-layout{display:block!important}.grant-outline-panel,.grant-guidance-panel{position:static!important;max-width:none!important;margin-bottom:10px}.grant-document-scroll{height:65vh;min-height:500px}.grant-doc-section{padding:36px 30px 50px}}
 """
 
 def core_request_headers(method):
@@ -145,7 +170,14 @@ def gateway_callback(function):
             for header in ("x-grantspace-user-id","x-grantspace-organization-id","x-grantspace-user-email","x-grantspace-user-name"):
                 if incoming.get(header):identity["-".join(part.capitalize() for part in header.split("-"))]=incoming[header]
             if os.getenv("AUTH_MODE","local_single_user")=="internal_accounts":
-                session_token=dict(getattr(request,"cookies",{}) or {}).get("grantspace_session")
+                session_token=incoming.get("x-grantspace-session")
+                if not session_token:session_token=dict(getattr(request,"cookies",{}) or {}).get("grantspace_session")
+                if not session_token and incoming.get("cookie"):
+                    parsed_cookies=SimpleCookie()
+                    try:parsed_cookies.load(incoming["cookie"])
+                    except Exception:parsed_cookies=SimpleCookie()
+                    morsel=parsed_cookies.get("grantspace_session")
+                    if morsel:session_token=morsel.value
                 if session_token:identity["Authorization"]=f"Bearer {session_token}"
         token=REQUEST_IDENTITY_HEADERS.set(identity)
         try:return function(*call_args,**kwargs)
@@ -160,8 +192,12 @@ def api(method,path,**kwargs):
     headers.update(kwargs.pop("headers",{}) or {})
     r=requests.request(method,f"{CORE}{path}",timeout=kwargs.pop("timeout",300),headers=headers,**kwargs)
     if not r.ok:
-        try:detail=r.json().get("error",r.text)
+        try:
+            payload=r.json()
+            detail=payload.get("error") or payload.get("detail") or r.text
         except Exception:detail=r.text
+        detail=str(detail or "").strip()
+        if not detail:detail=f"{method.upper()} {path} failed with HTTP {r.status_code} {r.reason or 'error'}"
         raise gr.Error(detail)
     return r.json()
 
@@ -410,26 +446,19 @@ def selected_modules_from_modes(*modes):
         if mode=="include"
     ]
 
-WIZARD_CORE_FIRST=4
-WIZARD_CORE_LAST=WIZARD_CORE_FIRST+len(WORKFLOW_REGISTRY["core_steps"])-1
-WIZARD_MODULE_FIRST=WIZARD_CORE_LAST+1
-WIZARD_MODULE_LAST=WIZARD_MODULE_FIRST+len(WORKFLOW_REGISTRY["optional_modules"])-1
-WIZARD_REVIEW_PAGE=WIZARD_MODULE_LAST+1
+WIZARD_CORE_PAGE=4
+WIZARD_MODULE_PAGE=5
+WIZARD_REVIEW_PAGE=6
 WIZARD_TEAM_PAGE=WIZARD_REVIEW_PAGE+1
 WIZARD_ROUTING_PAGE=WIZARD_TEAM_PAGE+1
 WIZARD_PREVIEW_PAGE=WIZARD_ROUTING_PAGE+1
 WIZARD_PAGE_COUNT=WIZARD_PREVIEW_PAGE
-WIZARD_PAGE_TITLES=(
-    ["Start","Grant details","Grant source"]
-    +[step["title"] for step in WORKFLOW_REGISTRY["core_steps"]]
-    +[module["title"] for module in WORKFLOW_REGISTRY["optional_modules"]]
-    +["Review setup","Team","Model routing","Workflow preview"]
-)
+WIZARD_PAGE_TITLES=["Start","Grant details","Grant source","Core workflow","Optional tools","Review setup","Team","Model routing","Workflow preview"]
 WIZARD_RAIL_SECTIONS=[
     ("Start",1,1,"Create or open"),
     ("Grant ask",2,3,"Details and source"),
-    ("Core outcomes",WIZARD_CORE_FIRST,WIZARD_CORE_LAST,"Five focused screens"),
-    ("Optional tools",WIZARD_MODULE_FIRST,WIZARD_MODULE_LAST,"One choice per screen"),
+    ("Core outcomes",WIZARD_CORE_PAGE,WIZARD_CORE_PAGE,"Complete core workflow"),
+    ("Optional tools",WIZARD_MODULE_PAGE,WIZARD_MODULE_PAGE,"Choose tools together"),
     ("Review setup",WIZARD_REVIEW_PAGE,WIZARD_REVIEW_PAGE,"Advisory configuration"),
     ("Team",WIZARD_TEAM_PAGE,WIZARD_TEAM_PAGE,"Invite collaborators"),
     ("Routing",WIZARD_ROUTING_PAGE,WIZARD_ROUTING_PAGE,"Choose model policy"),
@@ -483,16 +512,17 @@ WIZARD_CREATE_CLICK_JS="""() => {
     if (!button) return;
     if (button.dataset.creationBusy === 'true' && !button.disabled) button.dataset.creationBusy = 'false';
     if (button.dataset.creationBusy === 'true') return;
+    const editingExisting = button.textContent.includes('Save workflow');
     button.dataset.creationBusy = 'true';
     button.setAttribute('aria-busy', 'true');
-    button.textContent = 'Creating shared grant…';
+    button.textContent = editingExisting ? 'Saving workflow changes…' : 'Creating shared grant…';
     const status = document.querySelector('#wizard-create-status .prose, #wizard-create-status');
-    if (status) status.innerHTML = '<h3>Creating your shared grant…</h3><p>Validating the workflow, storing the project, and ingesting its sources. Grant-ask compilation starts from the saved workspace.</p>';
+    if (status) status.innerHTML = editingExisting ? '<h3>Saving workflow changes…</h3><p>Validating the composition and updating this grant without deleting historical artifacts.</p>' : '<h3>Creating and drafting your shared grant…</h3><p>The app will stay here while it saves the grant ask, derives the sponsor-specific outline, drafts every section in bounded model chunks, assembles the responses, and verifies the saved document.</p>';
     const progress = document.getElementById('wizard-create-progress');
     if (progress) {
       progress.className = 'active';
       const label = progress.querySelector('.label');
-      if (label) label.textContent = 'Stage 1 of 4 · Saving the shared grant and authoritative source…';
+      if (label) label.textContent = editingExisting ? 'Validating the updated workflow configuration…' : 'Stage 1 of 4 · Saving the shared grant and authoritative source…';
     }
     setTimeout(() => { button.disabled = true; }, 0);
   };
@@ -505,7 +535,7 @@ WIZARD_CREATE_CLICK_JS="""() => {
     const label = progress.querySelector('.label');
     if (text.includes('Shared grant created')) {
       progress.className = 'complete';
-      if (label) label.textContent = 'Stage 4 of 4 · Shared grant saved. Opening the workspace…';
+      if (label) label.textContent = 'Stage 4 of 4 · Every model response is assembled and saved. Opening the editor…';
       setTimeout(() => {
         const overlay = document.getElementById('wizard-overlay');
         if (overlay) {
@@ -520,6 +550,37 @@ WIZARD_CREATE_CLICK_JS="""() => {
     }
   });
   window.__grantspaceCreateStatusObserver.observe(document.body, {subtree: true, childList: true, characterData: true});
+  return [];
+}"""
+
+SESSION_STORAGE_AUTH_JS="""async () => {
+  const storageKey = 'grantspace_session';
+  const originalFetch = window.__grantspaceOriginalFetch || window.fetch.bind(window);
+  window.__grantspaceOriginalFetch = originalFetch;
+  try {
+    const response = await originalFetch('/session-token', {credentials: 'same-origin', cache: 'no-store'});
+    if (!response.ok) throw new Error('session bootstrap failed');
+    const payload = await response.json();
+    if (!payload.access_token) throw new Error('session token missing');
+    window.sessionStorage.setItem(storageKey, payload.access_token);
+  } catch (_) {
+    window.sessionStorage.removeItem(storageKey);
+    window.location.replace('/login');
+    return [];
+  }
+  if (!window.__grantspaceSessionFetchInstalled) {
+    window.fetch = (input, init = {}) => {
+      const requestUrl = new URL(typeof input === 'string' ? input : input.url, window.location.href);
+      if (requestUrl.origin === window.location.origin && requestUrl.pathname.startsWith('/app/')) {
+        const headers = new Headers(init.headers || (typeof input !== 'string' ? input.headers : undefined));
+        const token = window.sessionStorage.getItem(storageKey);
+        if (token) headers.set('X-Grantspace-Session', token);
+        init = {...init, headers, credentials: 'same-origin'};
+      }
+      return originalFetch(input, init);
+    };
+    window.__grantspaceSessionFetchInstalled = true;
+  }
   return [];
 }"""
 
@@ -556,14 +617,6 @@ def reconcile_module_gates(selected,required):
     choices=[choice for choice in GATE_CHOICES if choice[1] in allowed]
     return gr.update(choices=choices,value=required)
 
-def wizard_after_modules(selected):
-    active=5 if WORKFLOW_REGISTRY["review_module_key"] in (selected or []) else 6
-    return wizard_page_updates(active)
-
-def wizard_team_back(selected):
-    active=5 if WORKFLOW_REGISTRY["review_module_key"] in (selected or []) else 4
-    return wizard_page_updates(active)
-
 def validate_grant_details_and_continue(title,deadline):
     if not (title or "").strip():raise gr.Error("Working title is required.")
     if (deadline or "").strip():
@@ -571,17 +624,29 @@ def validate_grant_details_and_continue(title,deadline):
         except ValueError:raise gr.Error("Sponsor deadline must use YYYY-MM-DD.")
     return wizard_page_updates(3)
 
-def validate_grant_source_and_continue(source,source_url,source_text):
-    if not source and not (source_url or "").strip() and not (source_text or "").strip():
+def validate_grant_source_and_continue(source,source_url,source_text,edit_project=None):
+    if not (edit_project or "").strip() and not source and not (source_url or "").strip() and not (source_text or "").strip():
         raise gr.Error("Upload, link, or paste the authoritative grant ask.")
-    return wizard_page_updates(WIZARD_CORE_FIRST)
+    return wizard_page_updates(WIZARD_CORE_PAGE)
+
+def optional_tools_continue(*module_modes):
+    selected=selected_modules_from_modes(*module_modes)
+    destination=WIZARD_REVIEW_PAGE if WORKFLOW_REGISTRY["review_module_key"] in selected else WIZARD_TEAM_PAGE
+    return wizard_page_updates(destination)
+
+def optional_tools_skip_all():
+    return ["skip" for _ in WORKFLOW_REGISTRY["optional_modules"]]+wizard_page_updates(WIZARD_TEAM_PAGE)
+
+def team_back_from_optional_tools(*module_modes):
+    selected=selected_modules_from_modes(*module_modes)
+    destination=WIZARD_REVIEW_PAGE if WORKFLOW_REGISTRY["review_module_key"] in selected else WIZARD_MODULE_PAGE
+    return wizard_page_updates(destination)
 
 def validate_routing_and_preview(title,sponsor,mechanism,deadline,review_mode,routing_mode,team_rows,*module_modes):
-    identity=api("GET","/api/me")
-    if not identity.get("id"):raise gr.Error("Your authenticated account could not be resolved. Sign in again.")
     selected=selected_modules_from_modes(*module_modes)
     required=[]
     review_required=False
+    if WORKFLOW_REGISTRY["review_module_key"] not in selected:review_mode=None
     preview=workflow_preview_html(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows)
     return wizard_page_updates(WIZARD_PREVIEW_PAGE)+[preview,selected,required,review_required]
 
@@ -656,14 +721,11 @@ def project_workflow_ui(project):
     if config.get("review_required"):required.add(WORKFLOW_REGISTRY["review_module_key"])
     summary=(f"### Grant workflow\nDefinition **v{workflow.get('definition_version',config.get('definition_version'))}** · "
              f"configuration **v{workflow.get('config_version','—')}** · {len(enabled)} optional tools selected · routing **{config.get('model_routing_mode') or 'deployment default'}**")
-    return (summary,status,
-            gr.update(visible="investigator_interview" in enabled),
-            gr.update(visible=True),
-            gr.update(visible="clinical_design" in enabled),
-            gr.update(visible="competitive_intelligence" in enabled),
-            gr.update(visible="sponsor_compliance" in enabled),
-            gr.update(visible="review_simulator" in enabled),
-            gr.update(visible="advanced_workbench" in enabled))
+    # Workflow configuration still controls model context and generated content,
+    # but normal contributors work in one document-first surface. Specialist
+    # records remain available through the API and portable audit export.
+    hidden=gr.update(visible=False)
+    return (summary,status,hidden,hidden,hidden,hidden,hidden,hidden,hidden)
 
 def workflow_preview_html(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows):
     selected=set(selected or []);required=set(required or [])
@@ -1170,7 +1232,7 @@ def post_team_channel_message(project,kind,subject_key,message,parent_id,mention
 
 def invite_delivery_summary(result):
     link=f"{os.getenv('APP_PUBLIC_URL','http://127.0.0.1:7860').rstrip('/')}/invite?token={quote(str(result.get('token') or ''))}"
-    delivery="Email delivered." if result.get("email_sent") else f"Email was not delivered: {result.get('delivery_error')}. Send the one-time link through an approved secure channel."
+    delivery="Email accepted by the configured SMTP server." if result.get("email_sent") else f"Email was not accepted: {result.get('delivery_error')}. Send the one-time link through an approved secure channel."
     account=("The recipient has an active account and can accept this invitation."
              if result.get("account_exists") else
              "The recipient does not have an active account yet. A system administrator must create one with this exact email before the invitation can be accepted.")
@@ -1179,8 +1241,59 @@ def invite_delivery_summary(result):
                   if public_url.startswith(("http://127.0.0.1","http://localhost")) else "")
     return f"Invite created for **{result.get('email')}**. {delivery} {account}{reachability}\n\nOne-time link: `{link}`"
 
+def _validated_email_address(value):
+    display_name,address=parseaddr(str(value or "").strip())
+    if "\r" in address or "\n" in address:raise ValueError("Email address contains invalid newline characters")
+    normalized=Address(addr_spec=address).addr_spec
+    if not normalized:raise ValueError("Email address is empty")
+    return display_name,normalized
+
+def _python_smtp_send(recipient,subject,body):
+    host=os.getenv("SMTP_HOST","").strip()
+    if not host:raise RuntimeError("SMTP_HOST is not configured")
+    security=os.getenv("SMTP_SECURITY","starttls").strip().lower()
+    if security not in {"none","starttls","tls"}:raise RuntimeError("SMTP_SECURITY must be none, starttls, or tls")
+    default_port=465 if security=="tls" else (587 if security=="starttls" else 25)
+    port=int(os.getenv("SMTP_PORT",str(default_port)) or default_port)
+    timeout=float(os.getenv("SMTP_TIMEOUT_SECONDS","30") or 30)
+    sender_display,sender=_validated_email_address(os.getenv("SMTP_FROM",""))
+    _,recipient=_validated_email_address(recipient)
+    if "\r" in subject or "\n" in subject:raise ValueError("Email subject contains invalid newline characters")
+    message=EmailMessage();message["From"]=Address(display_name=sender_display,addr_spec=sender);message["To"]=recipient;message["Subject"]=subject;message.set_content(body)
+    context=ssl.create_default_context();client=None
+    try:
+        client=smtplib.SMTP_SSL(host,port,timeout=timeout,context=context) if security=="tls" else smtplib.SMTP(host,port,timeout=timeout)
+        client.ehlo()
+        if security=="starttls":client.starttls(context=context);client.ehlo()
+        username=os.getenv("SMTP_USERNAME","");password=os.getenv("SMTP_PASSWORD","")
+        if bool(username)!=bool(password):raise RuntimeError("SMTP_USERNAME and SMTP_PASSWORD must be configured together")
+        if username:client.login(username,password)
+        refused=client.send_message(message,from_addr=sender,to_addrs=[recipient])
+        if refused:raise RuntimeError(f"SMTP server refused the recipient: {refused}")
+    finally:
+        if client is not None:
+            try:client.quit()
+            except Exception:client.close()
+
+def _ensure_invite_email(result,project_title,role):
+    if result.get("email_sent") or not os.getenv("SMTP_HOST","").strip():return result
+    public_url=os.getenv("APP_PUBLIC_URL","http://127.0.0.1:7860").rstrip("/")
+    token=str(result.get("token") or "")
+    body=(f'You were invited to the Grantspace project "{project_title}" with the role {PROJECT_ROLE_LABELS.get(role,role)}.\n\n'
+          f'Sign in with the Grantspace account matching this email address, then accept the single-use invitation:\n{public_url}/invite?token={token}\n\n'
+          'If you do not yet have an account, contact the Grantspace administrator who invited you. Do not forward this link.')
+    updated=dict(result)
+    try:
+        _python_smtp_send(result.get("email"),"You were invited to a Grantspace project",body)
+        updated["email_sent"]=True;updated["delivery_error"]=None;updated["delivery_provider"]="python_smtplib"
+    except Exception as error:
+        prior=str(result.get("delivery_error") or "").strip()
+        updated["email_sent"]=False;updated["delivery_error"]="; ".join(value for value in [prior,f"Python SMTP fallback: {error}"] if value)
+    return updated
+
 def create_project_invite_ui(project,email,role,expires_days):
     project=_require_project(project);result=api("POST",f"/api/projects/{project}/invites",json={"email":str(email or "").strip(),"role":role,"expires_in_days":int(expires_days)})
+    metadata=api("GET",f"/api/projects/{project}");result=_ensure_invite_email(result,metadata.get("title") or "Grantspace project",role)
     return invite_delivery_summary(result),*load_team_workspace(project)
 
 def add_existing_project_member_ui(project,user_id,role):
@@ -1304,7 +1417,10 @@ def create_project(title,sponsor,mechanism,source,source_url,source_text,support
     if not title.strip():raise gr.Error("Working title is required.")
     if not source and not (source_url or "").strip() and not (source_text or "").strip():raise gr.Error("Upload, link, or paste a funding opportunity.")
     if progress:progress(0.12,desc="Stage 1 of 4 · Saving the shared grant record and workflow configuration")
-    payload={"title":title.strip(),"sponsor":sponsor or None,"mechanism":mechanism or None,"sections":DEFAULT_SECTIONS,"actor":actor or None}
+    # Composed grants receive a solicitation-derived model plan after their
+    # authoritative source is stored. Static legacy sections are retained only
+    # for the older direct-create surface.
+    payload={"title":title.strip(),"sponsor":sponsor or None,"mechanism":mechanism or None,"sections":([] if workflow is not None else DEFAULT_SECTIONS),"actor":actor or None}
     if workflow is not None:payload["workflow"]=workflow
     d=api("POST","/api/projects",json=payload)
     pid=d["id"];count=0
@@ -1324,9 +1440,9 @@ def create_project(title,sponsor,mechanism,source,source_url,source_text,support
     api("POST",f"/api/projects/{pid}/design-profile",json={"profile":profile})
     sections=api("GET",f"/api/projects/{pid}/sections");section_choices=[x["title"] for x in sections]
     if not analyze:
-        if progress:progress(0.76,desc="Stage 4 of 4 · Opening the saved workspace; grant-ask compilation is ready to start")
+        if progress:progress(0.18,desc="Stage 1 of 4 · Authoritative grant source saved; preparing the model-derived document plan")
         status=(f"Project `{pid}` created with {count} unique source(s). The source is stored and ready. "
-                "Select **Compile grant ask** to extract its requirements, eligibility, deadlines, attachments, and review criteria.")
+                "The proposal outline and complete first draft are being prepared before the editor opens.")
         return pid,status,"",[],gr.update(choices=section_choices,value=(section_choices[0] if section_choices else None))
     if progress:progress(0.76,desc="Stage 4 of 4 · Local model is extracting structured grant requirements")
     analysis=api("POST",f"/api/projects/{pid}/analyze-requirements",timeout=600)
@@ -1366,6 +1482,40 @@ def poll_grant_ask_compilation(project):
     preview=requirements_response_preview(requirements);preview_text=f"  \n**Model-output preview:** {preview}" if preview else ""
     return requirement_rows(requirements),f"**Stage 4 of 4 · Compilation complete.** The validated result contains **{len(requirements)}** atomic requirements. Review, correct, and approve the structured results.{preview_text}"
 
+def prepare_initial_grant_document(project,progress=None):
+    project=_require_project(project)
+    if progress:progress(0.22,desc="Stage 2 of 4 · Model is deriving the ordered proposal sections from the complete grant ask")
+    plan=api("POST",f"/api/projects/{project}/editor/plan",timeout=2400)
+    sections=(plan.get("sections") or [])
+    if not sections:raise gr.Error("The model returned no usable grant sections, so the editor was not opened.")
+    total=len(sections);drafted=0;draft_chunks=0;generation_runs=list(plan.get("generation_run_ids") or [])
+    for index,section in enumerate(sections,1):
+        title=str(section.get("title") or "").strip()
+        key=str(section.get("section_key") or "").strip()
+        if not title or not key:raise gr.Error(f"The model-derived outline contained an invalid section at position {index}.")
+        if progress:
+            fraction=0.30+(0.60*((index-1)/max(total,1)))
+            progress(fraction,desc=f"Stage 3 of 4 · Drafting section {index} of {total}: {title} · reducing source chunks, drafting bounded parts, and assembling the section")
+        result=api("POST",f"/api/projects/{project}/sections/{key}/rewrite",json={
+            "title":title,"description":section.get("description") or "","base_version_id":section.get("latest_version"),"high_value":False,"initial_build":True,
+        },timeout=2400)
+        text=str(result.get("text") or "").strip()
+        if not text:raise gr.Error(f"The model returned no assembled text for '{title}', so the editor was not opened.")
+        drafted+=1;draft_chunks+=int((result.get("chunking") or {}).get("section_chunks") or 1)
+        if result.get("generation_run_id"):generation_runs.append(result["generation_run_id"])
+        if progress:
+            preview=model_response_preview(text)
+            progress(0.30+(0.60*(index/max(total,1))),desc=f"Stage 3 of 4 · Assembled and saved section {index} of {total}: {title} · response preview: {preview}")
+    if progress:progress(0.94,desc="Stage 4 of 4 · Verifying every assembled section and loading the immutable saved versions")
+    document=api("GET",f"/api/projects/{project}/editor/document")
+    saved=document.get("sections") or []
+    incomplete=[str(section.get("title") or section.get("section_key") or "Untitled") for section in saved if not str(section.get("body") or "").strip() or not section.get("version")]
+    if len(saved)!=total or incomplete:
+        detail=", ".join(incomplete) if incomplete else f"expected {total} sections but loaded {len(saved)}"
+        raise gr.Error(f"The assembled grant did not pass final verification ({detail}), so the editor was not opened.")
+    if progress:progress(1.0,desc=f"Stage 4 of 4 · Complete grant assembled: {drafted} sections from {draft_chunks} bounded model response chunks")
+    return {"sections":drafted,"draft_chunks":draft_chunks,"generation_runs":len(generation_runs),"plan_chunking":plan.get("chunking") or {}}
+
 def configured_project_creation(title,sponsor,mechanism,deadline,grant_type,source,source_url,source_text,supporting,brand,
                                 preset_key,selected,required,review_mode,review_required,routing_mode,team_rows,progress=None):
     # Resolve ownership from the authenticated session at creation time; hidden
@@ -1376,7 +1526,7 @@ def configured_project_creation(title,sponsor,mechanism,deadline,grant_type,sour
     workflow=build_workflow_config(preset_key,selected,required,grant_type,deadline,review_mode,review_required,routing_mode)
     pid,status,notice,requirements,sections=create_project(title,sponsor,mechanism,source,source_url,source_text,supporting,brand,workflow,owner,False,progress)
     selected_set=set(selected or [])
-    if progress:progress(0.80,desc="Stage 4 of 4 · Applying team invitations, approval routing, and enabled workspace modules")
+    if progress:progress(0.20,desc="Stage 2 of 4 · Applying team invitations, collaboration settings, and enabled tools")
     invite_reports=[]
     members=_records(team_rows,["Email","Role"])
     for row in members:
@@ -1385,6 +1535,7 @@ def configured_project_creation(title,sponsor,mechanism,deadline,grant_type,sour
         if role not in PROJECT_ROLE_LABELS:raise gr.Error(f"Unsupported project role for {email}: {row.get('Role')}")
         try:
             invite=api("POST",f"/api/projects/{pid}/invites",json={"email":email,"role":role,"expires_in_days":7})
+            invite=_ensure_invite_email(invite,title.strip(),role)
             invite_reports.append(invite_delivery_summary(invite))
         except Exception as error:
             invite_reports.append(f"Invitation for **{html.escape(email)}** could not be created: {html.escape(str(error))}")
@@ -1398,12 +1549,14 @@ def configured_project_creation(title,sponsor,mechanism,deadline,grant_type,sour
         ]}
         routing_record=api("POST",f"/api/projects/{pid}/workflow/artifacts/collaboration_record",json={"body":routing,"source":"human_wizard","author":owner,"expected_version":None})
         api("POST",f"/api/projects/{pid}/workflow/artifacts/collaboration_record/approve",json={"version":routing_record["version"],"approver":owner})
+    document_report=prepare_initial_grant_document(pid,progress)
     workflow_data=api("GET",f"/api/projects/{pid}/workflow")
     workflow_status=api("GET",f"/api/projects/{pid}/workflow/status")
     summary=(f"### {html.escape(title.strip())}\nWorkflow definition **v{workflow_data.get('definition_version')}** · configuration **v{workflow_data.get('config_version')}** · "
              f"{len(selected_set)} optional capabilities · model routing **{routing_mode}**. The shared server is the source of truth for every teammate.")
     visibility={key:key in selected_set for key in WORKFLOW_MODULES}
-    if progress:progress(1.0,desc="Stage 4 of 4 · Shared grant saved; opening the intake workspace")
+    status=(f"Shared grant and authoritative source saved. The configured model prepared and verified "
+            f"{document_report['sections']} proposal sections from {document_report['draft_chunks']} bounded response chunks.")
     return (gr.update(visible=False),pid,title.strip(),sponsor or "",mechanism or "",status,notice,requirements,sections,summary,workflow_status,
             gr.update(visible=visibility.get("investigator_interview",False)),
             gr.update(visible=True),
@@ -1415,9 +1568,21 @@ def configured_project_creation(title,sponsor,mechanism,deadline,grant_type,sour
             "\n\n---\n\n".join(invite_reports))
 
 def configured_project_creation_ui(title,sponsor,mechanism,deadline,grant_type,source,source_url,source_text,supporting,brand,
-                                   preset_key,selected,required,review_mode,review_required,routing_mode,team_rows,progress=gr.Progress()):
+                                   preset_key,selected,required,review_mode,review_required,routing_mode,team_rows,edit_project=None,progress=gr.Progress()):
     """Keep the wizard usable and expose a durable result when creation fails."""
     try:
+        if (edit_project or "").strip():
+            pid=edit_project.strip();current=api("GET",f"/api/projects/{pid}/workflow");proposed=build_workflow_config(preset_key,selected,required,grant_type,deadline,review_mode,review_required,routing_mode)
+            impact=api("POST",f"/api/projects/{pid}/workflow/impact",json={"workflow":proposed})
+            if impact.get("destructive"):raise gr.Error("The server marked this workflow change destructive; no changes were applied.")
+            actor=(api("GET","/api/me").get("id") or "").strip()
+            if not actor:raise gr.Error("Your authenticated account could not be resolved. Sign in again.")
+            api("PATCH",f"/api/projects/{pid}/workflow",json={"workflow":proposed,"expected_config_version":int(current.get("config_version")),"actor":actor})
+            if str(title or "").strip():api("PATCH",f"/api/projects/{pid}",json={"title":str(title).strip(),"archived":None})
+            loaded=list(load_project(pid));workflow=project_workflow_ui(pid)
+            return (gr.update(visible=False),*loaded,*workflow,
+                    "Workflow configuration saved on the existing grant. Historical artifacts from removed tools remain preserved, while only selected tools remain active.",
+                    gr.update(value="Save workflow changes →",interactive=True))
         creation=configured_project_creation(title,sponsor,mechanism,deadline,grant_type,source,source_url,source_text,supporting,brand,
                                              preset_key,selected,required,review_mode,review_required,routing_mode,team_rows,progress)
         pid=creation[1]
@@ -1426,7 +1591,9 @@ def configured_project_creation_ui(title,sponsor,mechanism,deadline,grant_type,s
         if invite_report:
             loaded[4]=f"{loaded[4]}\n\n### Teammate invitation results\n{invite_report}"
         workflow=project_workflow_ui(pid)
-        creation_status="Shared grant created and loaded. The authoritative source is stored; select **Compile grant ask** when you are ready to run structured extraction."
+        document=api("GET",f"/api/projects/{pid}/editor/document");prepared=document.get("sections") or []
+        creation_status=(f"Shared grant created and loaded. **{len(prepared)} model-prepared sections are assembled, versioned, and ready for human review.** "
+                         "The editor opened only after every section returned non-empty saved text. Humans can edit and save any wording before publishing.")
         if invite_report:creation_status+=f"\n\n### Teammate invitation results\n{invite_report}"
         return (gr.update(visible=False),*loaded,*workflow,
                 creation_status,
@@ -1435,8 +1602,21 @@ def configured_project_creation_ui(title,sponsor,mechanism,deadline,grant_type,s
         message=html.escape(str(error).strip() or "The server did not return an error description.")
         return (*(gr.skip() for _ in range(26)),f"### Grant creation failed\n{message}",gr.update(value="Try creating the grant again →",interactive=True))
 
+def global_navigation_state(project,action):
+    action=str(action or "").strip()
+    field_count=11+len(WORKFLOW_REGISTRY["optional_modules"])
+    if action=="projects":
+        values=[gr.update(visible=True),None,gr.update(value="Create shared grant →",interactive=True),*wizard_page_updates(1),*(gr.skip() for _ in range(field_count)),gr.update(value="")]
+        return tuple(values)
+    if action!="workflow":return tuple(gr.skip() for _ in range(4+len(wizard_page_updates(1))+field_count))
+    project=_require_project(project);metadata=api("GET",f"/api/projects/{project}");workflow=api("GET",f"/api/projects/{project}/workflow");config=workflow.get("config") or workflow
+    enabled=set(config.get("enabled_modules") or []);modes=["include" if item["key"] in enabled else "skip" for item in WORKFLOW_REGISTRY["optional_modules"]]
+    base=[gr.update(visible=True),project,gr.update(value="Save workflow changes →",interactive=True),*wizard_page_updates(2)]
+    fields=[metadata.get("title") or "",metadata.get("sponsor") or "",metadata.get("mechanism") or "",config.get("target_deadline") or "",config.get("grant_type") or "custom",config.get("template") or "custom_configuration_v1",list(enabled),list(config.get("required_modules") or []),bool(config.get("review_required")),config.get("review_mode"),config.get("model_routing_mode") or os.getenv("MODEL_ROUTING_MODE","local_only"),*modes]
+    return tuple(base+fields+[gr.update(value="")])
+
 def wizard_to_preview(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows):
-    return wizard_page_updates(7)+[workflow_preview_html(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows)]
+    return wizard_page_updates(WIZARD_PREVIEW_PAGE)+[workflow_preview_html(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows)]
 
 def load_project(pid):
     if not pid:raise gr.Error("Choose a project.")
@@ -2087,12 +2267,352 @@ def export(project,fmt,_title):
     paths.append(package)
     return paths,f"Created from immutable export snapshot {snap['snapshot_id']} ({snap['sha256'][:16]}…). Sponsor-compliant package: {package}"
 
+def editor_outline_html(sections,selected_key=None):
+    if not sections:return '<div class="editor-empty">No sections yet. Add the first section below.</div>'
+    items=[]
+    for section in sections:
+        key=str(section.get("section_key") or "");title=str(section.get("title") or "Untitled section");description=str(section.get("description") or "")
+        active=" active" if key==selected_key else ""
+        items.append(f'''<div class="editor-outline-item{active}" draggable="true" data-section-key="{html.escape(key,quote=True)}">
+          <span class="drag" title="Drag to reorder">⋮⋮</span><div><b>{html.escape(title)}</b><div class="editor-outline-description">{html.escape(description)}</div></div>
+          <span class="outline-actions"><button type="button" data-outline-action="up" title="Move up">↑</button><button type="button" data-outline-action="down" title="Move down">↓</button></span></div>''')
+    return '<div class="editor-outline"><div class="editor-outline-head"><b>Grant sections</b><span>drag to reorder</span></div>'+"".join(items)+"</div>"
+
+def editor_guidance_html(comments):
+    if not comments:return '<div class="editor-secondary">No team guidance yet. Add a comment, question, or rule for this section.</div>'
+    cards=[]
+    for comment in comments:
+        raw=str(comment.get("body") or "");kind="COMMENT";text=raw
+        match=re.match(r"^(COMMENT|QUESTION|RULE)\s*[·:]\s*(.*)$",raw,flags=re.I|re.S)
+        if match:kind=match.group(1).upper();text=match.group(2)
+        resolved=bool(comment.get("resolved_at"));classes="guidance-card guidance-resolved" if resolved else "guidance-card"
+        state=" · resolved" if resolved else ""
+        cards.append(f'<article class="{classes}"><div class="guidance-type">{kind}</div><div class="guidance-meta">{html.escape(str(comment.get("author") or "Team member"))} · {html.escape(str(comment.get("created_at") or ""))}{state}</div><div>{html.escape(text).replace(chr(10),"<br>")}</div></article>')
+    return "".join(cards)
+
+def editor_comment_state(project,key):
+    if not project or not key:return '<div class="editor-secondary">Choose a section to view team guidance.</div>',gr.update(choices=[],value=None)
+    comments=api("GET",f"/api/projects/{project}/comments/section/{key}")
+    open_comments=[comment for comment in comments if not comment.get("resolved_at")]
+    choices=[(f"{str(comment.get('body') or '')[:70]} · {comment.get('author')}",comment.get("id")) for comment in open_comments]
+    return editor_guidance_html(comments),gr.update(choices=choices,value=None)
+
+def editor_document_html(sections,selected_key=None,override=None):
+    if not sections:return '<div class="editor-empty">No sections yet. Add the first section from the outline.</div>'
+    override=override or {};pages=[]
+    for section in sections:
+        key=str(section.get("section_key") or "");display=dict(section);dirty=False
+        if key==selected_key and override:
+            display.update({name:value for name,value in override.items() if name in {"title","description","body"}});dirty=True
+        title=html.escape(str(display.get("title") or "Untitled section"));description=html.escape(str(display.get("description") or ""));body=html.escape(str(display.get("body") or ""))
+        version=display.get("version");selected=" selected" if key==selected_key else "";unsaved=" unsaved" if dirty else ""
+        pages.append(f'''<article id="grant-doc-{html.escape(key,quote=True)}" class="grant-doc-section{selected}{unsaved}" data-section-key="{html.escape(key,quote=True)}" data-version="{version if version is not None else ''}" data-dirty="{'true' if dirty else 'false'}">
+          <div class="grant-doc-version">{f'Version {version}' if version else 'New section'}<span class="unsaved-label">Unsaved changes</span></div>
+          <h2 contenteditable="true" spellcheck="true" data-editor-field="title">{title}</h2>
+          <div class="grant-doc-description" contenteditable="true" spellcheck="true" data-editor-field="description">{description}</div>
+          <div class="grant-doc-body" contenteditable="true" spellcheck="true" data-editor-field="body">{body.replace(chr(10),'<br>')}</div>
+        </article>''')
+    return '<div class="grant-document-scroll">'+"".join(pages)+"</div>"
+
+def selected_editor_controls(project,key):
+    if not project or not key:return None,None,gr.update(choices=[],value=None),*editor_comment_state(project,None),"Choose a section from the outline."
+    state=api("GET",f"/api/projects/{project}/sections/{key}");latest=state.get("latest") or {};version=latest.get("version")
+    versions=api("GET",f"/api/projects/{project}/sections/{key}/versions")
+    choices=[(f"v{item.get('version')} · {item.get('editor') or item.get('source')} · {item.get('created_at')}",item.get("version")) for item in versions]
+    guidance_html,guidance_choices=editor_comment_state(project,key)
+    status=f"Section selected · latest saved version {version}." if version else "Section selected · not saved yet. Use Rewrite selected or write directly in the document."
+    return key,version,gr.update(choices=choices,value=version),guidance_html,guidance_choices,status
+
+def load_continuous_editor(project,requested_key=None,override=None,status=None):
+    if not (project or "").strip():
+        return editor_outline_html([],None),editor_document_html([],None),None,None,gr.update(choices=[],value=None),'<div class="editor-secondary">Open a saved grant to view guidance.</div>',gr.update(choices=[],value=None),"Open a saved grant to begin."
+    ensure_document_editor(project);document=api("GET",f"/api/projects/{project}/editor/document");sections=document.get("sections") or []
+    keys=[str(section.get("section_key")) for section in sections];key=str(requested_key or "") if str(requested_key or "") in keys else (keys[0] if keys else None)
+    controls=selected_editor_controls(project,key)
+    return editor_outline_html(sections,key),editor_document_html(sections,key,override),*controls[:-1],status or controls[-1]
+
+def prefill_continuous_editor(project,requested_key=None,progress=gr.Progress()):
+    if not (project or "").strip():return load_continuous_editor(project,requested_key)
+    try:
+        ensure_document_editor(project);document=api("GET",f"/api/projects/{project}/editor/document");sections=document.get("sections") or []
+        missing=[section for section in sections if not str(section.get("body") or "").strip()]
+        if not missing:return load_continuous_editor(project,requested_key,status="The AI-prepared grant draft is loaded. Edit any section directly or add team guidance.")
+        failures=[];total=len(missing);drafted_chunks=0
+        for index,section in enumerate(missing,1):
+            title=section.get("title") or "Untitled section"
+            progress((index-1)/total,desc=f"Drafting {index} of {total} · {title} · compiling grant sources and evidence")
+            try:
+                result=api("POST",f"/api/projects/{project}/sections/{section.get('section_key')}/rewrite",json={"title":title,"description":section.get("description") or "","base_version_id":section.get("version"),"high_value":False},timeout=2400)
+                drafted_chunks+=int((result.get("chunking") or {}).get("section_chunks") or 1)
+            except Exception as error:failures.append(f"{title}: {error}")
+        progress(1.0,desc="Assembling the complete editable grant document")
+        note=f"AI prepared {total-len(failures)} of {total} missing section(s) in {drafted_chunks} bounded drafting chunk(s), then assembled and saved each complete section from the saved grant ask, retrieved evidence, and configured workflow. Review and edit every claim before publishing."
+        if failures:note+=f" Drafting paused for {len(failures)} section(s): {'; '.join(failures)}"
+        return load_continuous_editor(project,requested_key,status=note)
+    except Exception as error:
+        # Opening a project must never fail merely because model generation is unavailable.
+        try:return load_continuous_editor(project,requested_key,status=f"The saved document opened, but automatic drafting could not start: {error}. Use Draft missing sections to retry.")
+        except Exception:return load_continuous_editor(None,None)
+
+def _editor_payload_sections(raw):
+    try:payload=json.loads(raw or "{}")
+    except Exception:raise gr.Error("The browser could not serialize the document. Your visible edits remain in place; retry Save document.")
+    sections=payload.get("sections") if isinstance(payload,dict) else None
+    if not isinstance(sections,list):raise gr.Error("The browser returned an invalid document payload. Your visible edits remain in place.")
+    return sections
+
+def _save_continuous_changes(project,raw):
+    sections=_editor_payload_sections(raw)
+    if not sections:return []
+    response=api("POST",f"/api/projects/{project}/editor/document",json={"sections":sections},timeout=2400)
+    return response.get("saved") or []
+
+def save_continuous_editor(project,raw,current_key):
+    project=_require_project(project)
+    try:saved=_save_continuous_changes(project,raw)
+    except Exception as error:raise gr.Error(f"The document was not saved because a teammate changed one of these sections. Your edits remain in this browser. Refresh only after copying or reconciling them. {error}")
+    note=(f"Saved {len(saved)} changed section(s) as one atomic document update. Teammates can use Refresh shared changes." if saved else "No unsaved document changes were detected.")
+    return load_continuous_editor(project,current_key,status=note)
+
+def rewrite_continuous_section(project,key,raw):
+    project=_require_project(project);key=str(key or "").strip()
+    if not key:raise gr.Error("Choose a section from the outline first.")
+    _save_continuous_changes(project,raw)
+    document=api("GET",f"/api/projects/{project}/editor/document");section=next((item for item in document.get("sections") or [] if str(item.get("section_key"))==key),None)
+    if not section:raise gr.Error("The selected section no longer exists. Refresh shared changes.")
+    result=api("POST",f"/api/projects/{project}/sections/{key}/rewrite",json={"title":section.get("title") or "Untitled section","description":section.get("description") or "","base_version_id":section.get("version"),"high_value":False},timeout=2400)
+    preview=" ".join(str(result.get("text") or "").split()[:20]);research=result.get("research") or {};failures=research.get("failures") or [];chunking=result.get("chunking") or {}
+    research_note=f"Research saved {research.get('sources_saved',0)} source(s)"+(f"; {' '.join(str(value) for value in failures)}" if failures else "")
+    chunk_note=(f" Ollama used {chunking.get('section_chunks',1)} section chunk(s) and {chunking.get('context_reduction_rounds',0)} reduction round(s)." if chunking.get("enabled") else "")
+    note=f"Rewrote {section.get('title')} as version {result.get('version')} with {result.get('model')}. {research_note}.{chunk_note} Preview: {preview}{'…' if len(str(result.get('text') or '').split())>20 else ''}"
+    return load_continuous_editor(project,key,status=note)
+
+def load_continuous_historical_version(project,key,version):
+    project=_require_project(project)
+    if not key or not version:raise gr.Error("Choose a stored version first.")
+    item=api("GET",f"/api/projects/{project}/sections/{key}/versions/{int(version)}")
+    document=api("GET",f"/api/projects/{project}/editor/document");sections=document.get("sections") or []
+    note=f"Historical version {version} is now an unsaved working copy. Save document to make it the newest version; publishing is unchanged until then."
+    return editor_document_html(sections,key,{"title":item.get("title") or "","body":item.get("body") or ""}),note
+
+def add_continuous_editor_section(project,title,raw,current_key):
+    project=_require_project(project);title=str(title or "").strip()
+    if not title:raise gr.Error("Enter a section title.")
+    _save_continuous_changes(project,raw)
+    sections=ensure_document_editor(project);existing={str(section.get("section_key")) for section in sections};base=slug(title) or "section";key=base;counter=2
+    while key in existing:key=f"{base}_{counter}";counter+=1
+    api("POST",f"/api/projects/{project}/editor/initialize",json={"sections":[{"key":key,"title":title,"description":""}]})
+    return (*load_continuous_editor(project,key,status=f"Added {title}. Write directly in the new page or choose Rewrite selected."),"")
+
+def handle_continuous_outline_command(project,current_key,raw):
+    if not raw:return current_key,None,gr.update(),gr.skip(),gr.update(),"",gr.update(value="")
+    try:command=json.loads(raw)
+    except Exception:raise gr.Error("The section outline command was invalid. Refresh shared changes and try again.")
+    action=command.get("action");keys=[str(value) for value in command.get("keys") or []];selected=str(command.get("key") or current_key or "")
+    if action=="reorder" and keys:api("POST",f"/api/projects/{project}/sections/reorder",json={"section_keys":keys})
+    controls=selected_editor_controls(project,selected)
+    status=("Section order saved for every collaborator." if action=="reorder" else controls[-1])
+    return *controls[:-1],status,gr.update(value="")
+
+def post_continuous_guidance(project,key,kind,body,raw):
+    project=_require_project(project);key=str(key or "").strip();text=str(body or "").strip()
+    if not key:raise gr.Error("Choose a section from the outline first.")
+    if not text:raise gr.Error("Write a comment, question, or rule first.")
+    _save_continuous_changes(project,raw)
+    state=api("GET",f"/api/projects/{project}/sections/{key}");latest=state.get("latest") or {};version=latest.get("version")
+    if not version:
+        document=api("GET",f"/api/projects/{project}/editor/document");section=next(item for item in document.get("sections") or [] if str(item.get("section_key"))==key)
+        api("POST",f"/api/projects/{project}/sections/{key}/rewrite",json={"title":section.get("title") or "Untitled section","description":section.get("description") or "","base_version_id":None,"high_value":False},timeout=2400)
+        version=(api("GET",f"/api/projects/{project}/sections/{key}").get("latest") or {}).get("version")
+    api("POST",f"/api/projects/{project}/comments/section/{key}",json={"version_id":int(version),"start_offset":None,"end_offset":None,"quoted_text":None,"body":f"{str(kind or 'COMMENT').upper()} · {text}","parent_comment_id":None,"mentioned_user_ids":[]})
+    if str(kind or "").lower() in {"question","rule"}:
+        loaded=rewrite_continuous_section(project,key,json.dumps({"sections":[]}));return (*loaded,"",f"The {kind} triggered evidence research and a new saved rewrite.")
+    loaded=load_continuous_editor(project,key,status="Shared comment saved. It will remain visible until a teammate resolves it.")
+    return (*loaded,"","Shared comment added without rewriting the section.")
+
+def ensure_document_editor(project):
+    project=_require_project(project);sections=api("GET",f"/api/projects/{project}/sections")
+    if not sections:
+        planned=api("POST",f"/api/projects/{project}/editor/plan",timeout=2400)
+        sections=planned.get("sections") or []
+    if not sections:raise gr.Error("No sponsor-derived document sections are available for this grant.")
+    return sections
+
+def load_document_editor(project,requested_key=None):
+    if not (project or "").strip():
+        return editor_outline_html([],None),None,"","","",None,"",gr.update(choices=[],value=None),'<div class="editor-secondary">Open a saved grant to begin editing.</div>',gr.update(choices=[],value=None),"Open a saved grant."
+    sections=ensure_document_editor(project)
+    keys=[str(section.get("section_key")) for section in sections]
+    key=str(requested_key or "") if requested_key in keys else (keys[0] if keys else "")
+    if not key:return editor_outline_html([],None),None,"","","",None,"",gr.update(choices=[],value=None),*editor_comment_state(project,None),"Add a section to begin."
+    meta=next(section for section in sections if str(section.get("section_key"))==key)
+    state=api("GET",f"/api/projects/{project}/sections/{key}");latest=state.get("latest") or {}
+    body=latest.get("body") or "";version=latest.get("version")
+    versions=api("GET",f"/api/projects/{project}/sections/{key}/versions")
+    version_choices=[(f"v{item.get('version')} · {item.get('editor') or item.get('source')} · {item.get('created_at')}",item.get("version")) for item in versions]
+    guidance_html,guidance_choices=editor_comment_state(project,key)
+    status=(f"Loaded version {version}. Refresh before editing if a teammate may have changed this section." if version else "This section is ready for its first evidence-grounded draft. Choose Rewrite with team guidance to prefill it.")
+    return editor_outline_html(sections,key),key,meta.get("title") or "",meta.get("description") or "",body,version,body,gr.update(choices=version_choices,value=version),guidance_html,guidance_choices,status
+
+def prepare_document_editor(project,requested_key=None,progress=gr.Progress()):
+    loaded=load_document_editor(project,requested_key)
+    if project and loaded[1] and not loaded[5]:
+        progress(0.08,desc=f"Researching the grant ask for {loaded[2]}")
+        progress(0.28,desc="Compiling saved sources, evidence, workflow options, and team guidance")
+        rewritten=rewrite_document_section(project,loaded[1],loaded[2],loaded[3],None)
+        progress(0.96,desc="Saving the first collaborative section version")
+        return rewritten
+    return loaded
+
+def load_editor_historical_version(project,key,version,current_version):
+    project=_require_project(project)
+    if not key or not version:raise gr.Error("Choose a stored version first.")
+    item=api("GET",f"/api/projects/{project}/sections/{key}/versions/{int(version)}")
+    note=(f"Loaded historical version {version} into the editable working copy. Your published grant is unchanged. "
+          f"Select Save changes to preserve your modifications as a new version based on current head {current_version}.")
+    return item.get("title") or "",item.get("body") or "",note
+
+def save_document_section(project,key,title,description,base_version,body):
+    project=_require_project(project);key=str(key or "").strip();title=str(title or "").strip();body=str(body or "")
+    if not key:raise gr.Error("Choose a section first.")
+    if not title:raise gr.Error("A section title is required.")
+    if not body.strip():raise gr.Error("Section text cannot be empty. Use Rewrite with team guidance to create its first draft.")
+    try:
+        result=api("POST",f"/api/projects/{project}/sections/{key}",json={"title":title,"description":str(description or ""),"body":body,"html":None,"base_version_id":int(base_version) if base_version else None},timeout=2400)
+    except Exception:
+        latest=api("GET",f"/api/projects/{project}/sections/{key}").get("latest") or {}
+        if latest.get("version") and int(latest.get("version"))!=int(base_version or 0):
+            raise gr.Error(f"A teammate saved version {latest.get('version')} while you were editing. Your text remains in this browser. Copy it if needed, refresh the section, then reconcile the changes.")
+        raise
+    loaded=list(load_document_editor(project,key));loaded[-1]=f"Saved as collaborative version {result.get('version')}. Teammates will see it when they refresh."
+    return tuple(loaded)
+
+def rewrite_document_section(project,key,title,description,base_version):
+    project=_require_project(project);key=str(key or "").strip()
+    if not key:raise gr.Error("Choose a section first.")
+    result=api("POST",f"/api/projects/{project}/sections/{key}/rewrite",json={"title":str(title or "").strip(),"description":str(description or ""),"base_version_id":int(base_version) if base_version else None,"high_value":False},timeout=2400)
+    loaded=list(load_document_editor(project,key));preview=" ".join(str(result.get("text") or "").split()[:20]);research=result.get("research") or {};failures=research.get("failures") or []
+    research_note=(f"saved {research.get('sources_saved',0)} new research source(s)" if not failures else f"saved {research.get('sources_saved',0)} new research source(s); {' '.join(str(value) for value in failures)}")
+    chunking=result.get("chunking") or {};chunk_note=(f" Ollama processed {chunking.get('section_chunks',1)} section chunk(s) after {chunking.get('context_reduction_rounds',0)} context-reduction round(s)." if chunking.get("enabled") else "")
+    loaded[-1]=f"Rewrote this section as version {result.get('version')} with {result.get('model')}. Applied {result.get('guidance_count',0)} open team item(s); {research_note}.{chunk_note} Preview: {preview}{'…' if len(str(result.get('text') or '').split())>20 else ''}"
+    return tuple(loaded)
+
+def post_editor_guidance(project,key,version,kind,body):
+    project=_require_project(project);key=str(key or "").strip();text=str(body or "").strip()
+    if not version:raise gr.Error("Create the section's first draft before adding version-anchored guidance.")
+    if not text:raise gr.Error("Write a comment, question, or rule first.")
+    api("POST",f"/api/projects/{project}/comments/section/{key}",json={"version_id":int(version),"start_offset":None,"end_offset":None,"quoted_text":None,"body":f"{str(kind or 'COMMENT').upper()} · {text}","parent_comment_id":None,"mentioned_user_ids":[]})
+    guidance_html,guidance_choices=editor_comment_state(project,key)
+    return guidance_html,guidance_choices,"",f"Shared {str(kind or 'comment').lower()} added. Use Rewrite with team guidance when the team is ready to apply it."
+
+def post_editor_guidance_and_rewrite(project,key,version,kind,body,title,description):
+    if not version:
+        initial=rewrite_document_section(project,key,title,description,None)
+        version=initial[5]
+    post_editor_guidance(project,key,version,kind,body)
+    if str(kind or "").lower() in {"question","rule"}:
+        loaded=list(rewrite_document_section(project,key,title,description,version))
+        research_status=loaded[-1]
+        return (*loaded,"",f"The {kind} triggered evidence research and a new section rewrite. {research_status}")
+    loaded=load_document_editor(project,key)
+    return (*loaded,"",f"Shared comment added. It remains open until a teammate applies or resolves it.")
+
+def resolve_editor_guidance(project,key,comment_id):
+    project=_require_project(project)
+    if not comment_id:raise gr.Error("Choose an open team item to resolve.")
+    api("POST",f"/api/projects/{project}/comments/{int(comment_id)}/resolve",json={})
+    guidance_html,guidance_choices=editor_comment_state(project,key)
+    return guidance_html,guidance_choices,"Team item resolved; its audit history was preserved."
+
+def add_editor_section(project,title):
+    project=_require_project(project);title=str(title or "").strip()
+    if not title:raise gr.Error("Enter a section title.")
+    sections=ensure_document_editor(project);existing={str(section.get("section_key")) for section in sections};base=slug(title) or "section";key=base;counter=2
+    while key in existing:key=f"{base}_{counter}";counter+=1
+    api("POST",f"/api/projects/{project}/editor/initialize",json={"sections":[{"key":key,"title":title,"description":""}]})
+    return (*load_document_editor(project,key),"")
+
+def handle_editor_outline_command(project,current_key,raw):
+    if not raw:return load_document_editor(project,current_key)
+    try:command=json.loads(raw)
+    except Exception:raise gr.Error("The section outline command was invalid. Refresh the editor and try again.")
+    action=command.get("action");keys=[str(value) for value in command.get("keys") or []];selected=str(command.get("key") or current_key or "")
+    if action=="reorder" and keys:api("POST",f"/api/projects/{project}/sections/reorder",json={"section_keys":keys})
+    loaded=load_document_editor(project,selected)
+    if action=="select" and loaded[1] and not loaded[5]:return rewrite_document_section(project,loaded[1],loaded[2],loaded[3],None)
+    return loaded
+
+def publish_document_editor(project):
+    project=_require_project(project);response=api("POST",f"/api/projects/{project}/publish-snapshot",json={},timeout=300);snapshot=response.get("snapshot") or {};meta=snapshot.get("project") or {};sections=snapshot.get("sections") or [];paths=[]
+    payload_base={"project_id":project,"snapshot_id":response["snapshot_id"],"title":meta.get("title") or "Grant Application","sponsor":meta.get("sponsor"),"organization_name":ORGANIZATION_NAME,"sections":[{"section_key":item.get("section_key"),"title":item.get("title"),"body":item.get("body"),"version":item.get("version")} for item in sections],"include_document_title":True,"design_profile":snapshot.get("design_profile")}
+    for output_format in ("docx","pdf"):
+        rendered=renderer_api("/render",{**payload_base,"format":output_format},timeout=300);paths.append(rendered["path"])
+    return paths,f"Published exact collaborative snapshot {response['snapshot_id']} as DOCX and PDF. Snapshot SHA-256: {response['sha256']}."
+
+EDITOR_OUTLINE_JS="""() => {
+  if (window.__grantspaceEditorOutlineBound) return [];
+  window.__grantspaceEditorOutlineBound = true;
+  let dragged = null;
+  window.grantspaceCollectEditorDocument = () => ({sections:[...document.querySelectorAll('.grant-doc-section[data-dirty="true"]')].map(section => ({
+    key:section.dataset.sectionKey,
+    title:(section.querySelector('[data-editor-field="title"]')?.innerText || '').trim(),
+    description:(section.querySelector('[data-editor-field="description"]')?.innerText || '').trim(),
+    body:section.querySelector('[data-editor-field="body"]')?.innerText || '',
+    base_version_id:section.dataset.version ? Number(section.dataset.version) : null
+  }))});
+  const emit = (action, key) => {
+    const items = [...document.querySelectorAll('.editor-outline-item')];
+    const host = document.querySelector('#editor-outline-command textarea, #editor-outline-command input');
+    if (!host) return;
+    const value = JSON.stringify({action, key, keys: items.map(item => item.dataset.sectionKey)});
+    const prototype = host.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+    if (setter) setter.call(host, value); else host.value = value;
+    host.dispatchEvent(new Event('input', {bubbles:true}));
+    host.dispatchEvent(new Event('change', {bubbles:true}));
+  };
+  document.addEventListener('dragstart', event => { const item=event.target.closest('.editor-outline-item'); if(!item)return; dragged=item;item.classList.add('dragging');event.dataTransfer.effectAllowed='move'; });
+  document.addEventListener('dragover', event => { const item=event.target.closest('.editor-outline-item'); if(!dragged||!item||item===dragged)return;event.preventDefault();const box=item.getBoundingClientRect();item.parentElement.insertBefore(dragged,event.clientY<box.top+box.height/2?item:item.nextSibling); });
+  const reorderDocument = () => { const host=document.querySelector('.grant-document-scroll');if(!host)return;[...document.querySelectorAll('.editor-outline-item')].forEach(item=>{const page=document.getElementById(`grant-doc-${item.dataset.sectionKey}`);if(page)host.appendChild(page);}); };
+  document.addEventListener('dragend', event => { if(!dragged)return;const key=dragged.dataset.sectionKey;dragged.classList.remove('dragging');dragged=null;reorderDocument();emit('reorder',key); });
+  document.addEventListener('input', event => { const field=event.target.closest('[contenteditable="true"][data-editor-field]');if(!field)return;const section=field.closest('.grant-doc-section');if(section){section.dataset.dirty='true';section.classList.add('unsaved');} });
+  document.addEventListener('click', event => { const actionButton=event.target.closest('[data-outline-action]');const item=event.target.closest('.editor-outline-item');if(!item)return;event.preventDefault();document.querySelectorAll('.editor-outline-item,.grant-doc-section').forEach(node=>node.classList.remove('active','selected'));item.classList.add('active');const page=document.getElementById(`grant-doc-${item.dataset.sectionKey}`);if(page)page.classList.add('selected');if(actionButton){const direction=actionButton.dataset.outlineAction;const sibling=direction==='up'?item.previousElementSibling:item.nextElementSibling;if(sibling&&sibling.classList.contains('editor-outline-item'))item.parentElement.insertBefore(direction==='up'?item:sibling,direction==='up'?sibling:item);reorderDocument();emit('reorder',item.dataset.sectionKey);}else{page?.scrollIntoView({behavior:'smooth',block:'start'});emit('select',item.dataset.sectionKey);} });
+  return [];
+}"""
+
+EDITOR_SAVE_INPUT_JS="""(project,payload,currentKey) => [project,JSON.stringify((window.grantspaceCollectEditorDocument||(()=>({sections:[]})))()),currentKey]"""
+EDITOR_REWRITE_INPUT_JS="""(project,currentKey,payload) => [project,currentKey,JSON.stringify((window.grantspaceCollectEditorDocument||(()=>({sections:[]})))())]"""
+EDITOR_GUIDANCE_INPUT_JS="""(project,currentKey,kind,body,payload) => [project,currentKey,kind,body,JSON.stringify((window.grantspaceCollectEditorDocument||(()=>({sections:[]})))())]"""
+EDITOR_ADD_INPUT_JS="""(project,title,payload,currentKey) => [project,title,JSON.stringify((window.grantspaceCollectEditorDocument||(()=>({sections:[]})))()),currentKey]"""
+GLOBAL_NAVIGATION_JS="""() => {
+  if (window.__grantspaceGlobalNavigationBound) return [];
+  window.__grantspaceGlobalNavigationBound=true;
+  document.addEventListener('click',event=>{
+    const control=event.target.closest('[data-global-nav]');if(!control)return;
+    const action=control.dataset.globalNav;
+    if(action==='editor'||action==='admin'){
+      const overlay=document.getElementById('wizard-overlay');if(overlay){overlay.style.setProperty('display','none','important');overlay.setAttribute('aria-hidden','true');}
+      const wanted=action==='editor'?'Grant editor':'System administration';
+      const tab=[...document.querySelectorAll('button[role="tab"]')].find(button=>button.textContent.trim()===wanted);
+      if(tab)tab.click();return;
+    }
+    const overlay=document.getElementById('wizard-overlay');if(overlay){overlay.style.setProperty('display','block','important');overlay.setAttribute('aria-hidden','false');}
+    const host=document.querySelector('#global-navigation-command textarea,#global-navigation-command input');if(!host)return;
+    const prototype=host.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
+    const setter=Object.getOwnPropertyDescriptor(prototype,'value')?.set;if(setter)setter.call(host,action);else host.value=action;
+    host.dispatchEvent(new Event('input',{bubbles:true}));host.dispatchEvent(new Event('change',{bubbles:true}));
+  });
+  return [];
+}"""
+
 with gr.Blocks(title="Grantspace") as demo:
     with gr.Column(visible=True,elem_classes="wizard-lightbox",elem_id="wizard-overlay") as wizard_shell:
+        gr.HTML('''<nav class="global-nav" aria-label="Global navigation"><span class="brand">Grantspace</span><button type="button" data-global-nav="projects">Grants &amp; wizard</button><button type="button" data-global-nav="workflow">Workflow setup</button><button type="button" data-global-nav="editor">Grant editor</button><button type="button" data-global-nav="admin">Administration</button><a href="/logout">Sign out</a></nav>''',container=False)
         with gr.Row(elem_classes="wizard-shell"):
             wizard_rail=gr.HTML(wizard_rail_html(1),container=False)
             with gr.Column(elem_classes="wizard-main"):
                 wizard_preset=gr.State("custom_configuration_v1")
+                wizard_edit_project=gr.State(None)
                 wizard_modules=gr.State([])
                 wizard_required_modules=gr.State([])
                 wizard_review_required=gr.State(False)
@@ -2123,7 +2643,7 @@ with gr.Blocks(title="Grantspace") as demo:
                             wizard_sponsor=gr.Textbox(label="Sponsor")
                             wizard_mechanism=gr.Textbox(label="Mechanism")
                         with gr.Row():
-                            wizard_grant_type=gr.Dropdown(["research","clinical_trial","implementation","training","center_program","foundation","rfi_response","custom"],value="research",label="Grant type")
+                            wizard_grant_type=gr.Dropdown(["research","clinical_trial","implementation","training","center_program","foundation","rfi_response","custom"],value="custom",label="Grant type",interactive=True)
                             wizard_deadline=gr.Textbox(label="Sponsor deadline",placeholder="YYYY-MM-DD")
                     with gr.Row():wizard_details_back=gr.Button("← Back");wizard_details_next=gr.Button("Continue →",variant="primary")
                 with gr.Column(visible=False,elem_id="wizard-page-3") as wizard_page_3:
@@ -2136,36 +2656,35 @@ with gr.Blocks(title="Grantspace") as demo:
                         wizard_brand=gr.File(label="Brand or layout references (optional)",file_count="multiple",type="filepath")
                     with gr.Row():wizard_source_back=gr.Button("← Back");wizard_source_next=gr.Button("Continue →",variant="primary")
 
-                wizard_core_pages=[];wizard_core_back=[];wizard_core_next=[]
-                for core_index,step in enumerate(WORKFLOW_REGISTRY["core_steps"]):
-                    page_number=WIZARD_CORE_FIRST+core_index
-                    with gr.Column(visible=False,elem_id=f"wizard-page-{page_number}") as core_page:
-                        gr.HTML(workflow_item_screen_html(step,"core",core_index+1,len(WORKFLOW_REGISTRY["core_steps"])))
-                        gr.Markdown("This outcome remains part of the grant workflow. You complete it on its own workspace screen; optional tools never add hidden blockers to it.")
-                        with gr.Row():
-                            back_button=gr.Button("← Back")
-                            next_button=gr.Button("Continue →",variant="primary")
-                    wizard_core_pages.append(core_page);wizard_core_back.append(back_button);wizard_core_next.append(next_button)
+                with gr.Column(visible=False,elem_id=f"wizard-page-{WIZARD_CORE_PAGE}") as wizard_core_page:
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">Core workflow</div><h2>Five outcomes, one clear workflow</h2><p>These five outcomes create the editable proposal. Review them together and continue once.</p></div>')
+                    with gr.Column(elem_classes="wizard-summary-table"):
+                        for core_index,step in enumerate(WORKFLOW_REGISTRY["core_steps"],1):
+                            with gr.Row(elem_classes="wizard-summary-row"):
+                                gr.HTML(f'<div class="wizard-summary-copy"><h3>{core_index:02d} · {html.escape(step["title"])}</h3><p>{html.escape(step["description"])}</p><small>Produces: {html.escape(step["output"])}</small></div>',container=False)
+                                gr.HTML('<span class="core-included">Included in core workflow</span>',container=False)
+                    with gr.Row():wizard_core_back=gr.Button("← Back");wizard_core_next=gr.Button("Continue →",variant="primary")
 
-                wizard_module_pages=[];wizard_module_back=[];wizard_module_next=[];wizard_module_modes=[]
-                for module_index,module in enumerate(WORKFLOW_REGISTRY["optional_modules"]):
-                    page_number=WIZARD_MODULE_FIRST+module_index
-                    with gr.Column(visible=False,elem_id=f"wizard-page-{page_number}") as module_page:
-                        gr.HTML(workflow_item_screen_html(module,"optional",module_index+1,len(WORKFLOW_REGISTRY["optional_modules"])))
-                        mode=gr.Radio(
-                            [("Skip this tool","skip"),("Include as an optional tool","include")],
-                            value="skip",
-                            label="Use this tool for this grant?",
-                        )
-                        gr.Markdown("An included optional tool gets its own workspace screen. It does not block another step or final export.")
-                        with gr.Row():
-                            back_button=gr.Button("← Back")
-                            next_button=gr.Button("Continue →",variant="primary")
-                    wizard_module_pages.append(module_page);wizard_module_back.append(back_button);wizard_module_next.append(next_button);wizard_module_modes.append(mode)
+                with gr.Column(visible=False,elem_id=f"wizard-page-{WIZARD_MODULE_PAGE}") as wizard_module_page:
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">Optional tools</div><h2>Add only the tools you want</h2><p>Every tool defaults to Skip. Included tools remain advisory and cannot block another outcome or final export.</p></div>')
+                    with gr.Row(elem_classes="skip-all-panel"):
+                        gr.Markdown("**Fast path:** use the five core outcomes without specialist tools.")
+                        wizard_optional_skip_all=gr.Button("Skip all optional tools →",variant="secondary")
+                    wizard_module_modes=[]
+                    with gr.Column(elem_classes="wizard-summary-table"):
+                        for module in WORKFLOW_REGISTRY["optional_modules"]:
+                            with gr.Row(elem_classes="wizard-summary-row"):
+                                gr.HTML(f'<div class="wizard-summary-copy"><h3>{html.escape(module["title"])}</h3><p>{html.escape(module["description"])}</p><small>{html.escape(module["placement"].replace("_"," ").title())} · Produces: {html.escape(module["output"])}</small></div>',container=False)
+                                mode=gr.Radio(
+                                    [("Skip","skip"),("Add optionally","include")],value="skip",label=None,
+                                    interactive=True,container=False,elem_classes="wizard-choice",
+                                )
+                                wizard_module_modes.append(mode)
+                    with gr.Row():wizard_module_back=gr.Button("← Back");wizard_module_next=gr.Button("Continue →",variant="primary")
 
                 with gr.Column(visible=False,elem_id=f"wizard-page-{WIZARD_REVIEW_PAGE}") as wizard_review_page:
                     gr.HTML('<div class="wizard-title"><div class="wizard-kicker">Review setup</div><h2>Choose the depth of critique</h2><p>This choice is used only when the Review simulator tool is included. Review remains advisory and never blocks the grant.</p></div>')
-                    wizard_review_mode=gr.Radio(REVIEW_MODE_CHOICES,value=REVIEW_MODE_CHOICES[0][1],label="Review mode")
+                    wizard_review_mode=gr.Radio(REVIEW_MODE_CHOICES,value=REVIEW_MODE_CHOICES[0][1],label="Review mode",interactive=True,elem_classes="wizard-option-grid")
                     gr.HTML('<div class="privacy-note">Reviewer roles are derived later from the approved solicitation and the versioned registry. Synthetic reviewers never represent named people or predict an award decision.</div>')
                     with gr.Row():wizard_review_back=gr.Button("← Back");wizard_review_next=gr.Button("Continue →",variant="primary")
 
@@ -2189,8 +2708,8 @@ with gr.Blocks(title="Grantspace") as demo:
                 with gr.Column(visible=False,elem_id=f"wizard-page-{WIZARD_ROUTING_PAGE}") as wizard_routing_page:
                     gr.HTML('<div class="wizard-title"><div class="wizard-kicker">Model routing</div><h2>Choose where model work runs</h2><p>This policy is stored on the grant and enforced for its model calls.</p></div>')
                     with gr.Column(elem_classes="wizard-panel"):
-                        wizard_routing=gr.Dropdown(WORKFLOW_REGISTRY["model_routing_modes"],value=os.getenv("MODEL_ROUTING_MODE","local_only"),label="Model routing policy")
-                        gr.Markdown(f"**Local provider:** `{os.getenv('LOCAL_LLM_PROVIDER','not configured')}`  \n**Local model:** `{os.getenv('LOCAL_LLM_MODEL','not configured')}`  \n**Cloud model:** `{os.getenv('CLAUDE_MODEL','not configured')}`")
+                        wizard_routing=gr.Dropdown(WORKFLOW_REGISTRY["model_routing_modes"],value=os.getenv("MODEL_ROUTING_MODE","local_only"),label="Model routing policy",interactive=True)
+                        gr.Markdown(f"**Local provider:** `{os.getenv('LOCAL_LLM_PROVIDER','not configured')}`  \n**Local model:** `{os.getenv('LOCAL_LLM_API_MODEL',os.getenv('LOCAL_LLM_MODEL','not configured'))}`  \n**Cloud model:** `{os.getenv('CLAUDE_MODEL','not configured')}`")
                         gr.HTML('<div class="privacy-note">Local-only prevents proposal content from being sent to Claude. Hybrid routing shows and records the provider and model for every generated artifact.</div>')
                     with gr.Row():wizard_routing_back=gr.Button("← Back");wizard_routing_next=gr.Button("Preview workflow →",variant="primary")
 
@@ -2204,14 +2723,17 @@ with gr.Blocks(title="Grantspace") as demo:
                 with gr.Row(elem_classes="wizard-footer"):
                     gr.Markdown("Configuration is not persisted until you create the grant.")
                     wizard_progress=gr.Markdown(f"1 of {WIZARD_PAGE_COUNT}",elem_id="wizard-progress")
-    gr.Markdown(f"# Grantspace\n{ORGANIZATION_NAME} · Compose the workflow. Write the grant. Win the review. · Build {GRANT_BUILD_VERSION}")
-    refresh_shared_updates_btn=gr.Button("↻ Refresh shared updates",variant="secondary",elem_id="refresh-shared-updates")
-    manual_refresh_status=gr.Markdown()
+    global_navigation_command=gr.Textbox(visible=True,elem_id="global-navigation-command")
+    gr.HTML('''<nav class="global-nav" aria-label="Global navigation"><span class="brand">Grantspace</span><button type="button" data-global-nav="projects">Grants &amp; wizard</button><button type="button" data-global-nav="workflow">Workflow setup</button><button type="button" data-global-nav="editor">Grant editor</button><button type="button" data-global-nav="admin">Administration</button><a href="/logout">Sign out</a></nav>''',container=False)
+    gr.Markdown(f"# Grantspace\n{ORGANIZATION_NAME} · Shared grant writing · Build {GRANT_BUILD_VERSION}",visible=False)
+    refresh_shared_updates_btn=gr.Button("↻ Refresh shared updates",variant="secondary",elem_id="refresh-shared-updates",visible=False)
+    manual_refresh_status=gr.Markdown(visible=False)
     project_id=gr.State("");interview_questions=gr.State([]);current_question=gr.State(None);current_version=gr.State(None);baseline_body=gr.State("");current_section_key=gr.State("");current_competitive_update_event=gr.State(None)
-    workspace_workflow_summary=gr.Markdown()
+    workspace_workflow_summary=gr.Markdown(visible=False)
     workspace_workflow_status=gr.JSON(label="Composable workflow status",visible=False)
-    with gr.Row():
-        recent=gr.Dropdown(label="Open existing project",choices=[]);refresh_projects_btn=gr.Button("Refresh Projects");open_project_btn=gr.Button("Open Project",variant="secondary")
+    with gr.Accordion("Switch grant",open=False):
+        with gr.Row():
+            recent=gr.Dropdown(label="Saved grant",choices=[]);refresh_projects_btn=gr.Button("Refresh list");open_project_btn=gr.Button("Open",variant="secondary")
     with gr.Accordion("Manage saved grants",open=False):
         gr.Markdown("Grants are persisted on the shared server, scoped to your account memberships, and remain available after every sign-out or restart. Archiving is reversible and never deletes grant records.")
         with gr.Row():
@@ -2224,9 +2746,45 @@ with gr.Blocks(title="Grantspace") as demo:
             managed_project_action=gr.Dropdown(["Keep active","Archive","Restore"],value="Keep active",label="Lifecycle action")
             apply_project_management_btn=gr.Button("Apply to selected grant")
         project_management_status=gr.Markdown()
-    agentic_global_notice=gr.Markdown()
+    agentic_global_notice=gr.Markdown(visible=False)
     with gr.Tabs() as workspace_tabs:
-        with gr.Tab("1 · Grant Ask") as intake_tab:
+        with gr.Tab("Grant editor") as document_editor_tab:
+            with gr.Column(elem_classes="grant-editor-shell"):
+                gr.HTML('<div class="grant-editor-header"><div><h2>Collaborative grant editor</h2><div class="editor-secondary">Edit the complete proposal in one continuous document. Saves create immutable versions; Refresh shared changes pulls teammate updates.</div></div></div>')
+                editor_current_key=gr.State(None);editor_version=gr.State(None)
+                editor_outline_command=gr.Textbox(visible=True,elem_id="editor-outline-command")
+                editor_document_payload=gr.Textbox(visible=True,elem_id="editor-document-payload")
+                with gr.Row(elem_classes="grant-editor-layout"):
+                    with gr.Column(scale=2,elem_classes="grant-outline-panel"):
+                        with gr.Accordion("Sections",open=True):
+                            editor_outline=gr.HTML(editor_outline_html([],None),container=False)
+                            with gr.Accordion("Add a section",open=False):
+                                editor_new_section_title=gr.Textbox(label="Section title",placeholder="Enter a new section title")
+                                editor_add_section_btn=gr.Button("Add section",variant="secondary")
+                            editor_refresh_btn=gr.Button("↻ Refresh shared changes",variant="secondary")
+                    with gr.Column(scale=9,elem_classes="grant-document-panel"):
+                        with gr.Row(elem_classes="grant-editor-toolbar"):
+                            editor_save_btn=gr.Button("Save document",variant="primary",scale=1)
+                            editor_prefill_btn=gr.Button("Draft missing sections",variant="secondary",scale=1)
+                            editor_rewrite_btn=gr.Button("Rewrite selected",variant="secondary",scale=1)
+                            editor_version_choice=gr.Dropdown(label="Selected section version",choices=[],scale=2,container=False)
+                            editor_load_version_btn=gr.Button("Load version",variant="secondary",scale=1)
+                        editor_document=gr.HTML(editor_document_html([],None),container=False)
+                        editor_status=gr.Markdown("Open a saved grant to begin.")
+                    with gr.Column(scale=2,elem_classes="grant-guidance-panel"):
+                        gr.Markdown("### Comments & guidance\nQuestions and rules trigger evidence research and a rewrite. Comments remain shared notes.")
+                        editor_guidance_view=gr.HTML(editor_guidance_html([]),container=False)
+                        editor_guidance_kind=gr.Radio([("Comment","comment"),("Question","question"),("Rule","rule")],value="comment",label="Add")
+                        editor_guidance_body=gr.Textbox(label="Message",lines=3,placeholder="Write one clear item")
+                        editor_post_guidance_btn=gr.Button("Share",variant="primary")
+                        with gr.Accordion("Resolve completed guidance",open=False):
+                            editor_resolve_choice=gr.Dropdown(label="Open item")
+                            editor_resolve_btn=gr.Button("Mark resolved",variant="secondary")
+                        editor_guidance_status=gr.Markdown()
+                publish_grant_btn=gr.Button("Publish grant · DOCX + PDF",elem_id="publish-grant-floating")
+                editor_publish_files=gr.File(label="Published grant files",file_count="multiple")
+                editor_publish_status=gr.Markdown()
+        with gr.Tab("1 · Grant Ask",visible=False) as intake_tab:
             with gr.Row():
                 with gr.Column(scale=2):
                     project_title=gr.Textbox(label="Working title");sponsor=gr.Textbox(label="Sponsor");mechanism=gr.Textbox(label="Mechanism")
@@ -2266,7 +2824,7 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
                     with gr.Row():
                         solicitation_return_reason=gr.Textbox(label="Return-for-revision rationale",placeholder="State the exact correction required")
                         return_solicitation_btn=gr.Button("↩ Return approved profile for revision")
-        with gr.Tab("2 · Research Plan") as framework_tab:
+        with gr.Tab("2 · Research Plan",visible=False) as framework_tab:
             gr.Markdown("### Sponsor-mapped research plan\nGenerate from the exact approved solicitation profile, then edit the argument, mappings, evidence gaps, ownership, dependencies, and word allocations before approval.")
             framework_version=gr.State(None)
             with gr.Row():
@@ -2282,7 +2840,7 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
             with gr.Row():
                 framework_return_reason=gr.Textbox(label="Return-for-revision rationale",placeholder="State the exact correction required")
                 return_framework_btn=gr.Button("↩ Return approved framework for revision")
-        with gr.Tab("3 · Aims") as aims_tab:
+        with gr.Tab("3 · Aims",visible=False) as aims_tab:
             gr.Markdown("### Versioned aims\nKeep objectives, central thesis, rationale, approach, outcomes, impact, innovation, dependencies, classifications, and supporting evidence explicit.")
             aims_version=gr.State(None)
             with gr.Row():
@@ -2307,7 +2865,7 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
                     with gr.Row():confidence=gr.Dropdown(["high","medium","low"],value="high",label="Confidence");classification=gr.Dropdown(["verified_fact","investigator_estimate","assumption","unknown"],value="verified_fact",label="Classification")
                     answer_notes=gr.Textbox(label="Supporting explanation / notes",lines=4);answered_by=gr.Textbox(label="Answered by / role");submit=gr.Button("Save Answer & Continue",variant="primary");interview_status=gr.Markdown()
                 with gr.Column(scale=2):interview_table=gr.JSON(label="Interview state")
-        with gr.Tab("4 · Evidence") as research_tab:
+        with gr.Tab("4 · Evidence",visible=False) as research_tab:
             gr.Markdown("### Approved search plan\nGenerate a solicitation-, framework-, and aims-grounded query plan, let contributors correct it, and require named approval before the application performs any external search.")
             search_plan_version=gr.State(None)
             with gr.Row():
@@ -2554,7 +3112,7 @@ Register the actual files that must travel with the proposal. Use a stable slot 
                 register_artifact_btn=gr.Button("Register Attachment(s)")
             artifact_table=gr.Dataframe(headers=["Slot","Filename","Extension","SHA-256"],interactive=False,label="Registered submission artifacts")
             compliance_status=gr.Markdown()
-        with gr.Tab("5 · Proposal") as writing_tab:
+        with gr.Tab("5 · Proposal",visible=False) as writing_tab:
             with gr.Row():section=gr.Dropdown(DEFAULT_SECTIONS,value=(DEFAULT_SECTIONS[0] if DEFAULT_SECTIONS else None),label="Section",allow_custom_value=True);high=gr.Checkbox(label="Escalate this draft to Claude (sends this section’s compiled context to the configured cloud API)",value=False)
             additional=gr.Textbox(lines=4,label="Optional additional human context");gen=gr.Button("Compile Context & Draft Section",variant="primary")
             section_update_banner=gr.Markdown()
@@ -2608,7 +3166,7 @@ Register the actual files that must travel with the proposal. Use a stable slot 
                 save_causal_btn=gr.Button("Save new causal model version")
             causal_editor=gr.JSON(label="Causal graph, assumptions, threats, and claim checks")
             causal_history=gr.JSON(label="Append-only causal model history",visible=False);causal_status=gr.Markdown()
-        with gr.Tab("Proposal · Readiness & Export") as export_tab:
+        with gr.Tab("Proposal · Readiness & Export",visible=False) as export_tab:
             gr.Markdown("### Human-Approved Grant Assembly\nOnly exact section versions approved by the human are included below or in final exports. AI drafts and unapproved edits are excluded.")
             preview_approved_btn=gr.Button("Refresh Approved Grant Preview",variant="secondary")
             approved_sections_table=gr.Dataframe(headers=["Order","Section","Status","Approved version"],datatype=["number","str","str","number"],interactive=False,label="Approved section assembly")
@@ -2649,32 +3207,37 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
                 disable_account_btn=gr.Button("Disable account")
                 enable_account_btn=gr.Button("Enable account")
 
-    wizard_pages=[wizard_page_1,wizard_page_2,wizard_page_3]+wizard_core_pages+wizard_module_pages+[wizard_review_page,wizard_team_page,wizard_routing_page,wizard_preview_page]
+    wizard_pages=[wizard_page_1,wizard_page_2,wizard_page_3,wizard_core_page,wizard_module_page,wizard_review_page,wizard_team_page,wizard_routing_page,wizard_preview_page]
     wizard_nav_outputs=wizard_pages+[wizard_rail,wizard_progress]
+    global_nav_fields=[wizard_title,wizard_sponsor,wizard_mechanism,wizard_deadline,wizard_grant_type,wizard_preset,wizard_modules,wizard_required_modules,wizard_review_required,wizard_review_mode,wizard_routing]+wizard_module_modes
+    global_nav_outputs=[wizard_shell,wizard_edit_project,wizard_create_btn]+wizard_nav_outputs+global_nav_fields+[global_navigation_command]
+    global_navigation_event=global_navigation_command.change(gateway_callback(global_navigation_state),[project_id,global_navigation_command],global_nav_outputs,show_progress="hidden")
+    global_navigation_event.success(fn=None,js=wizard_nav_from_progress_js(),queue=False)
     wizard_new_btn.click(wizard_go(2),outputs=wizard_nav_outputs,js=wizard_nav_js(2)).then(gateway_callback(authenticated_identity),outputs=[wizard_owner_id,wizard_identity_status])
+    wizard_new_btn.click(lambda:(None,gr.update(value="Create shared grant →",interactive=True)),outputs=[wizard_edit_project,wizard_create_btn],queue=False)
     wizard_details_back.click(wizard_go(1),outputs=wizard_nav_outputs,js=wizard_nav_js(1))
     wizard_details_event=wizard_details_next.click(validate_grant_details_and_continue,[wizard_title,wizard_deadline],wizard_nav_outputs)
     wizard_details_event.success(fn=None,js=wizard_nav_js(3),queue=False)
     wizard_source_back.click(wizard_go(2),outputs=wizard_nav_outputs,js=wizard_nav_js(2))
-    wizard_source_event=wizard_source_next.click(validate_grant_source_and_continue,[wizard_source,wizard_source_url,wizard_source_text],wizard_nav_outputs)
-    wizard_source_event.success(fn=None,js=wizard_nav_js(WIZARD_CORE_FIRST),queue=False)
-    for index,(back_button,next_button) in enumerate(zip(wizard_core_back,wizard_core_next)):
-        page=WIZARD_CORE_FIRST+index
-        back_button.click(wizard_go(page-1),outputs=wizard_nav_outputs,js=wizard_nav_js(page-1))
-        next_button.click(wizard_go(page+1),outputs=wizard_nav_outputs,js=wizard_nav_js(page+1))
-    for index,(back_button,next_button) in enumerate(zip(wizard_module_back,wizard_module_next)):
-        page=WIZARD_MODULE_FIRST+index
-        back_button.click(wizard_go(page-1),outputs=wizard_nav_outputs,js=wizard_nav_js(page-1))
-        next_button.click(wizard_go(page+1),outputs=wizard_nav_outputs,js=wizard_nav_js(page+1))
-    wizard_review_back.click(wizard_go(WIZARD_MODULE_LAST),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_MODULE_LAST))
+    wizard_source_event=wizard_source_next.click(validate_grant_source_and_continue,[wizard_source,wizard_source_url,wizard_source_text,wizard_edit_project],wizard_nav_outputs)
+    wizard_source_event.success(fn=None,js=wizard_nav_js(WIZARD_CORE_PAGE),queue=False)
+    wizard_core_back.click(wizard_go(3),outputs=wizard_nav_outputs,js=wizard_nav_js(3))
+    wizard_core_next.click(wizard_go(WIZARD_MODULE_PAGE),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_MODULE_PAGE))
+    wizard_module_back.click(wizard_go(WIZARD_CORE_PAGE),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_CORE_PAGE))
+    wizard_optional_skip_event=wizard_optional_skip_all.click(optional_tools_skip_all,outputs=wizard_module_modes+wizard_nav_outputs)
+    wizard_optional_skip_event.success(fn=None,js=wizard_nav_js(WIZARD_TEAM_PAGE),queue=False)
+    wizard_optional_continue_event=wizard_module_next.click(optional_tools_continue,wizard_module_modes,wizard_nav_outputs)
+    wizard_optional_continue_event.success(fn=None,js=wizard_nav_from_progress_js(),queue=False)
+    wizard_review_back.click(wizard_go(WIZARD_MODULE_PAGE),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_MODULE_PAGE))
     wizard_review_next.click(wizard_go(WIZARD_TEAM_PAGE),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_TEAM_PAGE))
-    wizard_team_back.click(wizard_go(WIZARD_REVIEW_PAGE),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_REVIEW_PAGE))
+    wizard_team_back_event=wizard_team_back.click(team_back_from_optional_tools,wizard_module_modes,wizard_nav_outputs)
+    wizard_team_back_event.success(fn=None,js=wizard_nav_from_progress_js(),queue=False)
     wizard_team_next.click(wizard_go(WIZARD_ROUTING_PAGE),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_ROUTING_PAGE))
     wizard_routing_back.click(wizard_go(WIZARD_TEAM_PAGE),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_TEAM_PAGE))
     wizard_team_add.click(add_wizard_team_invitation,[wizard_team,wizard_team_email,wizard_team_role],[wizard_team,wizard_team_email,wizard_team_remove_choice,wizard_team_status])
     wizard_team_remove.click(remove_wizard_team_invitation,[wizard_team,wizard_team_remove_choice],[wizard_team,wizard_team_remove_choice,wizard_team_status])
     wizard_routing_event=wizard_routing_next.click(
-        gateway_callback(validate_routing_and_preview),
+        validate_routing_and_preview,
         [wizard_title,wizard_sponsor,wizard_mechanism,wizard_deadline,wizard_review_mode,wizard_routing,wizard_team]+wizard_module_modes,
         wizard_nav_outputs+[wizard_preview,wizard_modules,wizard_required_modules,wizard_review_required],
     )
@@ -2687,9 +3250,21 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
         [wizard_shell,project_id,project_title,sponsor,mechanism,project_status,agentic_global_notice,requirements_table,section,current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner,workspace_workflow_summary,workspace_workflow_status,interview_tab,team_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab])
     wizard_open_event.success(fn=None,js=WIZARD_HIDE_JS,queue=False)
     wizard_create_event=wizard_create_btn.click(gateway_callback(configured_project_creation_ui),
-        [wizard_title,wizard_sponsor,wizard_mechanism,wizard_deadline,wizard_grant_type,wizard_source,wizard_source_url,wizard_source_text,wizard_supporting,wizard_brand,wizard_preset,wizard_modules,wizard_required_modules,wizard_review_mode,wizard_review_required,wizard_routing,wizard_team],
+        [wizard_title,wizard_sponsor,wizard_mechanism,wizard_deadline,wizard_grant_type,wizard_source,wizard_source_url,wizard_source_text,wizard_supporting,wizard_brand,wizard_preset,wizard_modules,wizard_required_modules,wizard_review_mode,wizard_review_required,wizard_routing,wizard_team,wizard_edit_project],
         [wizard_shell,project_id,project_title,sponsor,mechanism,project_status,agentic_global_notice,requirements_table,section,current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner,workspace_workflow_summary,workspace_workflow_status,interview_tab,team_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab,wizard_create_status,wizard_create_btn])
     wizard_create_event.then(fn=None,inputs=[wizard_create_status],js=WIZARD_HIDE_AFTER_CREATE_JS,queue=False)
+    editor_outputs=[editor_outline,editor_document,editor_current_key,editor_version,editor_version_choice,editor_guidance_view,editor_resolve_choice,editor_status]
+    project_id.change(gateway_callback(prefill_continuous_editor),[project_id,editor_current_key],editor_outputs)
+    editor_refresh_btn.click(gateway_callback(load_continuous_editor),[project_id,editor_current_key],editor_outputs)
+    editor_prefill_btn.click(gateway_callback(prefill_continuous_editor),[project_id,editor_current_key],editor_outputs)
+    editor_outline_command.change(gateway_callback(handle_continuous_outline_command),[project_id,editor_current_key,editor_outline_command],[editor_current_key,editor_version,editor_version_choice,editor_guidance_view,editor_resolve_choice,editor_status,editor_outline_command],show_progress="hidden")
+    editor_save_btn.click(gateway_callback(save_continuous_editor),[project_id,editor_document_payload,editor_current_key],editor_outputs,js=EDITOR_SAVE_INPUT_JS)
+    editor_rewrite_btn.click(gateway_callback(rewrite_continuous_section),[project_id,editor_current_key,editor_document_payload],editor_outputs,js=EDITOR_REWRITE_INPUT_JS)
+    editor_add_section_btn.click(gateway_callback(add_continuous_editor_section),[project_id,editor_new_section_title,editor_document_payload,editor_current_key],editor_outputs+[editor_new_section_title],js=EDITOR_ADD_INPUT_JS)
+    editor_load_version_btn.click(gateway_callback(load_continuous_historical_version),[project_id,editor_current_key,editor_version_choice],[editor_document,editor_status])
+    editor_post_guidance_btn.click(gateway_callback(post_continuous_guidance),[project_id,editor_current_key,editor_guidance_kind,editor_guidance_body,editor_document_payload],editor_outputs+[editor_guidance_body,editor_guidance_status],js=EDITOR_GUIDANCE_INPUT_JS)
+    editor_resolve_btn.click(gateway_callback(resolve_editor_guidance),[project_id,editor_current_key,editor_resolve_choice],[editor_guidance_view,editor_resolve_choice,editor_guidance_status])
+    publish_grant_btn.click(gateway_callback(publish_document_editor),[project_id],[editor_publish_files,editor_publish_status])
     create.click(gateway_callback(create_project),[project_title,sponsor,mechanism,source,source_url,source_text,supporting,brand],[project_id,project_status,agentic_global_notice,requirements_table,section])
     compile_grant_ask_btn.click(gateway_callback(compile_grant_ask),[project_id],[requirements_table,req_status])
     approve_req.click(gateway_callback(approve_requirements),[project_id],[req_status])
@@ -2789,10 +3364,13 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
     enable_account_btn.click(gateway_callback(lambda user_id:set_account_status(user_id,True)),[account_target_id],[accounts_table,account_admin_status])
     refresh_shared_updates_btn.click(gateway_callback(refresh_shared_updates),[project_id,team_channel_kind,team_channel_subject,search_plan_version,literature_version,include_archived_projects],
         [wizard_existing,recent,project_catalog_table,project_catalog_summary,team_members,team_activity,project_invites,team_tasks,team_notifications,approval_routing_table,project_health_table,project_health_summary_md,team_workspace_status,team_channel_html,team_messages,team_channel_status,shared_literature_sync_status,requirements_table,req_status,workspace_workflow_summary,workspace_workflow_status,interview_tab,team_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab,manual_refresh_status])
-    demo.load(gateway_callback(project_catalog),[include_archived_projects],[recent,project_catalog_table,project_catalog_summary],show_progress="hidden")
-    demo.load(gateway_callback(refresh_projects),outputs=[wizard_existing],show_progress="hidden")
-    demo.load(gateway_callback(authenticated_identity),outputs=[wizard_owner_id,wizard_identity_status],show_progress="hidden")
+    session_bootstrap_event=demo.load(fn=None,js=SESSION_STORAGE_AUTH_JS,queue=False)
     demo.load(fn=None,js=WIZARD_CREATE_CLICK_JS,queue=False)
+    demo.load(fn=None,js=EDITOR_OUTLINE_JS,queue=False)
+    demo.load(fn=None,js=GLOBAL_NAVIGATION_JS,queue=False)
+    session_bootstrap_event.then(gateway_callback(project_catalog),[include_archived_projects],[recent,project_catalog_table,project_catalog_summary],show_progress="hidden")
+    session_bootstrap_event.then(gateway_callback(refresh_projects),outputs=[wizard_existing],show_progress="hidden")
+    session_bootstrap_event.then(gateway_callback(authenticated_identity),outputs=[wizard_owner_id,wizard_identity_status],show_progress="hidden")
 
 APP_THEME=gr.themes.Base(primary_hue=gr.themes.colors.purple,secondary_hue=gr.themes.colors.fuchsia,neutral_hue=gr.themes.colors.gray)
 
@@ -2856,6 +3434,12 @@ def build_internal_account_app():
 
     @web.get("/favicon.ico",include_in_schema=False)
     async def favicon():return Response(status_code=204)
+
+    @web.get("/session-token",include_in_schema=False)
+    async def session_token(request:Request):
+        token=request.cookies.get("grantspace_session")
+        if not token or not _session_user(request):return JSONResponse({"error":"login session is missing or expired"},status_code=401)
+        return JSONResponse({"access_token":token},headers={"Cache-Control":"no-store"})
 
     @web.get("/")
     async def root(request:Request):
