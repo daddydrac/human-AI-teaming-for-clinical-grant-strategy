@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><link rel="stylesheet" href="mockups.css"></head>
+<body>
+  <section class="frame auth-frame" data-shot="first-admin">
+    <div class="auth-card">
+      <div class="logo">G</div><div class="kicker">FIRST START</div>
+      <h1>Create the first administrator</h1>
+      <p>This one-time account manages users and shared grants.</p>
+      <div class="field wide"><label>Initial setup token</label><div class="input">••••••••••••••••••••••••</div></div>
+      <div class="two"><div class="field"><label>Username</label><div class="input">mchen</div></div><div class="field"><label>Email</label><div class="input">maya.chen@northstar.example</div></div></div>
+      <div class="two"><div class="field"><label>Display name</label><div class="input">Dr. Maya Chen</div></div><div class="field"><label>Temporary password</label><div class="input">••••••••••••••</div></div></div>
+      <button class="primary">Create administrator</button>
+      <div class="note">You will choose a permanent password immediately after signing in.</div>
+    </div>
+  </section>
+
+  <section class="frame" data-shot="grant-wizard">
+    <aside class="rail"><div class="rail-title">COMPOSE WORKFLOW</div><ol><li class="done">Start</li><li class="done">Grant details</li><li class="active">Grant source</li><li>Core workflow</li><li>Optional tools</li><li>Team</li><li>Model routing</li><li>Preview</li></ol><div class="rail-foot">3 of 8<br><span>Grant source</span></div></aside>
+    <main class="canvas">
+      <div class="topline"><span>GRANT SOURCE</span><span class="save">Draft saved locally</span></div>
+      <h1>Give Grantspace the sponsor ask</h1><p class="lead">Upload the NOFO, enter its public URL, or paste the complete text.</p>
+      <div class="source-tabs"><b>Upload</b><span>URL</span><span>Paste text</span></div>
+      <div class="dropzone"><div class="upload-icon">⇧</div><strong>Drop the RFA, NOFO, or application form here</strong><span>PDF, DOCX, TXT, or HTML</span><button>Choose file</button></div>
+      <div class="source-grid"><div class="mini-card"><strong>Supporting guidance</strong><p>Policies, strategic plans, and sponsor instructions.</p><span>＋ Add material</span></div><div class="mini-card"><strong>Institutional materials</strong><p>Facilities, bios, prior approved language, and capabilities.</p><span>＋ Add material</span></div></div>
+      <div class="actions"><button>← Back</button><button class="primary">Continue →</button></div>
+    </main>
+  </section>
+
+  <section class="frame" data-shot="team-management">
+    <header class="appbar"><b>Grantspace</b><nav>Grants & wizard　 Workflow setup　 <em>Grant editor</em>　 Administration　 Sign out</nav></header>
+    <main class="workspace-page">
+      <div class="project-head"><div><div class="kicker">SHARED GRANT</div><h1>Community Oncology Navigation Trial</h1><p>Northstar Cancer Center · NIH R01 · Due October 5</p></div><button>↻ Refresh shared changes</button></div>
+      <div class="team-layout">
+        <section class="panel"><div class="panel-head"><div><h2>Team members</h2><p>Everyone works from the same saved grant.</p></div><button class="primary">Invite teammate</button></div>
+          <table><thead><tr><th>Person</th><th>Project role</th><th>Status</th><th>Last activity</th></tr></thead><tbody>
+            <tr><td><b>Dr. Maya Chen</b><small>maya.chen@northstar.example</small></td><td><span class="pill purple">Owner / PI</span></td><td><span class="online">● Active</span></td><td>Editing Specific Aims</td></tr>
+            <tr><td><b>Jordan Lee</b><small>jordan.lee@northstar.example</small></td><td><span class="pill">Scientific writer</span></td><td><span class="online">● Active</span></td><td>Added a question</td></tr>
+            <tr><td><b>Sam Rivera</b><small>sam.rivera@northstar.example</small></td><td><span class="pill">Statistician</span></td><td>Invited</td><td>Email sent today</td></tr>
+          </tbody></table>
+        </section>
+        <aside class="panel invite"><h2>Invite a collaborator</h2><p>Send a time-limited invitation to an existing account.</p><div class="field"><label>Email</label><div class="input">sam.rivera@northstar.example</div></div><div class="field"><label>Role</label><div class="input select">Statistician / methodologist</div></div><div class="field"><label>Invitation expires</label><div class="input select">7 days</div></div><button class="primary">Create and email invitation</button><div class="success">✓ Invitation accepted by the mail server</div></aside>
+      </div>
+    </main>
+  </section>
+
+  <section class="frame" data-shot="workflow-editor">
+    <header class="appbar"><b>Grantspace</b><nav>Grants & wizard　 Workflow setup　 <em>Grant editor</em>　 Administration　 Sign out</nav></header>
+    <main class="editor-page">
+      <div class="editor-head"><div><div class="kicker">COMMUNITY ONCOLOGY NAVIGATION TRIAL</div><h1>Collaborative grant editor</h1></div><div><button>↻ Refresh shared changes</button><button class="publish">Publish grant · DOCX + PDF</button></div></div>
+      <div class="editor-grid">
+        <aside class="outline panel"><div class="panel-head"><h2>Sections</h2><span>6 sections</span></div><ul><li class="selected">⋮⋮　Specific Aims <span>2</span></li><li>⋮⋮　Significance</li><li>⋮⋮　Innovation</li><li>⋮⋮　Approach <span>1</span></li><li>⋮⋮　Human Subjects</li><li>⋮⋮　Environment</li></ul><button>＋ Add section</button></aside>
+        <article class="paper"><div class="doc-tools"><button class="primary">Save document</button><button>Draft missing sections</button><button>Rewrite selected</button><select><option>Version 4 · Dr. Chen</option></select></div><div class="page"><div class="section-label">SPECIFIC AIMS</div><h2>Closing navigation gaps in community oncology care</h2><p>Patients treated across community oncology networks experience preventable delays between diagnosis, referral, and initiation of evidence-based care. This proposal will evaluate a navigation model designed with clinical teams and patient partners.</p><p><b>Aim 1.</b> Determine whether structured navigation reduces time from referral to treatment initiation across participating clinics.</p><p><b>Aim 2.</b> Identify implementation conditions associated with equitable reach, adoption, and sustained delivery.</p><p>The expected outcome is an evidence-grounded implementation strategy that can be adapted across resource-constrained oncology settings.</p></div></article>
+        <aside class="comments panel"><h2>Comments & guidance</h2><p>Questions and rules can trigger evidence research and a rewrite.</p><div class="comment"><b>Jordan Lee</b><small>Question · 10:42 AM</small><p>Can we quantify the referral delay from our baseline cohort?</p></div><div class="comment rule"><b>Dr. Maya Chen</b><small>Rule · 10:47 AM</small><p>Preserve the distinction between preliminary results and assumptions.</p></div><button class="primary">＋ Add guidance</button></aside>
+      </div>
+    </main>
+  </section>
+
+  <section class="frame" data-shot="review-publish">
+    <header class="appbar"><b>Grantspace</b><nav>Grant editor　 Team　 <em>Review simulator</em>　 Evidence　 Export</nav></header>
+    <main class="workspace-page">
+      <div class="project-head"><div><div class="kicker">SYNTHETIC REVIEW · ADVISORY</div><h1>Panel review and revision plan</h1><p>Grounded in the approved solicitation rubric and proposal snapshot v12.</p></div><button class="primary">Run a new review</button></div>
+      <div class="score-row"><div class="score"><span>Rubric coverage</span><b>100%</b><small>All criteria reviewed</small></div><div class="score"><span>Priority findings</span><b>6</b><small>2 critical · 4 addressable</small></div><div class="score"><span>Reviewer agreement</span><b>Moderate</b><small>Methods drove disagreement</small></div><div class="score ready"><span>Export status</span><b>Ready</b><small>Human approval retained</small></div></div>
+      <div class="review-grid"><section class="panel"><h2>Panel findings</h2><div class="finding critical"><span>CRITICAL · APPROACH</span><h3>Attrition assumptions need stronger justification</h3><p>The methods reviewer found insufficient evidence for the proposed retention estimate.</p><div class="anchors">Proposal § Approach 3.2　 · 　NOFO Criterion 2</div></div><div class="finding"><span>ADDRESSABLE · SIGNIFICANCE</span><h3>Clarify how the intervention changes referral behavior</h3><p>The mission and implementation reviewers agreed the mechanism should be more explicit.</p><div class="anchors">Proposal § Significance 2.1　 · 　NOFO Criterion 1</div></div></section>
+        <aside class="panel"><h2>Revision backlog</h2><ol class="tasks"><li><b>Recalculate retention scenarios</b><small>Assigned to Sam Rivera</small></li><li><b>Rewrite mechanism paragraph</b><small>Assigned to Jordan Lee</small></li><li><b>Confirm final human approval</b><small>Assigned to Dr. Maya Chen</small></li></ol><button>Open causal assumptions</button><button class="publish">Publish approved grant</button><p class="fine">Simulated feedback does not predict funding or represent named reviewers.</p></aside></div>
+    </main>
+  </section>
+</body></html>
