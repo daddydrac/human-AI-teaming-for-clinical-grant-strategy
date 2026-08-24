@@ -3,6 +3,7 @@
 Clinical Grant Workbench is a local, human-in-the-loop application for developing sponsor-ready grant proposals. It turns a funding opportunity and supporting project materials into structured requirements, evidence, clinical-study design, competitive intelligence, reviewed grant sections, and a final DOCX/PDF submission package. The UI, Rust API, rendering, ingestion, and embeddings run in Docker. On Apple Silicon, Ollama runs natively for Metal acceleration; on NVIDIA Linux it runs in a GPU-enabled container.
 
 > Read the docs for how to use the UI and set up: https://daddydrac.github.io/human-AI-teaming-for-clinical-grant-strategy/
+
 > Get up and running with your team in under 5 min using Quickstart: https://github.com/daddydrac/human-AI-teaming-for-clinical-grant-strategy/blob/main/QUICKSTART.md
 
 ## UI workflow
