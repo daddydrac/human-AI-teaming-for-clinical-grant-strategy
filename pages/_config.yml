@@ -1,0 +1,17 @@
+title: Grantspace Clinician Guide
+description: Deploy Grantspace, assemble a clinical grant team, and move from a sponsor solicitation to a review-ready proposal.
+url: ""
+baseurl: ""
+repository: ""
+markdown: kramdown
+permalink: pretty
+exclude:
+  - scripts
+  - assets/mockups
+  - README.md
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+      image: /assets/images/workflow-editor.png
