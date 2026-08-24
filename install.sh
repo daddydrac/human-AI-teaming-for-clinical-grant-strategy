@@ -2,6 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
+COMPOSE=(docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml")
 if [[ "$(uname -s)" != "Darwin" ]]; then echo "ERROR: Grant Writer production installation targets macOS." >&2; exit 2; fi
 if [[ ! -f .env ]]; then
   TEMPLATE=.env.example
@@ -31,7 +32,7 @@ if [[ "${RUN_FULL_VALIDATION:-false}" == "true" ]]; then
   ./scripts/validate.sh
 else
   python3 -m py_compile ui/app.py renderer/app.py embedding_cpu/app.py ingestion/app.py
-  docker compose config >/dev/null
+  "${COMPOSE[@]}" config >/dev/null
   echo "Fast installation checks passed. Full validation was skipped; set RUN_FULL_VALIDATION=true to run it."
 fi
 echo

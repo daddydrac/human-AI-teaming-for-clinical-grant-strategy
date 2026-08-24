@@ -2,6 +2,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
+run_compose() {
+  docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" "$@"
+}
 if [[ ! -f .env ]]; then
   TEMPLATE=.env.example
   if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
@@ -41,31 +44,31 @@ if [[ "$GRANT_RUNTIME_PROFILE" == "docker_cpu" ]]; then
     exit 4
   fi
 elif [[ "$GRANT_RUNTIME_PROFILE" == "container_ollama" ]]; then
-  docker compose --profile local-model up -d ollama
-  for _ in $(seq 1 90); do docker compose exec -T ollama ollama list >/dev/null 2>&1 && break; sleep 2; done
-  docker compose exec -T ollama ollama list >/dev/null 2>&1 || { echo "Containerized Ollama failed to become ready." >&2; exit 5; }
+  run_compose --profile local-model up -d ollama
+  for _ in $(seq 1 90); do run_compose exec -T ollama ollama list >/dev/null 2>&1 && break; sleep 2; done
+  run_compose exec -T ollama ollama list >/dev/null 2>&1 || { echo "Containerized Ollama failed to become ready." >&2; exit 5; }
   MODEL="${LOCAL_LLM_API_MODEL:-${OLLAMA_MODEL:-qwen3:1.7b}}"
-  if ! docker compose exec -T ollama ollama show "$MODEL" >/dev/null 2>&1; then
+  if ! run_compose exec -T ollama ollama show "$MODEL" >/dev/null 2>&1; then
     echo "Downloading local model $MODEL into the Docker model volume..."
-    docker compose exec -T ollama ollama pull "$MODEL"
+    run_compose exec -T ollama ollama pull "$MODEL"
   fi
 fi
 
 if [[ "${REBUILD:-0}" == "1" ]]; then
-  docker compose up -d --build
+  run_compose up -d --build
 else
-  docker compose up -d
+  run_compose up -d
 fi
 # Refresh the two configuration-consuming entry services sequentially so
 # credentials and routing changed in .env cannot remain stale. --no-deps avoids
 # Docker Desktop races while Ollama or another large dependency is already up.
-docker compose up -d --no-deps --force-recreate core
-docker compose up -d --no-deps --force-recreate ui
+run_compose up -d --no-deps --force-recreate core
+run_compose up -d --no-deps --force-recreate ui
 
 for _ in $(seq 1 60); do
   curl -fsS http://127.0.0.1:7860 >/dev/null 2>&1 && break
   sleep 2
 done
-curl -fsS http://127.0.0.1:7860 >/dev/null || { docker compose ps; exit 6; }
+curl -fsS http://127.0.0.1:7860 >/dev/null || { run_compose ps; exit 6; }
 echo "Grant Writer is ready: http://localhost:7860"
 command -v open >/dev/null 2>&1 && open http://localhost:7860 || true

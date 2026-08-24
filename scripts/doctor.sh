@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
+COMPOSE=(docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml")
 echo "Grant Writer doctor"
 echo "  OS: $(uname -s) $(uname -m)"
 echo "  Docker CLI: $(command -v docker >/dev/null && echo yes || echo no)"
@@ -20,9 +21,9 @@ echo "  OMP/Rayon/BLAS: ${OMP_NUM_THREADS:-?}/${RAYON_NUM_THREADS:-?}/${OPENBLAS
 echo "  Competitive refresh: ${COMPETITIVE_REFRESH_TTL_SECONDS:-14400}s"
 echo "  Exports: ${GRANT_EXPORT_HOME:-./exports}"
 if docker info >/dev/null 2>&1; then
-  docker compose ps || true
+  "${COMPOSE[@]}" ps || true
   if [[ "${GRANT_RUNTIME_PROFILE:-}" == "container_ollama" ]]; then
-    docker compose exec -T ollama ollama list 2>/dev/null || echo "  Containerized Ollama: unavailable"
+    "${COMPOSE[@]}" exec -T ollama ollama list 2>/dev/null || echo "  Containerized Ollama: unavailable"
   fi
   curl -fsS http://127.0.0.1:8080/health/ready 2>/dev/null || true
 fi

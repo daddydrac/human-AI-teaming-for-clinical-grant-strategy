@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+COMPOSE=(docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml")
 [[ -f "$ROOT/.runtime.env" ]] || "$ROOT/scripts/configure_runtime.sh" "$ROOT/.runtime.env" >/dev/null
 set -a
 [[ -f "$ROOT/.env" ]] && source "$ROOT/.env"
@@ -19,7 +20,18 @@ fi
 if [[ "$GRANT_RUNTIME_PROFILE" == "docker_cpu" ]]; then
   [[ -n "${ANTHROPIC_API_KEY:-}" ]] || { echo "ANTHROPIC_API_KEY is required in docker_cpu mode." >&2; exit 5; }
 elif [[ "$GRANT_RUNTIME_PROFILE" == "container_ollama" ]]; then
-  docker compose --profile local-model config --services | grep -qx ollama || { echo "The containerized Ollama service is not available." >&2; exit 6; }
+  if ! COMPOSE_SERVICES="$("${COMPOSE[@]}" --profile local-model config --services)"; then
+    echo "The containerized Ollama service configuration could not be loaded." >&2
+    exit 6
+  fi
+  OLLAMA_SERVICE_FOUND=false
+  while IFS= read -r service; do
+    if [[ "$service" == "ollama" ]]; then
+      OLLAMA_SERVICE_FOUND=true
+      break
+    fi
+  done <<< "$COMPOSE_SERVICES"
+  [[ "$OLLAMA_SERVICE_FOUND" == "true" ]] || { echo "The containerized Ollama service is not defined in docker-compose.yml." >&2; exit 6; }
 fi
 if [[ "${MODEL_ROUTING_MODE:-}" == "hybrid" && "${REQUIRE_CLAUDE_IN_HYBRID:-false}" == "true" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
   echo "ANTHROPIC_API_KEY is required because this hybrid profile requires Claude escalation." >&2
