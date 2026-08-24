@@ -474,6 +474,76 @@ impl Store {
             }
             conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_active_updated ON projects(archived_at,updated_at DESC)",[])?;
         }
+        if current < 28 {
+            // The MVP workflow keeps optional capabilities available without making
+            // them hidden export prerequisites. Legacy full-workbench projects retain
+            // their historical gate behavior; every other project receives an audited,
+            // non-destructive conversion of optional gates to advisory tools.
+            let mut statement = conn.prepare(
+                "SELECT project_id,config_json FROM project_workflows ORDER BY project_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut updates = Vec::new();
+            for row in rows {
+                let (project_id, raw) = row?;
+                let mut value: Value = serde_json::from_str(&raw)
+                    .context("stored workflow configuration is invalid JSON")?;
+                let object = value
+                    .as_object_mut()
+                    .context("stored workflow configuration must be a JSON object")?;
+                let template = object
+                    .get("template")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if template == "legacy_full_workbench_v1" {
+                    continue;
+                }
+                let previous_required = object
+                    .get("required_modules")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
+                let review_was_required = object
+                    .get("review_required")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if previous_required.as_array().is_some_and(Vec::is_empty)
+                    && !review_was_required
+                {
+                    continue;
+                }
+                object.insert("required_modules".into(), json!([]));
+                object.insert("review_required".into(), json!(false));
+                let updated = serde_json::to_string(&value)?;
+                updates.push((
+                    project_id,
+                    updated,
+                    previous_required,
+                    review_was_required,
+                ));
+            }
+            drop(statement);
+            for (project_id, config_json, previous_required, review_was_required) in updates {
+                let config_sha256 = sha256_hex(config_json.as_bytes());
+                conn.execute(
+                    "UPDATE project_workflows SET config_json=?1,config_sha256=?2,config_version=config_version+1,updated_at=CURRENT_TIMESTAMP WHERE project_id=?3",
+                    params![config_json, config_sha256, project_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO workflow_events(project_id,event_type,actor,payload_json) VALUES(?1,'optional_gates_made_advisory',NULL,?2)",
+                    params![
+                        project_id,
+                        serde_json::to_string(&json!({
+                            "migration_version": 28,
+                            "previous_required_modules": previous_required,
+                            "review_was_required": review_was_required,
+                            "historical_artifacts_preserved": true
+                        }))?
+                    ],
+                )?;
+            }
+        }
         // Section catalog backfill is idempotent and safe on every startup.
         conn.execute_batch(
             r#"
@@ -903,7 +973,7 @@ impl Store {
             conn.execute("UPDATE project_workflows SET definition_version=?1,definition_sha256=?2,config_sha256=?3,config_json=?4 WHERE project_id=?5",
               params![workflow_registry.definition_version,definition_sha256,config_sha256,config_json,project_id])?;
         }
-        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(27)",[])?;
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(28)",[])?;
         Ok(Self {
             path: path_buf,
             workflow_registry,
@@ -2476,8 +2546,18 @@ impl Store {
         let id=Uuid::new_v4().to_string();
         let modifier=format!("+{days} days");
         let c=self.conn()?;
+        let account_exists=c.query_row(
+            r#"SELECT EXISTS(
+              SELECT 1 FROM users invitee JOIN users inviter ON inviter.id=?1
+              WHERE invitee.organization_id=inviter.organization_id
+                AND invitee.email=?2 COLLATE NOCASE
+                AND invitee.active=1 AND invitee.disabled_at IS NULL
+            )"#,
+            params![invited_by,email],
+            |row|row.get::<_,i64>(0),
+        )?!=0;
         c.execute("INSERT INTO project_invites(id,project_id,email,role,token_sha256,invited_by_user_id,expires_at) VALUES(?1,?2,?3,?4,?5,?6,datetime('now',?7))",params![id,project,email,role,token_sha,invited_by,modifier])?;
-        Ok(json!({"id":id,"project_id":project,"email":email,"role":role,"token":token,"expires_in_days":days}))
+        Ok(json!({"id":id,"project_id":project,"email":email,"role":role,"token":token,"expires_in_days":days,"account_exists":account_exists}))
     }
 
     pub fn accept_project_invite(&self,token:&str,user_id:&str,user_email:Option<&str>)->Result<Value>{
@@ -6053,6 +6133,99 @@ mod phase6_storage_tests {
         assert!(blockers
             .iter()
             .all(|blocker| blocker.get("module").is_none()));
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_makes_nonlegacy_optional_gates_advisory_without_hiding_tools() -> Result<()> {
+        let path = temp_db("optional-gates-advisory-migration");
+        {
+            let store = Store::open(&path)?;
+            store.upsert_identity(
+                "owner-user",
+                "test-org",
+                Some("owner@example.org"),
+                "Owner",
+            )?;
+            let mut workflow = store.default_workflow_config()?;
+            workflow
+                .enabled_modules
+                .push("competitive_intelligence".into());
+            workflow
+                .required_modules
+                .push("competitive_intelligence".into());
+            store.create_project_with_workflow(
+                "advisory-migration-project",
+                "Advisory migration",
+                None,
+                None,
+                &[],
+                &workflow,
+                Some("owner-user"),
+            )?;
+            store
+                .conn()?
+                .execute("DELETE FROM schema_migrations WHERE version=28", [])?;
+        }
+        let reopened = Store::open(&path)?;
+        let migrated = reopened.workflow_config("advisory-migration-project")?;
+        assert_eq!(
+            migrated.enabled_modules,
+            vec!["competitive_intelligence".to_owned()]
+        );
+        assert!(migrated.required_modules.is_empty());
+        let event_count: i64 = reopened.conn()?.query_row(
+            "SELECT COUNT(*) FROM workflow_events WHERE project_id='advisory-migration-project' AND event_type='optional_gates_made_advisory'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(event_count, 1);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn project_invite_reports_whether_recipient_has_an_active_account() -> Result<()> {
+        let path = temp_db("invite-account-status");
+        let store = Store::open(&path)?;
+        store.upsert_identity(
+            "owner-user",
+            "test-org",
+            Some("owner@example.org"),
+            "Owner",
+        )?;
+        store.create_project_with_workflow(
+            "invite-project",
+            "Invite project",
+            None,
+            None,
+            &[],
+            &store.default_workflow_config()?,
+            Some("owner-user"),
+        )?;
+        let missing = store.create_project_invite(
+            "invite-project",
+            "missing@example.org",
+            "contributor",
+            "owner-user",
+            7,
+        )?;
+        assert_eq!(missing.get("account_exists").and_then(Value::as_bool), Some(false));
+        store.upsert_identity(
+            "invitee-user",
+            "test-org",
+            Some("member@example.org"),
+            "Member",
+        )?;
+        let existing = store.create_project_invite(
+            "invite-project",
+            "member@example.org",
+            "contributor",
+            "owner-user",
+            7,
+        )?;
+        assert_eq!(existing.get("account_exists").and_then(Value::as_bool), Some(true));
         let _ = std::fs::remove_file(path);
         Ok(())
     }

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "definition_version": 1,
-  "default_preset_key": "lean_research_v1",
+  "definition_version": 2,
+  "default_preset_key": "custom_configuration_v1",
   "legacy_preset_key": "legacy_full_workbench_v1",
   "review_module_key": "review_simulator",
   "model_routing_modes": ["hybrid", "claude_only", "local_only"],
@@ -83,6 +83,7 @@
       "ui_surface": "opportunity_fit",
       "completion_evaluator": "artifact_approved",
       "gate_default": false,
+      "gate_configurable": false,
       "prerequisites": [],
       "runtime_implication": "Uses solicitation and public funder context; public-source connectors may make network requests."
     },
@@ -95,7 +96,8 @@
       "artifact_type": "investigator_interview",
       "ui_surface": "interview",
       "completion_evaluator": "investigator_interview_complete",
-      "gate_default": true,
+      "gate_default": false,
+      "gate_configurable": true,
       "prerequisites": ["framework"],
       "runtime_implication": "Model-assisted question generation; answers remain human-authored project records."
     },
@@ -108,7 +110,8 @@
       "artifact_type": "clinical_design",
       "ui_surface": "clinical",
       "completion_evaluator": "clinical_design_ready",
-      "gate_default": true,
+      "gate_default": false,
+      "gate_configurable": true,
       "prerequisites": ["aims"],
       "runtime_implication": "Runs deterministic statistical and feasibility calculations in addition to model assistance."
     },
@@ -122,6 +125,7 @@
       "ui_surface": "institutional_memory",
       "completion_evaluator": "artifact_approved",
       "gate_default": false,
+      "gate_configurable": false,
       "prerequisites": [],
       "runtime_implication": "Adds indexed institutional files and approved reusable content to project retrieval."
     },
@@ -135,6 +139,7 @@
       "ui_surface": "competitive",
       "completion_evaluator": "competitive_intelligence_ready",
       "gate_default": false,
+      "gate_configurable": true,
       "prerequisites": ["literature"],
       "runtime_implication": "Uses configured public research connectors and may trigger scheduled refreshes."
     },
@@ -147,7 +152,8 @@
       "artifact_type": "sponsor_compliance",
       "ui_surface": "compliance",
       "completion_evaluator": "sponsor_compliance_ready",
-      "gate_default": true,
+      "gate_default": false,
+      "gate_configurable": true,
       "prerequisites": ["solicitation"],
       "runtime_implication": "Runs model-assisted rule extraction followed by deterministic validation against exact source bytes."
     },
@@ -161,6 +167,7 @@
       "ui_surface": "review_simulator",
       "completion_evaluator": "artifact_approved",
       "gate_default": false,
+      "gate_configurable": true,
       "prerequisites": ["proposal_draft"],
       "runtime_implication": "High-compute, multi-pass model operation; hybrid deployments route configured review tasks to the disclosed cloud model."
     },
@@ -174,6 +181,7 @@
       "ui_surface": "collaboration",
       "completion_evaluator": "collaboration_routing_complete",
       "gate_default": false,
+      "gate_configurable": true,
       "prerequisites": [],
       "runtime_implication": "Requires authenticated shared deployment for real multi-user use."
     },
@@ -187,6 +195,7 @@
       "ui_surface": "tasks",
       "completion_evaluator": "artifact_approved",
       "gate_default": false,
+      "gate_configurable": false,
       "prerequisites": ["solicitation"],
       "runtime_implication": "Adds scheduled project checks and notifications; external calendar or email delivery is not enabled by default."
     },
@@ -200,15 +209,16 @@
       "ui_surface": "advanced_workbench",
       "completion_evaluator": "view_only",
       "gate_default": false,
+      "gate_configurable": false,
       "prerequisites": [],
       "runtime_implication": "Changes visible controls only and never adds completion prerequisites."
     }
   ],
   "presets": [
-    {"key": "custom_configuration_v1", "title": "Custom configuration (choose modules yourself)", "enabled_modules": [], "required_modules": []},
+    {"key": "custom_configuration_v1", "title": "Custom five-step workflow (choose any optional tools)", "enabled_modules": [], "required_modules": []},
     {"key": "lean_research_v1", "title": "Lean research proposal", "enabled_modules": [], "required_modules": []},
-    {"key": "clinical_study_v1", "title": "Clinical study", "enabled_modules": ["investigator_interview", "clinical_design", "sponsor_compliance", "team_collaboration"], "required_modules": ["investigator_interview", "clinical_design", "sponsor_compliance"]},
-    {"key": "full_institutional_v1", "title": "Full institutional submission", "enabled_modules": ["opportunity_fit", "investigator_interview", "clinical_design", "institutional_memory", "competitive_intelligence", "sponsor_compliance", "review_simulator", "team_collaboration", "task_automation", "advanced_workbench"], "required_modules": ["investigator_interview", "clinical_design", "sponsor_compliance", "team_collaboration"]},
+    {"key": "clinical_study_v1", "title": "Clinical study", "enabled_modules": ["investigator_interview", "clinical_design", "sponsor_compliance", "team_collaboration"], "required_modules": []},
+    {"key": "full_institutional_v1", "title": "Full institutional submission", "enabled_modules": ["opportunity_fit", "investigator_interview", "clinical_design", "institutional_memory", "competitive_intelligence", "sponsor_compliance", "review_simulator", "team_collaboration", "task_automation", "advanced_workbench"], "required_modules": []},
     {"key": "rfi_strategy_v1", "title": "RFI or strategy response", "enabled_modules": ["opportunity_fit", "institutional_memory", "review_simulator", "team_collaboration", "task_automation"], "required_modules": []},
     {"key": "legacy_full_workbench_v1", "title": "Legacy full workbench", "enabled_modules": ["opportunity_fit", "investigator_interview", "clinical_design", "institutional_memory", "competitive_intelligence", "sponsor_compliance", "review_simulator", "team_collaboration", "task_automation", "advanced_workbench"], "required_modules": ["investigator_interview", "clinical_design", "competitive_intelligence", "sponsor_compliance"]}
   ],

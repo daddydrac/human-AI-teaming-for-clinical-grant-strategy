@@ -36,6 +36,8 @@ pub struct WorkflowModuleDefinition {
     #[serde(flatten)]
     pub step: WorkflowStepDefinition,
     pub gate_default: bool,
+    #[serde(default)]
+    pub gate_configurable: bool,
     pub runtime_implication: String,
 }
 
@@ -219,6 +221,15 @@ impl WorkflowRegistry {
                 if !enabled.contains(key.as_str()) {
                     bail!("preset {} requires disabled module {key}", preset.key);
                 }
+                if !self
+                    .module(key)
+                    .is_some_and(|module| module.gate_configurable)
+                {
+                    bail!(
+                        "preset {} requires module {key}, but that module has no supported completion gate",
+                        preset.key
+                    );
+                }
             }
         }
         if self.preset(&self.default_preset_key).is_none() {
@@ -389,6 +400,14 @@ impl WorkflowConfig {
             if !enabled.contains(key.as_str()) {
                 bail!("required module is not enabled: {key}");
             }
+            if !registry
+                .module(key)
+                .is_some_and(|module| module.gate_configurable)
+            {
+                bail!(
+                    "module {key} cannot be required because it has no supported completion gate"
+                );
+            }
         }
         if self.review_required && !enabled.contains(registry.review_module_key.as_str()) {
             bail!(
@@ -533,6 +552,32 @@ mod registry_tests {
             .first()
             .context("registry has no optional modules")?;
         let mut config = registry.default_config()?;
+        config.required_modules.push(module.step.key.clone());
+        assert!(config.validate(&registry).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn default_workflow_has_only_five_core_outcomes_and_no_optional_gates() -> Result<()> {
+        let registry = WorkflowRegistry::load()?;
+        let config = registry.default_config()?;
+        assert_eq!(registry.core_steps.len(), 5);
+        assert!(config.enabled_modules.is_empty());
+        assert!(config.required_modules.is_empty());
+        assert!(!config.review_required);
+        Ok(())
+    }
+
+    #[test]
+    fn module_without_a_completion_surface_cannot_be_required() -> Result<()> {
+        let registry = WorkflowRegistry::load()?;
+        let module = registry
+            .optional_modules
+            .iter()
+            .find(|module| !module.gate_configurable)
+            .context("registry has no advisory-only module")?;
+        let mut config = registry.default_config()?;
+        config.enabled_modules.push(module.step.key.clone());
         config.required_modules.push(module.step.key.clone());
         assert!(config.validate(&registry).is_err());
         Ok(())

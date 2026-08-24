@@ -4,6 +4,69 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use lettre::{message::Mailbox, transport::smtp::authentication::Credentials, Message, SmtpTransport, Transport};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
+
+const DEFAULT_SMTP_TIMEOUT_SECONDS: u64 = 30;
+const MIN_SMTP_TIMEOUT_SECONDS: u64 = 1;
+const MAX_SMTP_TIMEOUT_SECONDS: u64 = 120;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SmtpSecurity {
+    StartTls,
+    Tls,
+    None,
+}
+
+impl SmtpSecurity {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None => Ok(Self::StartTls),
+            Some(value) if value.eq_ignore_ascii_case("starttls") => Ok(Self::StartTls),
+            Some(value)
+                if value.eq_ignore_ascii_case("tls")
+                    || value.eq_ignore_ascii_case("implicit")
+                    || value.eq_ignore_ascii_case("smtps") =>
+            {
+                Ok(Self::Tls)
+            }
+            Some(value) if value.eq_ignore_ascii_case("none") => Ok(Self::None),
+            Some(_) => bail!(
+                "SMTP_SECURITY must be one of: starttls, tls (or implicit), none"
+            ),
+        }
+    }
+
+    fn mode(self) -> &'static str {
+        match self {
+            Self::StartTls => "starttls",
+            Self::Tls => "tls",
+            Self::None => "none",
+        }
+    }
+
+    fn default_port(self) -> u16 {
+        match self {
+            Self::StartTls => 587,
+            Self::Tls => 465,
+            Self::None => 25,
+        }
+    }
+}
+
+fn parse_smtp_timeout_seconds(value: Option<&str>) -> Result<u64> {
+    let seconds = match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value
+            .parse::<u64>()
+            .context("SMTP_TIMEOUT_SECONDS must be an integer")?,
+        None => DEFAULT_SMTP_TIMEOUT_SECONDS,
+    };
+    if !(MIN_SMTP_TIMEOUT_SECONDS..=MAX_SMTP_TIMEOUT_SECONDS).contains(&seconds) {
+        bail!(
+            "SMTP_TIMEOUT_SECONDS must be between {MIN_SMTP_TIMEOUT_SECONDS} and {MAX_SMTP_TIMEOUT_SECONDS}"
+        );
+    }
+    Ok(seconds)
+}
 
 #[derive(Clone)]
 pub struct PasswordPolicy {
@@ -69,6 +132,8 @@ pub fn constant_time_eq(left:&[u8],right:&[u8])->bool{
 pub struct EmailSettings {
     host:String,
     port:u16,
+    security:SmtpSecurity,
+    timeout_seconds:u64,
     username:Option<String>,
     password:Option<String>,
     from:Mailbox,
@@ -82,20 +147,32 @@ impl EmailSettings {
         let from=std::env::var("SMTP_FROM").context("SMTP_FROM is required when SMTP_HOST is set")?.parse::<Mailbox>().context("SMTP_FROM is not a valid mailbox")?;
         let public_url=std::env::var("APP_PUBLIC_URL").context("APP_PUBLIC_URL is required when SMTP_HOST is set")?.trim_end_matches('/').to_owned();
         if !public_url.starts_with("https://")&&!public_url.starts_with("http://localhost")&&!public_url.starts_with("http://127.0.0.1"){bail!("APP_PUBLIC_URL must use HTTPS except on loopback development hosts");}
-        let port=std::env::var("SMTP_PORT").unwrap_or_else(|_|"587".into()).parse::<u16>().context("SMTP_PORT must be a valid port")?;
+        let security_value=std::env::var("SMTP_SECURITY").ok();
+        let security=SmtpSecurity::parse(security_value.as_deref())?;
+        let port=std::env::var("SMTP_PORT").ok().filter(|value|!value.trim().is_empty()).map(|value|value.parse::<u16>().context("SMTP_PORT must be a valid port")).transpose()?.unwrap_or_else(||security.default_port());
+        if port==0{bail!("SMTP_PORT must be between 1 and 65535");}
+        let timeout_value=std::env::var("SMTP_TIMEOUT_SECONDS").ok();
+        let timeout_seconds=parse_smtp_timeout_seconds(timeout_value.as_deref())?;
         let username=std::env::var("SMTP_USERNAME").ok().filter(|v|!v.is_empty());
         let password=std::env::var("SMTP_PASSWORD").ok().filter(|v|!v.is_empty());
         if username.is_some()!=password.is_some(){bail!("SMTP_USERNAME and SMTP_PASSWORD must be configured together");}
-        Ok(Some(Self{host:host.unwrap(),port,username,password,from,public_url}))
+        Ok(Some(Self{host:host.unwrap().trim().to_owned(),port,security,timeout_seconds,username,password,from,public_url}))
     }
 
     fn send(&self,to:&str,subject:&str,body:String)->Result<()> {
         let message=Message::builder().from(self.from.clone()).to(to.parse::<Mailbox>().context("recipient email is invalid")?).subject(subject).body(body)?;
-        let mut builder=SmtpTransport::relay(&self.host)?.port(self.port);
+        let builder=match self.security{
+            SmtpSecurity::StartTls=>SmtpTransport::starttls_relay(&self.host)?,
+            SmtpSecurity::Tls=>SmtpTransport::relay(&self.host)?,
+            SmtpSecurity::None=>SmtpTransport::builder_dangerous(&self.host),
+        };
+        let mut builder=builder.port(self.port).timeout(Some(Duration::from_secs(self.timeout_seconds)));
         if let (Some(username),Some(password))=(&self.username,&self.password){builder=builder.credentials(Credentials::new(username.clone(),password.clone()));}
         builder.build().send(&message).context("SMTP delivery failed")?;
         Ok(())
     }
+
+    pub fn delivery_mode(&self)->&'static str{self.security.mode()}
 
     pub fn send_new_account(&self,to:&str,username:&str,temp_password:&str)->Result<()> {
         self.send(to,"Your Grantspace account",format!("An administrator created your Grantspace account.\n\nUsername: {username}\nTemporary password: {temp_password}\nLogin: {}/login\n\nYou must choose a new password immediately after your first login. Do not forward this message.",self.public_url))
@@ -139,6 +216,31 @@ mod tests{
         assert_eq!(normalize_email(" Person@Example.ORG ")?,"person@example.org");
         assert!(normalize_username("invalid user").is_err());
         assert!(normalize_email("missing-domain").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn smtp_security_modes_and_defaults_are_explicit()->Result<()> {
+        assert_eq!(SmtpSecurity::parse(None)?,SmtpSecurity::StartTls);
+        assert_eq!(SmtpSecurity::parse(Some("STARTTLS"))?,SmtpSecurity::StartTls);
+        assert_eq!(SmtpSecurity::parse(Some("implicit"))?,SmtpSecurity::Tls);
+        assert_eq!(SmtpSecurity::parse(Some("smtps"))?,SmtpSecurity::Tls);
+        assert_eq!(SmtpSecurity::parse(Some("none"))?,SmtpSecurity::None);
+        assert_eq!(SmtpSecurity::StartTls.default_port(),587);
+        assert_eq!(SmtpSecurity::Tls.default_port(),465);
+        assert_eq!(SmtpSecurity::None.default_port(),25);
+        assert!(SmtpSecurity::parse(Some("opportunistic")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn smtp_timeout_is_bounded()->Result<()> {
+        assert_eq!(parse_smtp_timeout_seconds(None)?,DEFAULT_SMTP_TIMEOUT_SECONDS);
+        assert_eq!(parse_smtp_timeout_seconds(Some("1"))?,1);
+        assert_eq!(parse_smtp_timeout_seconds(Some("120"))?,120);
+        assert!(parse_smtp_timeout_seconds(Some("0")).is_err());
+        assert!(parse_smtp_timeout_seconds(Some("121")).is_err());
+        assert!(parse_smtp_timeout_seconds(Some("not-a-number")).is_err());
         Ok(())
     }
 }

@@ -689,9 +689,51 @@ fn canonical_request_sha256(content_type:&str,body:&[u8])->Result<String,ApiErro
     Ok(format!("{:x}",Sha256::digest(canonical)))
 }
 
+fn locate_user_solicitation_sources(
+    mut profile: workflow_artifacts::SolicitationProfile,
+    documents: &[source_locator::SourceDocument],
+) -> workflow_artifacts::SolicitationProfile {
+    let locate = |statement: &str| {
+        source_locator::locate_statement(statement, Some(statement), documents).map(|source| {
+            workflow_artifacts::SourceAnchor {
+                document_id: source.document_id,
+                document_sha256: source.document_sha256,
+                locator: source.locator,
+                start_offset: source.start_offset,
+                end_offset: source.end_offset,
+                excerpt: source.excerpt,
+            }
+        })
+    };
+    for fact in profile
+        .eligibility
+        .iter_mut()
+        .chain(profile.requirements.iter_mut())
+        .chain(profile.deadlines.iter_mut())
+        .chain(profile.budget_rules.iter_mut())
+        .chain(profile.attachments.iter_mut())
+    {
+        if fact.sources.is_empty() {
+            if let Some(anchor) = locate(&fact.label) {
+                fact.sources.push(anchor);
+                fact.status = workflow_artifacts::FactStatus::HumanCorrected;
+            }
+        }
+    }
+    for criterion in &mut profile.review_criteria {
+        if criterion.sources.is_empty() {
+            if let Some(anchor) = locate(&criterion.description) {
+                criterion.sources.push(anchor);
+                criterion.status = workflow_artifacts::FactStatus::HumanCorrected;
+            }
+        }
+    }
+    profile
+}
+
 #[cfg(test)]
 mod request_contract_tests {
-    use super::canonical_request_sha256;
+    use super::{canonical_request_sha256,locate_user_solicitation_sources};
 
     #[test]
     fn json_idempotency_hash_is_canonical_but_content_sensitive() {
@@ -700,6 +742,20 @@ mod request_contract_tests {
         let different=canonical_request_sha256("application/json",br#"{"a":1,"b":3}"#).unwrap();
         assert_eq!(first,equivalent);
         assert_ne!(first,different);
+    }
+
+    #[test]
+    fn human_rule_ids_remain_internal_while_exact_sources_are_located() {
+        let document=crate::source_locator::SourceDocument{id:7,name:"notice.txt".into(),kind:"opportunity".into(),text:"Applications must include a detailed dissemination plan describing how findings will reach community partners.".into(),sha256:"abc123".into()};
+        let profile=crate::workflow_artifacts::SolicitationProfile{
+            schema_version:1,working_title:"Test".into(),sponsor:"Sponsor".into(),mechanism:None,purpose:"Purpose".into(),
+            eligibility:vec![],requirements:vec![crate::workflow_artifacts::SolicitationFact{id:"RULE-INTERNAL".into(),label:"Applications must include a detailed dissemination plan describing how findings will reach community partners.".into(),value:serde_json::json!("Applications must include a detailed dissemination plan describing how findings will reach community partners."),mandatory:false,status:crate::workflow_artifacts::FactStatus::HumanCorrected,sources:vec![]}],
+            review_criteria:vec![],deadlines:vec![],budget_rules:vec![],attachments:vec![],open_questions:vec![]
+        };
+        let located=locate_user_solicitation_sources(profile,&[document]);
+        assert_eq!(located.requirements[0].id,"RULE-INTERNAL");
+        assert_eq!(located.requirements[0].sources.len(),1);
+        assert_eq!(located.requirements[0].sources[0].document_id,7);
     }
 }
 
@@ -1454,12 +1510,18 @@ async fn save_workflow_artifact(
     if req.source.trim().is_empty() {
         return Err(ApiError::bad_request("artifact source is required"));
     }
+    let body=if artifact_type=="solicitation_profile"{
+        let profile:workflow_artifacts::SolicitationProfile=serde_json::from_value(req.body)
+            .map_err(|error|ApiError::bad_request(format!("invalid solicitation profile: {error}")))?;
+        let documents=s.store.opportunity_documents(&id)?;
+        serde_json::to_value(locate_user_solicitation_sources(profile,&documents))?
+    }else{req.body};
     Ok(Json(
         s.store
             .save_workflow_artifact(
                 &id,
                 &artifact_type,
-                &req.body,
+                &body,
                 &req.source,
                 Some(&user.id),
                 req.expected_version,
@@ -3712,6 +3774,10 @@ async fn system_info(State(s): State<AppState>) -> Result<Json<serde_json::Value
     let db = s.workspace.join("grant.db");
     let db_bytes = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
     let envv = |k: &str| std::env::var(k).ok();
+    let email_delivery=match s.email.as_ref(){
+        Some(settings)=>serde_json::json!({"configured":true,"mode":settings.delivery_mode()}),
+        None=>serde_json::json!({"configured":false,"mode":serde_json::Value::Null}),
+    };
     Ok(Json(serde_json::json!({
         "version":env!("CARGO_PKG_VERSION"),
         "build_version":envv("GRANT_BUILD_VERSION").unwrap_or_else(||env!("CARGO_PKG_VERSION").to_string()),
@@ -3724,6 +3790,7 @@ async fn system_info(State(s): State<AppState>) -> Result<Json<serde_json::Value
         "openblas_threads":envv("OPENBLAS_NUM_THREADS").and_then(|v|v.parse::<usize>().ok()),
         "database_bytes":db_bytes,
         "competitive_refresh_seconds":envv("COMPETITIVE_REFRESH_TTL_SECONDS").and_then(|v|v.parse::<u64>().ok()),
+        "email_delivery":email_delivery,
         "workspace":s.workspace.to_string_lossy(),
         "secrets_exposed":false
     })))

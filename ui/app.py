@@ -64,13 +64,14 @@ CSS="""
 .gradio-container{max-width:100%!important;background:var(--gs-bg)!important;color:var(--gs-copy)!important}
 .wizard-lightbox{position:fixed!important;inset:0!important;z-index:9999!important;background:radial-gradient(circle at 63% 15%,rgba(88,28,135,.14),transparent 34%),var(--gs-bg)!important;overflow:auto!important}
 .wizard-shell{min-height:100vh!important;display:grid;grid-template-columns:minmax(230px,16vw) 1fr!important;gap:0!important}
-.wizard-rail{height:100vh;position:sticky;top:0;border-right:1px solid var(--gs-border);padding:38px 24px;background:#100d17}
+.wizard-rail{height:100vh;position:sticky;top:0;border-right:1px solid var(--gs-border);padding:38px 24px;background:#100d17;overflow-y:auto}
 .wizard-rail-label{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:#746c7e;margin-bottom:28px}
 .wizard-rail-step{display:grid;grid-template-columns:34px 1fr;gap:12px;align-items:center;padding:10px 4px;color:#716a7a}
 .wizard-rail-step .number{width:30px;height:30px;border:1px solid #393243;border-radius:50%;display:grid;place-items:center;font-size:12px}
 .wizard-rail-step.active{color:#fff}.wizard-rail-step.active .number{background:#7132a7;border-color:#a855f7;box-shadow:0 0 24px rgba(168,85,247,.28)}
 .wizard-rail-step.done .number{background:#17362d;border-color:#24463b;color:var(--gs-green)}
 .wizard-rail-step b{display:block;font-size:13px}.wizard-rail-step small{display:block;font-size:10px;color:#6d6575;margin-top:3px}
+.wizard-current{margin-top:24px;padding:14px;border:1px solid #302a38;border-radius:12px;background:#15111b}.wizard-current b,.wizard-current span{display:block}.wizard-current b{font-size:11px;color:#a855f7;letter-spacing:.08em}.wizard-current span{margin-top:5px;font-size:12px;color:#d9d2df}
 .wizard-main{max-width:1480px!important;width:100%!important;margin:auto!important;padding:7vh 6vw 110px!important}
 .wizard-lightbox .gr-group,.wizard-lightbox .gr-group>.styler{background:transparent!important;border:0!important}
 .wizard-lightbox .block:not(.wizard-panel){background:transparent!important}
@@ -320,7 +321,8 @@ def full_document_preview(project,payload):
     doc=html.escape(d["html"],quote=True)
     return f'<div class="page-frame"><iframe sandbox="" srcdoc="{doc}"></iframe></div>'
 
-def requirement_rows(reqs):return [[r.get("id"),r.get("category"),r.get("mandatory"),r.get("requirement"),", ".join(r.get("evidence_needed") or []),r.get("status"),r.get("approved")] for r in reqs]
+def requirement_rows(reqs):
+    return [[r.get("requirement"),"Required" if r.get("mandatory") else "Optional",", ".join(r.get("evidence_needed") or []) or "No separate evidence specified",str(r.get("status") or "Needs review").replace("_"," ").title()] for r in reqs]
 
 def model_response_preview(value,word_limit=20):
     words=str(value or "").split()
@@ -361,7 +363,7 @@ WORKFLOW_REGISTRY=load_workflow_registry()
 WORKFLOW_MODULES={item["key"]:item for item in WORKFLOW_REGISTRY["optional_modules"]}
 WORKFLOW_PRESETS={item["key"]:item for item in WORKFLOW_REGISTRY["presets"]}
 MODULE_CHOICES=[(item["title"],item["key"]) for item in WORKFLOW_REGISTRY["optional_modules"]]
-GATE_CHOICES=[(item["title"],item["key"]) for item in WORKFLOW_REGISTRY["optional_modules"] if item["completion_evaluator"]!="view_only"]
+GATE_CHOICES=[(item["title"],item["key"]) for item in WORKFLOW_REGISTRY["optional_modules"] if item.get("gate_configurable",False)]
 PRESET_CHOICES=[(item["title"],item["key"]) for item in WORKFLOW_REGISTRY["presets"] if item["key"]!=WORKFLOW_REGISTRY["legacy_preset_key"]]
 REVIEW_MODE_CHOICES=[(item["title"],item["key"]) for item in WORKFLOW_REGISTRY["review_modes"]]
 REVIEWER_ARCHETYPE_ROWS=[[item["title"],item["description"]] for item in WORKFLOW_REGISTRY["reviewer_archetypes"]]
@@ -378,35 +380,82 @@ def core_flow_html():
 def module_catalog_html():
     cards=[]
     for item in WORKFLOW_REGISTRY["optional_modules"]:
-        gated=item["completion_evaluator"]!="view_only" and item.get("gate_default",False)
-        gate="Default completion gate" if gated else "Advisory / configurable"
+        configurable=item.get("gate_configurable",False)
+        gate="Optional gate available" if configurable else "Advisory tool only"
         cards.append(
-            f'<article class="module-card {"gated" if gated else ""}"><b>{html.escape(item["title"])}</b>'
+            f'<article class="module-card"><b>{html.escape(item["title"])}</b>'
             f'<div class="placement">{html.escape(item["placement"].replace("_"," ").upper())} · {gate}</div>'
             f'<p>{html.escape(item["description"])}</p><small>Produces: {html.escape(item["output"])}<br>{html.escape(item["runtime_implication"])}</small></article>'
         )
     return '<div class="module-catalog">'+"".join(cards)+"</div>"
 
-WIZARD_STEPS=["Start","Grant ask","Core workflow","Optional modules","Review setup","Team & routing","Workflow preview"]
+def workflow_item_screen_html(item,kind,position,total):
+    label="Core outcome" if kind=="core" else "Optional tool"
+    placement=(item.get("placement") or "ordered").replace("_"," ")
+    runtime=item.get("runtime_implication")
+    runtime_html=(f'<div class="privacy-note"><b>Runtime and data use</b><br>{html.escape(runtime)}</div>' if runtime else "")
+    return (
+        f'<div class="wizard-title"><div class="wizard-kicker">{html.escape(label)} · {position} of {total}</div>'
+        f'<h2>{html.escape(item["title"])}</h2><p>{html.escape(item["description"])}</p></div>'
+        f'<div class="wizard-panel"><p><b>Produces</b><br>{html.escape(item["output"])}</p>'
+        f'<p><b>Where it appears</b><br>{html.escape(placement.title())}</p></div>{runtime_html}'
+    )
+
+def selected_modules_from_modes(*modes):
+    if len(modes)!=len(WORKFLOW_REGISTRY["optional_modules"]):
+        raise gr.Error("The optional-tool choices are incomplete. Reopen the setup wizard and choose Include or Skip on every tool screen.")
+    return [
+        module["key"]
+        for module,mode in zip(WORKFLOW_REGISTRY["optional_modules"],modes)
+        if mode=="include"
+    ]
+
+WIZARD_CORE_FIRST=4
+WIZARD_CORE_LAST=WIZARD_CORE_FIRST+len(WORKFLOW_REGISTRY["core_steps"])-1
+WIZARD_MODULE_FIRST=WIZARD_CORE_LAST+1
+WIZARD_MODULE_LAST=WIZARD_MODULE_FIRST+len(WORKFLOW_REGISTRY["optional_modules"])-1
+WIZARD_REVIEW_PAGE=WIZARD_MODULE_LAST+1
+WIZARD_TEAM_PAGE=WIZARD_REVIEW_PAGE+1
+WIZARD_ROUTING_PAGE=WIZARD_TEAM_PAGE+1
+WIZARD_PREVIEW_PAGE=WIZARD_ROUTING_PAGE+1
+WIZARD_PAGE_COUNT=WIZARD_PREVIEW_PAGE
+WIZARD_PAGE_TITLES=(
+    ["Start","Grant details","Grant source"]
+    +[step["title"] for step in WORKFLOW_REGISTRY["core_steps"]]
+    +[module["title"] for module in WORKFLOW_REGISTRY["optional_modules"]]
+    +["Review setup","Team","Model routing","Workflow preview"]
+)
+WIZARD_RAIL_SECTIONS=[
+    ("Start",1,1,"Create or open"),
+    ("Grant ask",2,3,"Details and source"),
+    ("Core outcomes",WIZARD_CORE_FIRST,WIZARD_CORE_LAST,"Five focused screens"),
+    ("Optional tools",WIZARD_MODULE_FIRST,WIZARD_MODULE_LAST,"One choice per screen"),
+    ("Review setup",WIZARD_REVIEW_PAGE,WIZARD_REVIEW_PAGE,"Advisory configuration"),
+    ("Team",WIZARD_TEAM_PAGE,WIZARD_TEAM_PAGE,"Invite collaborators"),
+    ("Routing",WIZARD_ROUTING_PAGE,WIZARD_ROUTING_PAGE,"Choose model policy"),
+    ("Preview",WIZARD_PREVIEW_PAGE,WIZARD_PREVIEW_PAGE,"Confirm and create"),
+]
 
 def wizard_rail_html(active):
     rows=[]
-    for index,title in enumerate(WIZARD_STEPS,1):
-        state="done" if index<active else ("active" if index==active else "")
-        marker="✓" if index<active else str(index)
-        subtitle="Required" if index<=4 else "Configuration"
-        rows.append(f'<div class="wizard-rail-step {state}"><span class="number">{marker}</span><span><b>{html.escape(title)}</b><small>{subtitle}</small></span></div>')
-    return '<nav class="wizard-rail"><div class="wizard-rail-label">Compose workflow</div>'+"".join(rows)+"</nav>"
+    for index,(title,first,last,subtitle) in enumerate(WIZARD_RAIL_SECTIONS,1):
+        state="done" if active>last else ("active" if first<=active<=last else "")
+        marker="✓" if active>last else str(index)
+        rows.append(f'<div class="wizard-rail-step {state}"><span class="number">{marker}</span><span><b>{html.escape(title)}</b><small>{html.escape(subtitle)}</small></span></div>')
+    current=WIZARD_PAGE_TITLES[active-1]
+    return (f'<nav class="wizard-rail"><div class="wizard-rail-label">Compose workflow</div>'
+            +"".join(rows)
+            +f'<div class="wizard-current"><b>{active} of {WIZARD_PAGE_COUNT}</b><span>{html.escape(current)}</span></div></nav>')
 
 def wizard_page_updates(active):
-    return [gr.Column(visible=index==active) for index in range(1,8)]+[wizard_rail_html(active),f"{active} of 7"]
+    return [gr.Column(visible=index==active) for index in range(1,WIZARD_PAGE_COUNT+1)]+[wizard_rail_html(active),f"{active} of {WIZARD_PAGE_COUNT}"]
 
 def wizard_go(active):
     return lambda: wizard_page_updates(active)
 
 def wizard_nav_js(active):
     return f"""() => {{
-      for (let index = 1; index <= 7; index += 1) {{
+      for (let index = 1; index <= {WIZARD_PAGE_COUNT}; index += 1) {{
         const page = document.getElementById(`wizard-page-${{index}}`);
         if (page) page.style.setProperty('display', index === {int(active)} ? 'flex' : 'none', 'important');
       }}
@@ -414,16 +463,16 @@ def wizard_nav_js(active):
     }}"""
 
 def wizard_nav_from_progress_js():
-    return """() => {
+    return f"""() => {{
       const progress = document.getElementById('wizard-progress');
-      const match = progress && progress.textContent.match(/[1-7]/);
-      const active = match ? Number(match[0]) : 1;
-      for (let index = 1; index <= 7; index += 1) {
-        const page = document.getElementById(`wizard-page-${index}`);
+      const match = progress && progress.textContent.match(/(\\d+)\\s+of\\s+\\d+/);
+      const active = match ? Number(match[1]) : 1;
+      for (let index = 1; index <= {WIZARD_PAGE_COUNT}; index += 1) {{
+        const page = document.getElementById(`wizard-page-${{index}}`);
         if (page) page.style.setProperty('display', index === active ? 'flex' : 'none', 'important');
-      }
+      }}
       return [];
-    }"""
+    }}"""
 
 WIZARD_CREATE_CLICK_JS="""() => {
   if (window.__grantspaceCreateClickHandler) return [];
@@ -504,9 +553,6 @@ def reconcile_module_gates(selected,required):
     selected=list(selected or [])
     allowed={key for _,key in GATE_CHOICES if key in selected}
     required=[key for key in (required or []) if key in allowed]
-    for key in selected:
-        item=WORKFLOW_MODULES[key]
-        if item.get("gate_default") and key in allowed and key not in required:required.append(key)
     choices=[choice for choice in GATE_CHOICES if choice[1] in allowed]
     return gr.update(choices=choices,value=required)
 
@@ -518,14 +564,26 @@ def wizard_team_back(selected):
     active=5 if WORKFLOW_REGISTRY["review_module_key"] in (selected or []) else 4
     return wizard_page_updates(active)
 
-def validate_grant_ask_and_continue(title,source,source_url,source_text,deadline):
+def validate_grant_details_and_continue(title,deadline):
     if not (title or "").strip():raise gr.Error("Working title is required.")
-    if not source and not (source_url or "").strip() and not (source_text or "").strip():
-        raise gr.Error("Upload, link, or paste the authoritative grant ask.")
     if (deadline or "").strip():
         try:date.fromisoformat(deadline.strip())
         except ValueError:raise gr.Error("Sponsor deadline must use YYYY-MM-DD.")
     return wizard_page_updates(3)
+
+def validate_grant_source_and_continue(source,source_url,source_text):
+    if not source and not (source_url or "").strip() and not (source_text or "").strip():
+        raise gr.Error("Upload, link, or paste the authoritative grant ask.")
+    return wizard_page_updates(WIZARD_CORE_FIRST)
+
+def validate_routing_and_preview(title,sponsor,mechanism,deadline,review_mode,routing_mode,team_rows,*module_modes):
+    identity=api("GET","/api/me")
+    if not identity.get("id"):raise gr.Error("Your authenticated account could not be resolved. Sign in again.")
+    selected=selected_modules_from_modes(*module_modes)
+    required=[]
+    review_required=False
+    preview=workflow_preview_html(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows)
+    return wizard_page_updates(WIZARD_PREVIEW_PAGE)+[preview,selected,required,review_required]
 
 def validate_team_and_preview(title,sponsor,mechanism,deadline,selected,required,review_mode,review_required,routing_mode,team_rows):
     identity=api("GET","/api/me")
@@ -534,9 +592,15 @@ def validate_team_and_preview(title,sponsor,mechanism,deadline,selected,required
 
 def authenticated_identity():
     identity=api("GET","/api/me")
+    system=api("GET","/api/system/info")
     display=identity.get("display_name") or identity.get("username") or identity.get("email") or "signed-in user"
     account=identity.get("username") or identity.get("email") or "authenticated account"
-    return identity.get("id") or "",f"**Project owner:** {display} (`{account}`)  \nOwnership, edits, and approvals use your authenticated account automatically. No internal user ID is required."
+    email_delivery=system.get("email_delivery") or {}
+    if email_delivery.get("configured"):
+        email_notice=f"Email delivery is configured through **{email_delivery.get('mode') or 'SMTP'}**."
+    else:
+        email_notice="**Email delivery is not configured.** Invitations will still be stored, but the app will show a one-time link instead of claiming an email was sent."
+    return identity.get("id") or "",f"**Project owner:** {display} (`{account}`)  \nOwnership, edits, and approvals use your authenticated account automatically. No internal user ID is required.  \n{email_notice}"
 
 def _normalized_team_rows(team_rows):
     rows=[]
@@ -588,8 +652,10 @@ def project_workflow_ui(project):
     status=api("GET",f"/api/projects/{project}/workflow/status")
     config=workflow.get("config") or workflow
     enabled=set(config.get("enabled_modules") or [])
-    summary=(f"### Persisted project workflow\nDefinition **v{workflow.get('definition_version',config.get('definition_version'))}** · "
-             f"configuration **v{workflow.get('config_version','—')}** · {len(enabled)} optional capabilities · routing **{config.get('model_routing_mode') or 'deployment default'}**")
+    required=set(config.get("required_modules") or [])
+    if config.get("review_required"):required.add(WORKFLOW_REGISTRY["review_module_key"])
+    summary=(f"### Grant workflow\nDefinition **v{workflow.get('definition_version',config.get('definition_version'))}** · "
+             f"configuration **v{workflow.get('config_version','—')}** · {len(enabled)} optional tools selected · routing **{config.get('model_routing_mode') or 'deployment default'}**")
     return (summary,status,
             gr.update(visible="investigator_interview" in enabled),
             gr.update(visible=True),
@@ -611,7 +677,8 @@ def workflow_preview_html(title,sponsor,mechanism,deadline,selected,required,rev
         for module in WORKFLOW_REGISTRY["optional_modules"]:
             if module["key"] in selected and module["placement"]==placement:
                 position+=1;rows.append((position,module["title"],module["output"],module["key"] in required or (module["key"]==WORKFLOW_REGISTRY["review_module_key"] and review_required)))
-    body="".join(f'<div class="workflow-preview-row"><span class="n">{n}</span><span><b>{html.escape(name)}</b><br><small>{html.escape(output)}</small></span><small>{"Approval gate" if gated else "Advisory"}</small></div>' for n,name,output,gated in rows)
+    core_titles={step["title"] for step in WORKFLOW_REGISTRY["core_steps"]}
+    body="".join(f'<div class="workflow-preview-row"><span class="n">{n}</span><span><b>{html.escape(name)}</b><br><small>{html.escape(output)}</small></span><small>{"Core outcome" if name in core_titles else "Optional tool"}</small></div>' for n,name,output,_gated in rows)
     cross=[WORKFLOW_MODULES[key]["title"] for key in selected if WORKFLOW_MODULES[key]["placement"] in {"cross_cutting","view"}]
     team_count=len(_records(team_rows,["Email","Role"]))
     meta=f'<p><b>{html.escape(title or "Untitled grant")}</b> · {html.escape(sponsor or "Sponsor not entered")} {html.escape(mechanism or "")} · {html.escape(deadline or "No deadline entered")}</p>'
@@ -637,6 +704,41 @@ def build_workflow_config(preset_key,selected,required,grant_type,deadline,revie
         "cloud_model":os.getenv("CLAUDE_MODEL") or None,
         "cloud_task_kinds":[x.strip() for x in os.getenv("CLAUDE_TASK_KINDS",os.getenv("CLOUD_TASK_KINDS","")).split(",") if x.strip()],
     }
+
+def update_project_workflow_mode(project,core_only):
+    project=_require_project(project)
+    current=api("GET",f"/api/projects/{project}/workflow")
+    proposed=json.loads(json.dumps(current.get("config") or current))
+    previous_enabled=list(proposed.get("enabled_modules") or [])
+    previous_required=list(proposed.get("required_modules") or [])
+    review_was_required=bool(proposed.get("review_required"))
+    proposed["required_modules"]=[]
+    proposed["review_required"]=False
+    if core_only:
+        proposed["template"]="custom_configuration_v1"
+        proposed["enabled_modules"]=[]
+        proposed["review_mode"]=None
+    changed=(previous_required or review_was_required or (core_only and previous_enabled))
+    if not changed:
+        action=("This grant already uses only the five core outcomes."
+                if core_only else "All optional tools are already advisory and cannot block completion.")
+        return action,*project_workflow_ui(project)
+    impact=api("POST",f"/api/projects/{project}/workflow/impact",json={"workflow":proposed})
+    if impact.get("destructive"):
+        raise gr.Error("The server marked this workflow change destructive; no change was applied.")
+    actor=(api("GET","/api/me").get("id") or "").strip()
+    if not actor:raise gr.Error("Your authenticated account could not be resolved. Sign in again.")
+    api("PATCH",f"/api/projects/{project}/workflow",json={"workflow":proposed,"expected_config_version":int(current.get("config_version")),"actor":actor})
+    if core_only:
+        action=(f"Workflow simplified to the five core outcomes. {len(previous_enabled)} optional tool(s) were hidden; "
+                "their artifacts and history remain preserved and auditable.")
+    else:
+        action=(f"Removed {len(previous_required)+(1 if review_was_required else 0)} optional completion gate(s). "
+                "Enabled tools remain available, but they can no longer block the proposal.")
+    return action,*project_workflow_ui(project)
+
+def make_optional_tools_advisory(project):return update_project_workflow_mode(project,False)
+def use_five_core_outcomes(project):return update_project_workflow_mode(project,True)
 
 def artifact_editor_load(project,artifact_type):
     if not project:raise gr.Error("Open a project first.")
@@ -664,7 +766,8 @@ def mark_solicitation_facts_human_approved(body):
     for collection in ("eligibility","requirements","deadlines","budget_rules","attachments","review_criteria"):
         for item in body.get(collection) or []:
             if not item.get("sources"):
-                raise gr.Error(f"{collection} item {item.get('id')} has no exact source provenance and cannot be approved.")
+                label=item.get("label") or item.get("title") or "Unnamed item"
+                raise gr.Error(f"The source text for “{label}” could not be located in the uploaded grant ask. Correct the wording or source before approval.")
             item["status"]="human_approved"
     return body
 
@@ -687,8 +790,8 @@ def artifact_editor_generate(project,artifact_type,actor):
     data=generated["artifact"]
     return json.dumps(data["body"],indent=2,ensure_ascii=False),data["version"],f"Generated {artifact_type} v{data['version']} with `{generated['model']}` from approved {generated['upstream_artifact_type']} v{generated['upstream_version']}. Review and edit before approval.",data
 
-SOLICITATION_FACT_HEADERS=["Category","ID","Label","Value","Mandatory","Status","Provenance"]
-SOLICITATION_CRITERION_HEADERS=["ID","Title","Description","Scored","Scale","Status","Provenance"]
+SOLICITATION_FACT_HEADERS=["Rule or requirement"]
+SOLICITATION_CRITERION_HEADERS=["Review criterion"]
 FRAMEWORK_HEADERS=["Key","Title","Position","Requirement IDs","Criterion IDs","Narrative purpose","Key argument","Aim IDs","Evidence needs","Missing investigator inputs","Owner user ID","Approver user ID","Target words","Dependencies"]
 CORE_AIM_HEADERS=["ID","Title","Statement","Rationale","Approach summary","Expected outcome","Impact","Innovation","Classification","Dependencies","Supporting evidence IDs"]
 LITERATURE_QUERY_HEADERS=["ID","Query","Rationale","Aim IDs","Requirement IDs","Criterion IDs","Preferred domains"]
@@ -752,6 +855,24 @@ def _parse_value(value):
 def _provenance_text(sources):
     return " | ".join(f"doc {source.get('document_id')} · {source.get('locator')} · {source.get('excerpt','')[:120]}" for source in (sources or []))
 
+def _solicitation_fact_text(item):
+    label=str(item.get("label") or "").strip()
+    value=_display_value(item.get("value")).strip()
+    return label if not value or value==label else f"{label}: {value}"
+
+def _solicitation_criterion_text(item):
+    title=str(item.get("title") or "").strip()
+    description=str(item.get("description") or "").strip()
+    return title if not description or description==title else f"{title} — {description}"
+
+def _stable_human_id(prefix,text,used):
+    base=f"{prefix}-{hashlib.sha256(text.encode('utf-8')).hexdigest()[:12].upper()}"
+    candidate=base;counter=2
+    while candidate in used:
+        candidate=f"{base}-{counter}";counter+=1
+    used.add(candidate)
+    return candidate
+
 def _artifact_status(data):
     version=data.get("version")
     if not version:return "No artifact exists yet."
@@ -776,8 +897,8 @@ def load_solicitation_form(project):
     rows=[]
     for category in (context.get("contract") or {}).get("solicitation_fact_categories") or []:
         for item in body.get(category) or []:
-            rows.append([category,item.get("id"),item.get("label"),_display_value(item.get("value")),item.get("mandatory",False),item.get("status"),_provenance_text(item.get("sources"))])
-    criteria=[[item.get("id"),item.get("title"),item.get("description"),item.get("scored",False),item.get("scale") or "",item.get("status"),_provenance_text(item.get("sources"))] for item in body.get("review_criteria") or []]
+            rows.append([_solicitation_fact_text(item)])
+    criteria=[[_solicitation_criterion_text(item)] for item in body.get("review_criteria") or []]
     questions=[[item] for item in body.get("open_questions") or []]
     return body.get("working_title",""),body.get("sponsor",""),body.get("mechanism") or "",body.get("purpose",""),rows,criteria,questions,data.get("version"),_artifact_status(data),data
 
@@ -785,17 +906,35 @@ def solicitation_body(metadata,working_title,sponsor,mechanism,purpose,fact_rows
     prior=(metadata or {}).get("body") or {}
     categories=((metadata or {}).get("editor_context") or {}).get("contract",{}).get("solicitation_fact_categories") or []
     if not categories:raise gr.Error("The server did not provide the solicitation editor contract. Reload the profile before editing.")
-    prior_facts={(category,str(item.get("id"))):item for category in categories for item in prior.get(category) or []}
     body={"schema_version":1,"working_title":str(working_title or "").strip(),"sponsor":str(sponsor or "").strip(),"mechanism":str(mechanism or "").strip() or None,"purpose":str(purpose or "").strip(),"eligibility":[],"requirements":[],"review_criteria":[],"deadlines":[],"budget_rules":[],"attachments":[],"open_questions":[]}
+    prior_fact_rows={}
+    used_ids=set()
+    for category in categories:
+        for item in prior.get(category) or []:
+            prior_fact_rows.setdefault(_solicitation_fact_text(item),[]).append((category,item))
+            used_ids.add(str(item.get("id") or ""))
     for row in _records(fact_rows,SOLICITATION_FACT_HEADERS):
-        category=str(row["Category"] or "").strip()
-        if category not in set(categories):raise gr.Error(f"Unknown solicitation fact category: {category}")
-        item_id=str(row["ID"] or "").strip();prior_item=prior_facts.get((category,item_id),{})
-        body[category].append({"id":item_id,"label":str(row["Label"] or "").strip(),"value":_parse_value(row["Value"]),"mandatory":bool(row["Mandatory"]),"status":prior_item.get("status") or "human_corrected","sources":prior_item.get("sources") or []})
-    prior_criteria={str(item.get("id")):item for item in prior.get("review_criteria") or []}
+        text=str(row["Rule or requirement"] or "").strip()
+        if not text:continue
+        matches=prior_fact_rows.get(text) or []
+        if matches:
+            category,prior_item=matches.pop(0)
+            body[category].append(prior_item)
+        else:
+            item_id=_stable_human_id("RULE",text,used_ids)
+            body["requirements"].append({"id":item_id,"label":text,"value":text,"mandatory":False,"status":"human_corrected","sources":[]})
+    prior_criteria={}
+    for item in prior.get("review_criteria") or []:
+        prior_criteria.setdefault(_solicitation_criterion_text(item),[]).append(item)
+        used_ids.add(str(item.get("id") or ""))
     for row in _records(criterion_rows,SOLICITATION_CRITERION_HEADERS):
-        item_id=str(row["ID"] or "").strip();prior_item=prior_criteria.get(item_id,{})
-        body["review_criteria"].append({"id":item_id,"title":str(row["Title"] or "").strip(),"description":str(row["Description"] or "").strip(),"scored":bool(row["Scored"]),"scale":str(row["Scale"] or "").strip() or None,"status":prior_item.get("status") or "human_corrected","sources":prior_item.get("sources") or []})
+        text=str(row["Review criterion"] or "").strip()
+        if not text:continue
+        matches=prior_criteria.get(text) or []
+        if matches:body["review_criteria"].append(matches.pop(0))
+        else:
+            item_id=_stable_human_id("CRITERION",text,used_ids)
+            body["review_criteria"].append({"id":item_id,"title":text,"description":text,"scored":False,"scale":None,"status":"human_corrected","sources":[]})
     body["open_questions"]=[str(row["Question"]).strip() for row in _records(question_rows,["Question"]) if str(row["Question"] or "").strip()]
     return body
 
@@ -805,10 +944,16 @@ def save_solicitation_form(project,actor,version,metadata,*fields):
     return (*load_solicitation_form(project)[:-3],data["version"],f"Saved solicitation profile v{data['version']}; approval is still required.",data)
 
 def approve_solicitation_form(project,actor,version,metadata,*fields):
-    body=mark_solicitation_facts_human_approved(solicitation_body(metadata,*fields))
+    body=solicitation_body(metadata,*fields)
     current=api("GET",f"/api/projects/{project}/workflow/artifacts/solicitation_profile")
-    if body!=current.get("body"):
+    collections=("eligibility","requirements","deadlines","budget_rules","attachments","review_criteria")
+    needs_source_location=any(not item.get("sources") for collection in collections for item in body.get(collection) or [])
+    if body!=current.get("body") or needs_source_location:
         current=api("POST",f"/api/projects/{project}/workflow/artifacts/solicitation_profile",json={"body":body,"source":"human_structured_editor","author":actor,"expected_version":int(version) if version else None})
+    approved_body=json.loads(json.dumps(current.get("body") or {}))
+    mark_solicitation_facts_human_approved(approved_body)
+    if approved_body!=current.get("body"):
+        current=api("POST",f"/api/projects/{project}/workflow/artifacts/solicitation_profile",json={"body":approved_body,"source":"human_approval_review","author":actor,"expected_version":int(current["version"])})
     approved=api("POST",f"/api/projects/{project}/workflow/artifacts/solicitation_profile/approve",json={"version":int(current["version"]),"approver":actor})
     loaded=load_solicitation_form(project)
     return (*loaded[:-2],_approval_message(approved,"solicitation profile"),approved,api("GET",f"/api/projects/{project}/workflow/status"))
@@ -1023,11 +1168,20 @@ def post_team_channel_message(project,kind,subject_key,message,parent_id,mention
     loaded=load_team_channel(project,kind,subject_key)
     return *loaded,""
 
-def create_project_invite_ui(project,email,role,expires_days):
-    project=_require_project(project);result=api("POST",f"/api/projects/{project}/invites",json={"email":str(email or "").strip(),"role":role,"expires_in_days":int(expires_days)})
+def invite_delivery_summary(result):
     link=f"{os.getenv('APP_PUBLIC_URL','http://127.0.0.1:7860').rstrip('/')}/invite?token={quote(str(result.get('token') or ''))}"
     delivery="Email delivered." if result.get("email_sent") else f"Email was not delivered: {result.get('delivery_error')}. Send the one-time link through an approved secure channel."
-    return f"Invite created for **{result.get('email')}**. {delivery}\n\nOne-time link: `{link}`",*load_team_workspace(project)
+    account=("The recipient has an active account and can accept this invitation."
+             if result.get("account_exists") else
+             "The recipient does not have an active account yet. A system administrator must create one with this exact email before the invitation can be accepted.")
+    public_url=os.getenv("APP_PUBLIC_URL","http://127.0.0.1:7860").rstrip("/")
+    reachability=(" The configured link uses a loopback address and is only usable from this computer."
+                  if public_url.startswith(("http://127.0.0.1","http://localhost")) else "")
+    return f"Invite created for **{result.get('email')}**. {delivery} {account}{reachability}\n\nOne-time link: `{link}`"
+
+def create_project_invite_ui(project,email,role,expires_days):
+    project=_require_project(project);result=api("POST",f"/api/projects/{project}/invites",json={"email":str(email or "").strip(),"role":role,"expires_in_days":int(expires_days)})
+    return invite_delivery_summary(result),*load_team_workspace(project)
 
 def add_existing_project_member_ui(project,user_id,role):
     project=_require_project(project);user_id=str(user_id or "").strip()
@@ -1223,13 +1377,18 @@ def configured_project_creation(title,sponsor,mechanism,deadline,grant_type,sour
     pid,status,notice,requirements,sections=create_project(title,sponsor,mechanism,source,source_url,source_text,supporting,brand,workflow,owner,False,progress)
     selected_set=set(selected or [])
     if progress:progress(0.80,desc="Stage 4 of 4 · Applying team invitations, approval routing, and enabled workspace modules")
+    invite_reports=[]
+    members=_records(team_rows,["Email","Role"])
+    for row in members:
+        email=_cell(row.get("Email"));role=_cell(row.get("Role"))
+        if not email:continue
+        if role not in PROJECT_ROLE_LABELS:raise gr.Error(f"Unsupported project role for {email}: {row.get('Role')}")
+        try:
+            invite=api("POST",f"/api/projects/{pid}/invites",json={"email":email,"role":role,"expires_in_days":7})
+            invite_reports.append(invite_delivery_summary(invite))
+        except Exception as error:
+            invite_reports.append(f"Invitation for **{html.escape(email)}** could not be created: {html.escape(str(error))}")
     if "team_collaboration" in selected_set:
-        members=_records(team_rows,["Email","Role"])
-        for row in members:
-            email=_cell(row.get("Email"));role=_cell(row.get("Role"))
-            if not email:continue
-            if role not in PROJECT_ROLE_LABELS:raise gr.Error(f"Unsupported project role for {email}: {row.get('Role')}")
-            api("POST",f"/api/projects/{pid}/invites",json={"email":email,"role":role,"expires_in_days":7})
         approvers=[owner]
         routed_artifacts=["solicitation_profile","research_framework","aim_set","literature_manifest","proposal_section","proposal_snapshot"]
         if "review_simulator" in selected_set:routed_artifacts.append("review_simulation")
@@ -1252,7 +1411,8 @@ def configured_project_creation(title,sponsor,mechanism,deadline,grant_type,sour
             gr.update(visible=visibility.get("competitive_intelligence",False)),
             gr.update(visible=visibility.get("sponsor_compliance",False)),
             gr.update(visible=visibility.get("review_simulator",False)),
-            gr.update(visible=visibility.get("advanced_workbench",False)))
+            gr.update(visible=visibility.get("advanced_workbench",False)),
+            "\n\n---\n\n".join(invite_reports))
 
 def configured_project_creation_ui(title,sponsor,mechanism,deadline,grant_type,source,source_url,source_text,supporting,brand,
                                    preset_key,selected,required,review_mode,review_required,routing_mode,team_rows,progress=gr.Progress()):
@@ -1261,10 +1421,15 @@ def configured_project_creation_ui(title,sponsor,mechanism,deadline,grant_type,s
         creation=configured_project_creation(title,sponsor,mechanism,deadline,grant_type,source,source_url,source_text,supporting,brand,
                                              preset_key,selected,required,review_mode,review_required,routing_mode,team_rows,progress)
         pid=creation[1]
-        loaded=load_project(pid)
+        invite_report=creation[-1]
+        loaded=list(load_project(pid))
+        if invite_report:
+            loaded[4]=f"{loaded[4]}\n\n### Teammate invitation results\n{invite_report}"
         workflow=project_workflow_ui(pid)
+        creation_status="Shared grant created and loaded. The authoritative source is stored; select **Compile grant ask** when you are ready to run structured extraction."
+        if invite_report:creation_status+=f"\n\n### Teammate invitation results\n{invite_report}"
         return (gr.update(visible=False),*loaded,*workflow,
-                "Shared grant created and loaded. The authoritative source is stored; select **Compile grant ask** when you are ready to run structured extraction.",
+                creation_status,
                 gr.update(value="Create shared grant →",interactive=True))
     except Exception as error:
         message=html.escape(str(error).strip() or "The server did not return an error description.")
@@ -1304,7 +1469,7 @@ def refresh_shared_updates(project,kind,subject_key,search_plan_version,literatu
     compilation=poll_grant_ask_compilation(project)
     workflow=project_workflow_ui(project)
     return (wizard_projects,*catalog,*collaboration,*compilation,*workflow,
-            "Shared updates loaded from the server. Teammate activity, tasks, messages, approvals, workflow gates, and compilation status are current as of this refresh.")
+            "Shared updates loaded from the server. Teammate activity, tasks, messages, approvals, workflow progress, and compilation status are current as of this refresh.")
 
 def _portable_archive_payload(upload):
     if not upload:raise gr.Error("Choose a Grantspace portable project archive first.")
@@ -1681,23 +1846,60 @@ def load_section(project,project_title,section_title):
     return version,body,section_preview(project,project_title,section_title,body,key,version,update),status,body,key,(update or {}).get("event_id"),competitive_update_banner(update,version)
 
 
-COMPLIANCE_HEADERS=["Rule ID","Category","Type","Scope","Target","Severity","Mandatory","Numeric value","Text value","List value","Source hint","Document hint","Page hint","Notes"]
+COMPLIANCE_HEADERS=["Rule"]
+
+def compliance_rule_text(rule):
+    manual=str(rule.get("text_value") or "").strip()
+    if rule.get("rule_type")=="manual_requirement" and manual:return manual
+    target=str(rule.get("target") or "the application").replace("_"," ").strip()
+    number=rule.get("numeric_value")
+    values=", ".join(rule.get("list_value") or [])
+    templates={
+        "required_section":f"Include the required section: {target}.",
+        "required_form":f"Include the required form: {target}.",
+        "required_attachment":f"Include the required attachment: {target}.",
+        "max_words":f"Limit {target} to {number:g} words." if number is not None else "",
+        "min_words":f"Use at least {number:g} words for {target}." if number is not None else "",
+        "max_pages":f"Limit {target} to {number:g} pages." if number is not None else "",
+        "min_font_size_pt":f"Use a font size of at least {number:g} points." if number is not None else "",
+        "min_margin_in":f"Use margins of at least {number:g} inches." if number is not None else "",
+        "allowed_extensions":f"Use only these file types for {target}: {values}." if values else "",
+        "deadline":f"Submit by {manual or target}.",
+        "max_budget":f"Do not exceed a budget of {number:g}." if number is not None else "",
+        "project_period_max_months":f"Limit the project period to {number:g} months." if number is not None else "",
+        "submission_system":f"Submit through {manual or target}.",
+    }
+    return templates.get(rule.get("rule_type")) or str(rule.get("source_hint") or rule.get("notes") or target).strip()
+
+def _compliance_rule_draft(rule):
+    return {key:rule.get(key) for key in (
+        "rule_id","category","rule_type","scope","target","severity","mandatory",
+        "numeric_value","text_value","list_value","source_hint","source_document_hint",
+        "source_page_hint","notes",
+    )}
 
 def compliance_rule_rows(profile):
-    rows=[]
-    for r in (profile or {}).get("rules") or []:
-        rows.append([r.get("rule_id"),r.get("category"),r.get("rule_type"),r.get("scope"),r.get("target"),r.get("severity"),r.get("mandatory"),r.get("numeric_value"),r.get("text_value"),", ".join(r.get("list_value") or []),r.get("source_hint"),r.get("source_document_hint"),r.get("source_page_hint"),r.get("notes")])
-    return rows
+    return [[compliance_rule_text(rule)] for rule in (profile or {}).get("rules") or []]
+
+def compliance_rule_choices(profile):
+    return [(compliance_rule_text(rule),rule.get("rule_id")) for rule in (profile or {}).get("rules") or [] if rule.get("rule_id")]
 
 def compliance_provenance_rows(profile):
     return [[r.get("rule_id"),r.get("source_status"),r.get("source_document_id"),r.get("source_page"),r.get("source_start_offset"),r.get("source_end_offset"),r.get("source_excerpt")] for r in (profile or {}).get("rules") or []]
 
-def build_compliance_profile(sponsor,mechanism,submission_system,deadline,table):
+def build_compliance_profile(current_profile,sponsor,mechanism,submission_system,deadline,table):
     rules=[]
+    prior_by_text={};used_ids=set()
+    for rule in (current_profile or {}).get("rules") or []:
+        prior_by_text.setdefault(compliance_rule_text(rule),[]).append(rule)
+        used_ids.add(str(rule.get("rule_id") or ""))
     for r in _records(table,COMPLIANCE_HEADERS):
-        rid=_cell(r.get("Rule ID"))
-        if not rid:continue
-        rules.append({"rule_id":rid,"category":_cell(r.get("Category")),"rule_type":_cell(r.get("Type")),"scope":_cell(r.get("Scope")),"target":_cell(r.get("Target")),"severity":_cell(r.get("Severity")) or "hard","mandatory":_truth(r.get("Mandatory")),"numeric_value":_opt_float(r.get("Numeric value")),"text_value":(_cell(r.get("Text value")) or None),"list_value":_csv(r.get("List value")),"source_hint":_cell(r.get("Source hint")),"source_document_hint":(_cell(r.get("Document hint")) or None),"source_page_hint":_opt_int(r.get("Page hint")),"notes":_cell(r.get("Notes"))})
+        text=_cell(r.get("Rule"))
+        if not text:continue
+        matches=prior_by_text.get(text) or []
+        if matches:rules.append(_compliance_rule_draft(matches.pop(0)));continue
+        rule_id=_stable_human_id("RULE",text,used_ids)
+        rules.append({"rule_id":rule_id,"category":"administrative","rule_type":"manual_requirement","scope":"proposal","target":"proposal","severity":"warning","mandatory":False,"numeric_value":None,"text_value":text,"list_value":[],"source_hint":text,"source_document_hint":None,"source_page_hint":None,"notes":"Human-authored rule"})
     return {"sponsor":_cell(sponsor) or None,"mechanism":_cell(mechanism) or None,"submission_system":_cell(submission_system) or None,"deadline_iso":_cell(deadline) or None,"rules":rules}
 
 def compliance_finding_rows(a):
@@ -1712,27 +1914,27 @@ def load_compliance(project):
     artifacts=api("GET",f"/api/projects/{project}/submission-artifacts")
     status=(f"Compliance profile v{d.get('version')} · {'approved' if d.get('approved') else 'awaiting human approval'} · {'fresh' if d.get('fresh') else 'STALE — recompile from the current opportunity source'}. "
             f"Hard failures: {assessment.get('hard_failures',0)}.")
-    return profile,source.get("text") or "",profile.get("sponsor") or "",profile.get("mechanism") or "",profile.get("submission_system") or "",profile.get("deadline_iso") or "",compliance_rule_rows(profile),compliance_provenance_rows(profile),compliance_finding_rows(assessment),assessment,[[x.get("slot"),x.get("filename"),x.get("extension"),x.get("sha256")] for x in artifacts],status
+    return profile,source.get("text") or "",profile.get("sponsor") or "",profile.get("mechanism") or "",profile.get("submission_system") or "",profile.get("deadline_iso") or "",compliance_rule_rows(profile),gr.update(choices=compliance_rule_choices(profile),value=None),compliance_provenance_rows(profile),compliance_finding_rows(assessment),assessment,[[x.get("slot"),x.get("filename"),x.get("extension"),x.get("sha256")] for x in artifacts],status
 
 def compile_compliance(project):
     d=api("POST",f"/api/projects/{project}/compliance/compile",timeout=900);profile=d.get("profile") or {};a=api("GET",f"/api/projects/{project}/compliance/assessment");source=api("GET",f"/api/projects/{project}/opportunity-source")
     sections=api("GET",f"/api/projects/{project}/sections");choices=[x.get("title") for x in sections if x.get("title")]
     missing=sum(1 for r in profile.get("rules") or [] if r.get("source_status")!="located")
-    return profile,source.get("text") or "",profile.get("sponsor") or "",profile.get("mechanism") or "",profile.get("submission_system") or "",profile.get("deadline_iso") or "",compliance_rule_rows(profile),compliance_provenance_rows(profile),compliance_finding_rows(a),a,f"Recompiled {len(profile.get('rules') or [])} sponsor rules; {missing} require source-location review. Human approval is required.",gr.update(choices=choices)
+    return profile,source.get("text") or "",profile.get("sponsor") or "",profile.get("mechanism") or "",profile.get("submission_system") or "",profile.get("deadline_iso") or "",compliance_rule_rows(profile),gr.update(choices=compliance_rule_choices(profile),value=None),compliance_provenance_rows(profile),compliance_finding_rows(a),a,f"Recompiled {len(profile.get('rules') or [])} sponsor rules; {missing} require source-location review. Human approval is required.",gr.update(choices=choices)
 
-def save_compliance(project,sponsor,mechanism,submission_system,deadline,table):
-    profile=build_compliance_profile(sponsor,mechanism,submission_system,deadline,table)
+def save_compliance(project,current_profile,sponsor,mechanism,submission_system,deadline,table):
+    profile=build_compliance_profile(current_profile,sponsor,mechanism,submission_system,deadline,table)
     d=api("POST",f"/api/projects/{project}/compliance",json={"profile":profile},timeout=300);a=api("GET",f"/api/projects/{project}/compliance/assessment")
     sections=api("GET",f"/api/projects/{project}/sections");choices=[x.get("title") for x in sections if x.get("title")]
     saved=d.get("profile") or profile
-    return saved,compliance_rule_rows(saved),compliance_provenance_rows(saved),compliance_finding_rows(a),a,f"Saved human-reviewed compliance profile v{d.get('version')}. Approval is still required.",gr.update(choices=choices)
+    return saved,compliance_rule_rows(saved),gr.update(choices=compliance_rule_choices(saved),value=None),compliance_provenance_rows(saved),compliance_finding_rows(a),a,f"Saved human-reviewed compliance profile v{d.get('version')}. Approval is still required.",gr.update(choices=choices)
 
 def approve_compliance(project):
     d=api("POST",f"/api/projects/{project}/compliance/approve");a=api("GET",f"/api/projects/{project}/compliance/assessment")
     return compliance_provenance_rows(d.get("profile") or {}),compliance_finding_rows(a),a,f"✓ Human approved sponsor compliance profile v{d.get('version')}. Deterministic hard-rule failures remaining: {a.get('hard_failures',0)}."
 
 def resolve_compliance(project,rule_id,status,notes,resolved_by):
-    if not (rule_id or "").strip():raise gr.Error("Enter the Rule ID to resolve.")
+    if not (rule_id or "").strip():raise gr.Error("Choose the rule to resolve.")
     a=api("POST",f"/api/projects/{project}/compliance/resolve",json={"rule_id":rule_id.strip(),"status":status,"notes":notes or None,"resolved_by":resolved_by or None})
     return compliance_finding_rows(a),a,f"Saved manual resolution `{status}` for {rule_id}."
 
@@ -1890,6 +2092,10 @@ with gr.Blocks(title="Grantspace") as demo:
         with gr.Row(elem_classes="wizard-shell"):
             wizard_rail=gr.HTML(wizard_rail_html(1),container=False)
             with gr.Column(elem_classes="wizard-main"):
+                wizard_preset=gr.State("custom_configuration_v1")
+                wizard_modules=gr.State([])
+                wizard_required_modules=gr.State([])
+                wizard_review_required=gr.State(False)
                 with gr.Column(visible=True,elem_id="wizard-page-1") as wizard_page_1:
                     gr.HTML('<div class="wizard-title"><div class="wizard-kicker">Composable grant workflow</div><h1>Start with the grant.<br><span class="accent">Build only what you need.</span></h1><p>Grantspace turns each solicitation into a shared, approval-ready workflow grounded in evidence, owned by your team, and reproducible at export.</p></div>')
                     with gr.Row():
@@ -1910,78 +2116,94 @@ with gr.Blocks(title="Grantspace") as demo:
                                 wizard_import_status=gr.Markdown()
                     gr.HTML('<div class="privacy-note"><b>Your research stays governed.</b><br>Provider routing and the exact cloud-bound task categories are shown before the project is created.</div>')
                 with gr.Column(visible=False,elem_id="wizard-page-2") as wizard_page_2:
-                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">02 · Grant ask</div><h2>Give us the source of truth</h2><p>Add the solicitation and its context. Requirements, review criteria, deadlines, attachments, and questions remain linked to their exact source.</p></div>')
-                    with gr.Row():
-                        with gr.Column(scale=1,elem_classes="wizard-panel"):
-                            wizard_source=gr.File(label="RFA, RFI, NOFO, or application form",file_count="single",type="filepath")
-                            wizard_source_url=gr.Textbox(label="Or import a public URL",placeholder="https://…")
-                            wizard_source_text=gr.Textbox(label="Or paste the grant ask",lines=9)
-                            wizard_supporting=gr.File(label="Supporting guidance and sponsor strategy",file_count="multiple",type="filepath")
-                            wizard_brand=gr.File(label="Brand and layout references",file_count="multiple",type="filepath")
-                        with gr.Column(scale=1,elem_classes="wizard-panel"):
-                            wizard_title=gr.Textbox(label="Working title")
-                            with gr.Row():
-                                wizard_sponsor=gr.Textbox(label="Sponsor")
-                                wizard_mechanism=gr.Textbox(label="Mechanism")
-                            with gr.Row():
-                                wizard_grant_type=gr.Dropdown(["research","clinical_trial","implementation","training","center_program","foundation","rfi_response","custom"],value="research",label="Grant type")
-                                wizard_deadline=gr.Textbox(label="Sponsor deadline",placeholder="YYYY-MM-DD")
-                            gr.HTML('<div class="privacy-note"><b>Content routing</b><br>The final screen discloses the selected local and cloud providers before processing starts.</div>')
-                    with gr.Row():wizard_2_back=gr.Button("← Back");wizard_2_next=gr.Button("Continue →",variant="primary")
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">Grant details</div><h2>Name this grant</h2><p>Enter only the identifying information known today. Sponsor and mechanism can be corrected later from the authoritative source.</p></div>')
+                    with gr.Column(elem_classes="wizard-panel"):
+                        wizard_title=gr.Textbox(label="Working title")
+                        with gr.Row():
+                            wizard_sponsor=gr.Textbox(label="Sponsor")
+                            wizard_mechanism=gr.Textbox(label="Mechanism")
+                        with gr.Row():
+                            wizard_grant_type=gr.Dropdown(["research","clinical_trial","implementation","training","center_program","foundation","rfi_response","custom"],value="research",label="Grant type")
+                            wizard_deadline=gr.Textbox(label="Sponsor deadline",placeholder="YYYY-MM-DD")
+                    with gr.Row():wizard_details_back=gr.Button("← Back");wizard_details_next=gr.Button("Continue →",variant="primary")
                 with gr.Column(visible=False,elem_id="wizard-page-3") as wizard_page_3:
-                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">03 · Core workflow</div><h2>Five outcomes. Always included.</h2><p>Each produces an approved input required by the next. These stages cannot be disabled.</p></div>')
-                    gr.HTML(core_flow_html())
-                    gr.HTML('<div class="privacy-note"><b>Approval gates protect the final proposal.</b> Drafting and export use the exact approved versions recorded in the compilation manifest.</div>')
-                    with gr.Row():wizard_3_back=gr.Button("← Back");wizard_3_next=gr.Button("Continue →",variant="primary")
-                with gr.Column(visible=False,elem_id="wizard-page-4") as wizard_page_4:
-                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">04 · Optional modules</div><h2>Compose the right level of rigor</h2><p>Selected capabilities appear in project navigation and gates. Unselected capabilities are absent and cannot block completion.</p></div>')
-                    wizard_preset=gr.Dropdown(PRESET_CHOICES,value=WORKFLOW_REGISTRY["default_preset_key"],label="Start from a preset, or choose Custom configuration")
-                    gr.HTML(module_catalog_html())
-                    wizard_modules=gr.CheckboxGroup(MODULE_CHOICES,label="Selected capabilities",value=WORKFLOW_PRESETS[WORKFLOW_REGISTRY["default_preset_key"]]["enabled_modules"],elem_classes="wizard-option-grid")
-                    wizard_required_modules=gr.CheckboxGroup([],label="Capabilities that add a required completion gate",value=[],elem_classes="wizard-option-grid")
-                    with gr.Row():wizard_4_back=gr.Button("← Back");wizard_4_next=gr.Button("Continue →",variant="primary")
-                with gr.Column(visible=False,elem_id="wizard-page-5") as wizard_page_5:
-                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">05 · Review configuration</div><h2>Build the panel before the critique</h2><p>Synthetic role archetypes use public criteria and proposal evidence. They do not represent named people or predict an award decision.</p></div>')
-                    with gr.Row():
-                        with gr.Column(elem_classes="wizard-panel"):
-                            wizard_review_mode=gr.Radio(REVIEW_MODE_CHOICES,value=REVIEW_MODE_CHOICES[0][1],label="Review mode")
-                            wizard_review_required=gr.Checkbox(label="Require an approved simulated review before final export",value=False)
-                        with gr.Column(elem_classes="wizard-panel"):
-                            gr.Markdown("### Reviewer-role registry\nThe server derives the actual panel from the human-approved solicitation rubric and this versioned registry. Roles are not manually preselected or inferred from a sponsor name.")
-                            gr.Dataframe(value=REVIEWER_ARCHETYPE_ROWS,headers=["Available archetype","Responsibility"],interactive=False,label="Versioned archetype registry")
-                            gr.Markdown("Every score and critique must cite a rubric item and proposal anchor. Unsupported scores fail validation.")
-                    with gr.Row():wizard_5_back=gr.Button("← Back");wizard_5_next=gr.Button("Continue →",variant="primary")
-                with gr.Column(visible=False,elem_id="wizard-page-6") as wizard_page_6:
-                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">06 · Team & routing</div><h2>Put a name on every decision</h2><p>Configure stable identities, review responsibility, internal dates, and notifications before work begins.</p></div>')
-                    with gr.Row():
-                        with gr.Column(scale=3,elem_classes="wizard-panel"):
-                            wizard_owner_id=gr.State("")
-                            wizard_identity_status=gr.Markdown()
-                            gr.Markdown("#### Invite teammates (optional)\nAdd one person at a time. Project roles are limited to permissions supported by the application.")
-                            with gr.Row():
-                                wizard_team_email=gr.Textbox(label="Teammate email",placeholder="name@organization.org",scale=2)
-                                wizard_team_role=gr.Dropdown(PROJECT_ROLE_CHOICES,value="contributor",label="Project role",scale=1)
-                                wizard_team_add=gr.Button("Add teammate",variant="secondary",scale=1)
-                            wizard_team=gr.Dataframe(value=[],headers=["Email","Role"],datatype=["str","str"],column_count=(2,"fixed"),interactive=False,label="Pending invitations")
-                            with gr.Row():
-                                wizard_team_remove_choice=gr.Dropdown([],label="Remove teammate",scale=3)
-                                wizard_team_remove=gr.Button("Remove",variant="secondary",scale=1)
-                            wizard_team_status=gr.Markdown()
-                        with gr.Column(scale=2,elem_classes="wizard-panel"):
-                            wizard_routing=gr.Dropdown(WORKFLOW_REGISTRY["model_routing_modes"],value=os.getenv("MODEL_ROUTING_MODE","local_only"),label="Model routing policy")
-                            gr.Markdown(f"**Local provider:** `{os.getenv('LOCAL_LLM_PROVIDER','not configured')}`  \n**Local model:** `{os.getenv('LOCAL_LLM_MODEL','not configured')}`  \n**Cloud model:** `{os.getenv('CLAUDE_MODEL','not configured')}`")
-                            gr.HTML('<div class="privacy-note">Local-only prevents proposal content from being sent to Claude. Hybrid routing shows and records the provider and model for every generated artifact.</div>')
-                    with gr.Row():wizard_6_back=gr.Button("← Back");wizard_6_next=gr.Button("Preview workflow →",variant="primary")
-                with gr.Column(visible=False,elem_id="wizard-page-7") as wizard_page_7:
-                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">07 · Workflow preview</div><h2>Your grant, composed</h2><p>This exact configuration becomes the server-side source of truth for every teammate.</p></div>')
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">Grant source</div><h2>Add the authoritative grant ask</h2><p>Upload a file, enter a public URL, or paste the solicitation text. Only one primary source is required.</p></div>')
+                    with gr.Column(elem_classes="wizard-panel"):
+                        wizard_source=gr.File(label="RFA, RFI, NOFO, or application form",file_count="single",type="filepath")
+                        wizard_source_url=gr.Textbox(label="Or import a public URL",placeholder="https://…")
+                        wizard_source_text=gr.Textbox(label="Or paste the grant ask",lines=7)
+                        wizard_supporting=gr.File(label="Supporting guidance (optional)",file_count="multiple",type="filepath")
+                        wizard_brand=gr.File(label="Brand or layout references (optional)",file_count="multiple",type="filepath")
+                    with gr.Row():wizard_source_back=gr.Button("← Back");wizard_source_next=gr.Button("Continue →",variant="primary")
+
+                wizard_core_pages=[];wizard_core_back=[];wizard_core_next=[]
+                for core_index,step in enumerate(WORKFLOW_REGISTRY["core_steps"]):
+                    page_number=WIZARD_CORE_FIRST+core_index
+                    with gr.Column(visible=False,elem_id=f"wizard-page-{page_number}") as core_page:
+                        gr.HTML(workflow_item_screen_html(step,"core",core_index+1,len(WORKFLOW_REGISTRY["core_steps"])))
+                        gr.Markdown("This outcome remains part of the grant workflow. You complete it on its own workspace screen; optional tools never add hidden blockers to it.")
+                        with gr.Row():
+                            back_button=gr.Button("← Back")
+                            next_button=gr.Button("Continue →",variant="primary")
+                    wizard_core_pages.append(core_page);wizard_core_back.append(back_button);wizard_core_next.append(next_button)
+
+                wizard_module_pages=[];wizard_module_back=[];wizard_module_next=[];wizard_module_modes=[]
+                for module_index,module in enumerate(WORKFLOW_REGISTRY["optional_modules"]):
+                    page_number=WIZARD_MODULE_FIRST+module_index
+                    with gr.Column(visible=False,elem_id=f"wizard-page-{page_number}") as module_page:
+                        gr.HTML(workflow_item_screen_html(module,"optional",module_index+1,len(WORKFLOW_REGISTRY["optional_modules"])))
+                        mode=gr.Radio(
+                            [("Skip this tool","skip"),("Include as an optional tool","include")],
+                            value="skip",
+                            label="Use this tool for this grant?",
+                        )
+                        gr.Markdown("An included optional tool gets its own workspace screen. It does not block another step or final export.")
+                        with gr.Row():
+                            back_button=gr.Button("← Back")
+                            next_button=gr.Button("Continue →",variant="primary")
+                    wizard_module_pages.append(module_page);wizard_module_back.append(back_button);wizard_module_next.append(next_button);wizard_module_modes.append(mode)
+
+                with gr.Column(visible=False,elem_id=f"wizard-page-{WIZARD_REVIEW_PAGE}") as wizard_review_page:
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">Review setup</div><h2>Choose the depth of critique</h2><p>This choice is used only when the Review simulator tool is included. Review remains advisory and never blocks the grant.</p></div>')
+                    wizard_review_mode=gr.Radio(REVIEW_MODE_CHOICES,value=REVIEW_MODE_CHOICES[0][1],label="Review mode")
+                    gr.HTML('<div class="privacy-note">Reviewer roles are derived later from the approved solicitation and the versioned registry. Synthetic reviewers never represent named people or predict an award decision.</div>')
+                    with gr.Row():wizard_review_back=gr.Button("← Back");wizard_review_next=gr.Button("Continue →",variant="primary")
+
+                with gr.Column(visible=False,elem_id=f"wizard-page-{WIZARD_TEAM_PAGE}") as wizard_team_page:
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">Team</div><h2>Invite collaborators</h2><p>Invitations change access only. They never add grant-completion rules.</p></div>')
+                    with gr.Column(elem_classes="wizard-panel"):
+                        wizard_owner_id=gr.State("")
+                        wizard_identity_status=gr.Markdown()
+                        gr.Markdown("Invite an existing account holder by email, or skip this screen and invite people later from the project workspace.")
+                        with gr.Row():
+                            wizard_team_email=gr.Textbox(label="Teammate email",placeholder="name@organization.org",scale=2)
+                            wizard_team_role=gr.Dropdown(PROJECT_ROLE_CHOICES,value="contributor",label="Project role",scale=1)
+                            wizard_team_add=gr.Button("Add teammate",variant="secondary",scale=1)
+                        wizard_team=gr.Dataframe(value=[],headers=["Email","Role"],datatype=["str","str"],column_count=(2,"fixed"),interactive=False,label="Pending invitations")
+                        with gr.Row():
+                            wizard_team_remove_choice=gr.Dropdown([],label="Remove teammate",scale=3)
+                            wizard_team_remove=gr.Button("Remove",variant="secondary",scale=1)
+                        wizard_team_status=gr.Markdown()
+                    with gr.Row():wizard_team_back=gr.Button("← Back");wizard_team_next=gr.Button("Continue →",variant="primary")
+
+                with gr.Column(visible=False,elem_id=f"wizard-page-{WIZARD_ROUTING_PAGE}") as wizard_routing_page:
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">Model routing</div><h2>Choose where model work runs</h2><p>This policy is stored on the grant and enforced for its model calls.</p></div>')
+                    with gr.Column(elem_classes="wizard-panel"):
+                        wizard_routing=gr.Dropdown(WORKFLOW_REGISTRY["model_routing_modes"],value=os.getenv("MODEL_ROUTING_MODE","local_only"),label="Model routing policy")
+                        gr.Markdown(f"**Local provider:** `{os.getenv('LOCAL_LLM_PROVIDER','not configured')}`  \n**Local model:** `{os.getenv('LOCAL_LLM_MODEL','not configured')}`  \n**Cloud model:** `{os.getenv('CLAUDE_MODEL','not configured')}`")
+                        gr.HTML('<div class="privacy-note">Local-only prevents proposal content from being sent to Claude. Hybrid routing shows and records the provider and model for every generated artifact.</div>')
+                    with gr.Row():wizard_routing_back=gr.Button("← Back");wizard_routing_next=gr.Button("Preview workflow →",variant="primary")
+
+                with gr.Column(visible=False,elem_id=f"wizard-page-{WIZARD_PREVIEW_PAGE}") as wizard_preview_page:
+                    gr.HTML('<div class="wizard-title"><div class="wizard-kicker">Workflow preview</div><h2>Your grant, composed</h2><p>This exact configuration becomes the server-side source of truth for every teammate.</p></div>')
                     wizard_preview=gr.HTML()
-                    gr.HTML('<div class="privacy-note"><b>Configuration validation</b><br>The server rejects unknown modules, hidden prerequisites, stale definitions, and required modules that are not enabled.</div>')
+                    gr.HTML('<div class="privacy-note"><b>What is enforced</b><br>The five grant outcomes remain available. Every tool you included is optional and cannot block another outcome or final export.</div>')
                     gr.HTML('<div id="wizard-create-progress" role="status" aria-live="polite"><b class="label">Ready to create the shared grant.</b><div class="track"><div class="bar"></div></div></div>')
                     wizard_create_status=gr.Markdown(elem_id="wizard-create-status")
-                    with gr.Row():wizard_7_back=gr.Button("← Back");wizard_create_btn=gr.Button("Create shared grant →",variant="primary",elem_id="wizard-create-button")
+                    with gr.Row():wizard_preview_back=gr.Button("← Back");wizard_create_btn=gr.Button("Create shared grant →",variant="primary",elem_id="wizard-create-button")
                 with gr.Row(elem_classes="wizard-footer"):
                     gr.Markdown("Configuration is not persisted until you create the grant.")
-                    wizard_progress=gr.Markdown("1 of 7",elem_id="wizard-progress")
+                    wizard_progress=gr.Markdown(f"1 of {WIZARD_PAGE_COUNT}",elem_id="wizard-progress")
     gr.Markdown(f"# Grantspace\n{ORGANIZATION_NAME} · Compose the workflow. Write the grant. Win the review. · Build {GRANT_BUILD_VERSION}")
     refresh_shared_updates_btn=gr.Button("↻ Refresh shared updates",variant="secondary",elem_id="refresh-shared-updates")
     manual_refresh_status=gr.Markdown()
@@ -2004,7 +2226,7 @@ with gr.Blocks(title="Grantspace") as demo:
         project_management_status=gr.Markdown()
     agentic_global_notice=gr.Markdown()
     with gr.Tabs() as workspace_tabs:
-        with gr.Tab("1 · Intake & Requirements") as intake_tab:
+        with gr.Tab("1 · Grant Ask") as intake_tab:
             with gr.Row():
                 with gr.Column(scale=2):
                     project_title=gr.Textbox(label="Working title");sponsor=gr.Textbox(label="Sponsor");mechanism=gr.Textbox(label="Mechanism")
@@ -2020,7 +2242,7 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
                     supporting=gr.File(label="Relevant institutional/project materials",file_count="multiple",type="filepath");brand=gr.File(label="Branding/layout inspiration",file_count="multiple",type="filepath")
                     create=gr.Button("Create / Analyze Grant",variant="primary");project_status=gr.Markdown()
                 with gr.Column(scale=5):
-                    requirements_table=gr.Dataframe(headers=["ID","Category","Mandatory","Requirement","Evidence needed","Status","Approved"],datatype=["str","str","bool","str","str","str","bool"],interactive=False,label="Parsed atomic requirements")
+                    requirements_table=gr.Dataframe(headers=["Requirement","Priority","Evidence or action","Status"],interactive=False,label="Grant requirements")
                     with gr.Row():
                         compile_grant_ask_btn=gr.Button("Compile grant ask",variant="primary")
                         approve_req=gr.Button("✓ Approve Requirements",variant="secondary")
@@ -2036,15 +2258,15 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
                         solicitation_sponsor=gr.Textbox(label="Sponsor")
                         solicitation_mechanism=gr.Textbox(label="Mechanism")
                     solicitation_purpose=gr.Textbox(label="Purpose",lines=4)
-                    solicitation_facts=gr.Dataframe(headers=SOLICITATION_FACT_HEADERS,column_count=(len(SOLICITATION_FACT_HEADERS),"fixed"),row_count=(8,"dynamic"),interactive=True,label="Eligibility, requirements, deadlines, budget rules, and attachments")
-                    solicitation_criteria=gr.Dataframe(headers=SOLICITATION_CRITERION_HEADERS,column_count=(len(SOLICITATION_CRITERION_HEADERS),"fixed"),row_count=(4,"dynamic"),interactive=True,label="Solicitation-derived review rubric")
-                    solicitation_questions=gr.Dataframe(headers=["Question"],column_count=(1,"fixed"),row_count=(3,"dynamic"),interactive=True,label="Questions requiring human resolution")
+                    solicitation_facts=gr.Dataframe(headers=SOLICITATION_FACT_HEADERS,column_count=(1,"fixed"),row_count=(8,"dynamic"),interactive=True,label="Rules and requirements · one per row")
+                    solicitation_criteria=gr.Dataframe(headers=SOLICITATION_CRITERION_HEADERS,column_count=(1,"fixed"),row_count=(4,"dynamic"),interactive=True,label="Review criteria · one per row")
+                    solicitation_questions=gr.Dataframe(headers=["Question"],column_count=(1,"fixed"),row_count=(3,"dynamic"),interactive=True,label="Questions · one per row")
                     solicitation_artifact_json=gr.JSON(label="Solicitation artifact metadata",visible=False)
                     solicitation_status=gr.Markdown()
                     with gr.Row():
                         solicitation_return_reason=gr.Textbox(label="Return-for-revision rationale",placeholder="State the exact correction required")
                         return_solicitation_btn=gr.Button("↩ Return approved profile for revision")
-        with gr.Tab("2 · Research Plan Framework") as framework_tab:
+        with gr.Tab("2 · Research Plan") as framework_tab:
             gr.Markdown("### Sponsor-mapped research plan\nGenerate from the exact approved solicitation profile, then edit the argument, mappings, evidence gaps, ownership, dependencies, and word allocations before approval.")
             framework_version=gr.State(None)
             with gr.Row():
@@ -2060,7 +2282,7 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
             with gr.Row():
                 framework_return_reason=gr.Textbox(label="Return-for-revision rationale",placeholder="State the exact correction required")
                 return_framework_btn=gr.Button("↩ Return approved framework for revision")
-        with gr.Tab("3 · Key Aims") as aims_tab:
+        with gr.Tab("3 · Aims") as aims_tab:
             gr.Markdown("### Versioned aims\nKeep objectives, central thesis, rationale, approach, outcomes, impact, innovation, dependencies, classifications, and supporting evidence explicit.")
             aims_version=gr.State(None)
             with gr.Row():
@@ -2078,14 +2300,14 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
             with gr.Row():
                 aims_return_reason=gr.Textbox(label="Return-for-revision rationale",placeholder="State the exact correction required")
                 return_aims_btn=gr.Button("↩ Return approved aims for revision")
-        with gr.Tab("Optional · Investigator Interview",visible=False) as interview_tab:
+        with gr.Tab("Tools · Investigator Interview",visible=False) as interview_tab:
             with gr.Row():
                 with gr.Column(scale=3):
                     generate_q=gr.Button("Generate / Recompute Missing Questions",variant="primary");question_card=gr.HTML(render_question(None));answer=gr.Textbox(label="Answer")
                     with gr.Row():confidence=gr.Dropdown(["high","medium","low"],value="high",label="Confidence");classification=gr.Dropdown(["verified_fact","investigator_estimate","assumption","unknown"],value="verified_fact",label="Classification")
                     answer_notes=gr.Textbox(label="Supporting explanation / notes",lines=4);answered_by=gr.Textbox(label="Answered by / role");submit=gr.Button("Save Answer & Continue",variant="primary");interview_status=gr.Markdown()
                 with gr.Column(scale=2):interview_table=gr.JSON(label="Interview state")
-        with gr.Tab("4 · Literature & Evidence") as research_tab:
+        with gr.Tab("4 · Evidence") as research_tab:
             gr.Markdown("### Approved search plan\nGenerate a solicitation-, framework-, and aims-grounded query plan, let contributors correct it, and require named approval before the application performs any external search.")
             search_plan_version=gr.State(None)
             with gr.Row():
@@ -2126,7 +2348,7 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
             index_message=gr.Markdown();index_json=gr.JSON(label="Index manifest / status")
             with gr.Row():retrieval_query=gr.Textbox(label="Test hybrid retrieval query");retrieval_k=gr.Slider(1,50,value=12,step=1,label="Top K");retrieval_btn=gr.Button("Run Retrieval")
             retrieval_table=gr.Dataframe(headers=["Score","Semantic","BM25","Evidence","Freshness","Graph boost","Kind","Source","Excerpt"],interactive=False)
-        with gr.Tab("Optional · Team Workspace",visible=False) as team_tab:
+        with gr.Tab("Team",visible=False) as team_tab:
             gr.Markdown("### Shared project collaboration\nEvery message, comment, task, invitation, notification, and approval decision is tied to an authenticated user and the persisted project workflow.")
             team_permissions=gr.State({})
             with gr.Row():
@@ -2210,7 +2432,7 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
                     notification_status=gr.Markdown()
                     approval_routing_table=gr.Dataframe(headers=["Artifact","Current version","Owner user ID","Approver user IDs","Approvals","Required","Threshold met","Artifact approved"],interactive=False,label="Configured approval-routing status")
                     team_activity=gr.Dataframe(headers=["Created","Actor","Kind","Detail"],interactive=False,label="Append-only project activity")
-        with gr.Tab("4 · Clinical Study Design",visible=False) as clinical_tab:
+        with gr.Tab("Tools · Clinical Design",visible=False) as clinical_tab:
             gr.Markdown("### Authoritative clinical study model\nThese structured values are the source of truth injected into every grant section. Deterministic checks flag feasibility and consistency issues; they never rewrite human-approved prose.")
             with gr.Row():
                 load_clinical_btn=gr.Button("Load Saved Study")
@@ -2282,7 +2504,7 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
             resources_table=gr.Dataframe(headers=RESOURCE_HEADERS,datatype=["str","str","bool","bool","str"],row_count=(4,"dynamic"),column_count=(5,"fixed"),interactive=True)
             clinical_assessment=gr.JSON(label="Deterministic clinical assessment")
             clinical_status=gr.Markdown()
-        with gr.Tab("5 · Competitive Applicant Intelligence",visible=False) as competitive_tab:
+        with gr.Tab("Tools · Competitive Intelligence",visible=False) as competitive_tab:
             gr.Markdown("### Public competitive applicant intelligence\nThe system builds a capability profile from this grant and clinical design, then identifies organizations whose **public** grants, publications, clinical trials, patents/IP signals, and disclosed technologies overlap with that profile. These are potential capability-matched competitors—not confirmed applicants. The resulting strategy is injected into grant drafting to emphasize defensible superiority and differentiation.")
             with gr.Row():
                 generate_comp_profile_btn=gr.Button("Generate Likely Strong-Applicant Profile",variant="secondary")
@@ -2295,7 +2517,7 @@ Use whichever input is easiest. Upload, URL, and pasted text are normalized into
             asset_table=gr.Dataframe(headers=["Potential competitor","Asset type","Relevance","Public asset","Year","Provider","URL"],interactive=False,label="Top public grants / publications / trials / IP signals / technology evidence")
             competitive_strategy=gr.Markdown("No competitive positioning run yet.")
             competitive_raw=gr.JSON(label="Auditable competitive run",visible=False)
-        with gr.Tab("6 · Sponsor Compliance & Submission",visible=False) as compliance_tab:
+        with gr.Tab("Tools · Sponsor Compliance",visible=False) as compliance_tab:
             gr.Markdown("""### Deterministic Sponsor Compliance
 The approved funding opportunity is compiled into atomic submission rules. You can correct the parsed rules before approval. Hard sponsor rules—not AI opinion—control final export readiness.""")
             with gr.Row():
@@ -2310,18 +2532,20 @@ The approved funding opportunity is compiled into atomic submission rules. You c
                 compliance_mechanism=gr.Textbox(label="Mechanism")
                 submission_system=gr.Textbox(label="Submission system / portal")
                 compliance_deadline=gr.Textbox(label="Deadline (YYYY-MM-DD)")
-            compliance_rules=gr.Dataframe(headers=COMPLIANCE_HEADERS,row_count=(8,"dynamic"),column_count=(14,"fixed"),interactive=True,label="Rule meaning and source hints · editable before approval")
-            save_compliance_btn=gr.Button("Save Rule Corrections")
-            compliance_provenance=gr.Dataframe(headers=["Rule ID","Source status","Document ID","Page","Start byte","End byte","Exact source excerpt"],interactive=False,label="Deterministically copied provenance · never authored or edited by an LLM")
-            compliance_findings=gr.Dataframe(headers=["Rule ID","Severity","Mandatory","Status","Type","Target","Detail","Source excerpt"],interactive=False,label="Deterministic compliance assessment")
-            compliance_json=gr.JSON(label="Compliance assessment")
-            gr.Markdown("#### Resolve a rule that requires authoritative human confirmation")
-            with gr.Row():
-                compliance_rule_id=gr.Textbox(label="Rule ID")
-                compliance_resolution=gr.Dropdown(["satisfied","not_applicable","waived","unresolved"],value="satisfied",label="Resolution")
-                compliance_resolved_by=gr.Textbox(label="Resolved by / role")
-            compliance_resolution_notes=gr.Textbox(label="Resolution rationale / evidence note",lines=3)
-            resolve_compliance_btn=gr.Button("Save Manual Resolution")
+            compliance_rules=gr.Dataframe(headers=COMPLIANCE_HEADERS,row_count=(8,"dynamic"),column_count=(1,"fixed"),interactive=True,label="Rules · one plain-language rule per row")
+            save_compliance_btn=gr.Button("Save rules")
+            with gr.Accordion("Advanced audit details and manual resolutions",open=False):
+                gr.Markdown("Internal IDs and exact source offsets are retained for auditability. Users select a rule by its wording; IDs never need to be entered.")
+                compliance_provenance=gr.Dataframe(headers=["Internal rule ID","Source status","Document ID","Page","Start byte","End byte","Exact source excerpt"],interactive=False,label="Exact source provenance")
+                compliance_findings=gr.Dataframe(headers=["Internal rule ID","Severity","Mandatory","Status","Type","Target","Detail","Source excerpt"],interactive=False,label="Deterministic assessment")
+                compliance_json=gr.JSON(label="Machine-readable assessment")
+                gr.Markdown("#### Resolve a rule requiring authoritative human confirmation")
+                with gr.Row():
+                    compliance_rule_id=gr.Dropdown(label="Rule",choices=[])
+                    compliance_resolution=gr.Dropdown(["satisfied","not_applicable","waived","unresolved"],value="satisfied",label="Resolution")
+                    compliance_resolved_by=gr.Textbox(label="Resolved by / role")
+                compliance_resolution_notes=gr.Textbox(label="Resolution rationale / evidence note",lines=3)
+                resolve_compliance_btn=gr.Button("Save manual resolution")
             gr.Markdown("""#### Submission attachments
 Register the actual files that must travel with the proposal. Use a stable slot such as `letters_of_support`, `biosketches`, `data_management_plan`, or the sponsor's attachment name.""")
             with gr.Row():
@@ -2330,7 +2554,7 @@ Register the actual files that must travel with the proposal. Use a stable slot 
                 register_artifact_btn=gr.Button("Register Attachment(s)")
             artifact_table=gr.Dataframe(headers=["Slot","Filename","Extension","SHA-256"],interactive=False,label="Registered submission artifacts")
             compliance_status=gr.Markdown()
-        with gr.Tab("7 · Write, Edit & Approve") as writing_tab:
+        with gr.Tab("5 · Proposal") as writing_tab:
             with gr.Row():section=gr.Dropdown(DEFAULT_SECTIONS,value=(DEFAULT_SECTIONS[0] if DEFAULT_SECTIONS else None),label="Section",allow_custom_value=True);high=gr.Checkbox(label="Escalate this draft to Claude (sends this section’s compiled context to the configured cloud API)",value=False)
             additional=gr.Textbox(lines=4,label="Optional additional human context");gen=gr.Button("Compile Context & Draft Section",variant="primary")
             section_update_banner=gr.Markdown()
@@ -2355,7 +2579,7 @@ Register the actual files that must travel with the proposal. Use a stable slot 
                 with gr.Row():
                     restore_version_id=gr.Dropdown(label="Version to restore")
                     restore_version_btn=gr.Button("Restore as a new version",variant="secondary")
-        with gr.Tab("Optional · Synthetic Review & Causal Critique",visible=False) as review_tab:
+        with gr.Tab("Tools · Review & Causal Critique",visible=False) as review_tab:
             gr.Markdown("### Solicitation-grounded synthetic review panel\nFeedback is generated from role archetypes derived from the approved solicitation. It does not represent real reviewers or predict a sponsor decision.")
             review_plan_id=gr.State(None);review_run_id=gr.State(None);review_plan_json=gr.JSON(visible=False);review_run_json=gr.JSON(visible=False)
             with gr.Row():
@@ -2384,7 +2608,7 @@ Register the actual files that must travel with the proposal. Use a stable slot 
                 save_causal_btn=gr.Button("Save new causal model version")
             causal_editor=gr.JSON(label="Causal graph, assumptions, threats, and claim checks")
             causal_history=gr.JSON(label="Append-only causal model history",visible=False);causal_status=gr.Markdown()
-        with gr.Tab("8 · Final Export") as export_tab:
+        with gr.Tab("Proposal · Readiness & Export") as export_tab:
             gr.Markdown("### Human-Approved Grant Assembly\nOnly exact section versions approved by the human are included below or in final exports. AI drafts and unapproved edits are excluded.")
             preview_approved_btn=gr.Button("Refresh Approved Grant Preview",variant="secondary")
             approved_sections_table=gr.Dataframe(headers=["Order","Section","Status","Approved version"],datatype=["number","str","str","number"],interactive=False,label="Approved section assembly")
@@ -2396,7 +2620,7 @@ Register the actual files that must travel with the proposal. Use a stable slot 
             portable_export_status=gr.Markdown()
             check_ready=gr.Button("Check Submission Readiness");readiness_json=gr.JSON(label="Backend readiness gates");readiness_status=gr.Markdown()
             fmt=gr.Radio(["DOCX","PDF","BOTH"],value="DOCX",label="Would you like me to produce a professionally formatted DOCX, PDF, or both?",visible=False);export_btn=gr.Button("Compile Approved Grant",variant="primary",visible=False);export_file=gr.File(label="Generated file(s)",file_count="multiple");export_status=gr.Markdown()
-        with gr.Tab("9 · System & Diagnostics",visible=False) as diagnostics_tab:
+        with gr.Tab("Tools · Diagnostics",visible=False) as diagnostics_tab:
             gr.Markdown("""### Production runtime diagnostics
 This view exposes non-secret runtime/build information and a local HPC benchmark. It does not display API keys or uploaded grant content.""")
             with gr.Row():
@@ -2425,24 +2649,37 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
                 disable_account_btn=gr.Button("Disable account")
                 enable_account_btn=gr.Button("Enable account")
 
-    wizard_pages=[wizard_page_1,wizard_page_2,wizard_page_3,wizard_page_4,wizard_page_5,wizard_page_6,wizard_page_7]
+    wizard_pages=[wizard_page_1,wizard_page_2,wizard_page_3]+wizard_core_pages+wizard_module_pages+[wizard_review_page,wizard_team_page,wizard_routing_page,wizard_preview_page]
     wizard_nav_outputs=wizard_pages+[wizard_rail,wizard_progress]
     wizard_new_btn.click(wizard_go(2),outputs=wizard_nav_outputs,js=wizard_nav_js(2)).then(gateway_callback(authenticated_identity),outputs=[wizard_owner_id,wizard_identity_status])
-    wizard_2_back.click(wizard_go(1),outputs=wizard_nav_outputs,js=wizard_nav_js(1))
-    wizard_2_next.click(validate_grant_ask_and_continue,[wizard_title,wizard_source,wizard_source_url,wizard_source_text,wizard_deadline],wizard_nav_outputs).then(fn=None,js=wizard_nav_js(3))
-    wizard_3_back.click(wizard_go(2),outputs=wizard_nav_outputs,js=wizard_nav_js(2))
-    wizard_3_next.click(wizard_go(4),outputs=wizard_nav_outputs,js=wizard_nav_js(4))
-    wizard_4_back.click(wizard_go(3),outputs=wizard_nav_outputs,js=wizard_nav_js(3))
-    wizard_4_next.click(wizard_after_modules,[wizard_modules],wizard_nav_outputs).then(fn=None,js=wizard_nav_from_progress_js())
-    wizard_5_back.click(wizard_go(4),outputs=wizard_nav_outputs,js=wizard_nav_js(4))
-    wizard_5_next.click(wizard_go(6),outputs=wizard_nav_outputs,js=wizard_nav_js(6))
-    wizard_6_back.click(wizard_team_back,[wizard_modules],wizard_nav_outputs).then(fn=None,js=wizard_nav_from_progress_js())
+    wizard_details_back.click(wizard_go(1),outputs=wizard_nav_outputs,js=wizard_nav_js(1))
+    wizard_details_event=wizard_details_next.click(validate_grant_details_and_continue,[wizard_title,wizard_deadline],wizard_nav_outputs)
+    wizard_details_event.success(fn=None,js=wizard_nav_js(3),queue=False)
+    wizard_source_back.click(wizard_go(2),outputs=wizard_nav_outputs,js=wizard_nav_js(2))
+    wizard_source_event=wizard_source_next.click(validate_grant_source_and_continue,[wizard_source,wizard_source_url,wizard_source_text],wizard_nav_outputs)
+    wizard_source_event.success(fn=None,js=wizard_nav_js(WIZARD_CORE_FIRST),queue=False)
+    for index,(back_button,next_button) in enumerate(zip(wizard_core_back,wizard_core_next)):
+        page=WIZARD_CORE_FIRST+index
+        back_button.click(wizard_go(page-1),outputs=wizard_nav_outputs,js=wizard_nav_js(page-1))
+        next_button.click(wizard_go(page+1),outputs=wizard_nav_outputs,js=wizard_nav_js(page+1))
+    for index,(back_button,next_button) in enumerate(zip(wizard_module_back,wizard_module_next)):
+        page=WIZARD_MODULE_FIRST+index
+        back_button.click(wizard_go(page-1),outputs=wizard_nav_outputs,js=wizard_nav_js(page-1))
+        next_button.click(wizard_go(page+1),outputs=wizard_nav_outputs,js=wizard_nav_js(page+1))
+    wizard_review_back.click(wizard_go(WIZARD_MODULE_LAST),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_MODULE_LAST))
+    wizard_review_next.click(wizard_go(WIZARD_TEAM_PAGE),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_TEAM_PAGE))
+    wizard_team_back.click(wizard_go(WIZARD_REVIEW_PAGE),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_REVIEW_PAGE))
+    wizard_team_next.click(wizard_go(WIZARD_ROUTING_PAGE),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_ROUTING_PAGE))
+    wizard_routing_back.click(wizard_go(WIZARD_TEAM_PAGE),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_TEAM_PAGE))
     wizard_team_add.click(add_wizard_team_invitation,[wizard_team,wizard_team_email,wizard_team_role],[wizard_team,wizard_team_email,wizard_team_remove_choice,wizard_team_status])
     wizard_team_remove.click(remove_wizard_team_invitation,[wizard_team,wizard_team_remove_choice],[wizard_team,wizard_team_remove_choice,wizard_team_status])
-    wizard_6_next.click(gateway_callback(validate_team_and_preview),[wizard_title,wizard_sponsor,wizard_mechanism,wizard_deadline,wizard_modules,wizard_required_modules,wizard_review_mode,wizard_review_required,wizard_routing,wizard_team],wizard_nav_outputs+[wizard_preview]).then(fn=None,js=wizard_nav_from_progress_js())
-    wizard_7_back.click(wizard_go(6),outputs=wizard_nav_outputs,js=wizard_nav_js(6))
-    wizard_preset.change(apply_workflow_preset,[wizard_preset],[wizard_modules,wizard_required_modules]).then(reconcile_module_gates,[wizard_modules,wizard_required_modules],[wizard_required_modules])
-    wizard_modules.change(reconcile_module_gates,[wizard_modules,wizard_required_modules],[wizard_required_modules])
+    wizard_routing_event=wizard_routing_next.click(
+        gateway_callback(validate_routing_and_preview),
+        [wizard_title,wizard_sponsor,wizard_mechanism,wizard_deadline,wizard_review_mode,wizard_routing,wizard_team]+wizard_module_modes,
+        wizard_nav_outputs+[wizard_preview,wizard_modules,wizard_required_modules,wizard_review_required],
+    )
+    wizard_routing_event.success(fn=None,js=wizard_nav_js(WIZARD_PREVIEW_PAGE),queue=False)
+    wizard_preview_back.click(wizard_go(WIZARD_ROUTING_PAGE),outputs=wizard_nav_outputs,js=wizard_nav_js(WIZARD_ROUTING_PAGE))
     wizard_refresh_btn.click(gateway_callback(refresh_projects),outputs=[wizard_existing])
     wizard_import_event=wizard_import_btn.click(gateway_callback(import_portable_project),[wizard_import],[wizard_existing,wizard_import_status]).then(lambda:gr.update(visible=False),outputs=[wizard_shell]).then(gateway_callback(load_project),[wizard_existing],[project_id,project_title,sponsor,mechanism,project_status,agentic_global_notice,requirements_table,section,current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner]).then(gateway_callback(project_workflow_ui),[project_id],[workspace_workflow_summary,workspace_workflow_status,interview_tab,team_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab]).then(gateway_callback(authenticated_identity),outputs=[wizard_owner_id,wizard_identity_status])
     wizard_import_event.success(fn=None,js=WIZARD_HIDE_JS,queue=False)
@@ -2453,7 +2690,6 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
         [wizard_title,wizard_sponsor,wizard_mechanism,wizard_deadline,wizard_grant_type,wizard_source,wizard_source_url,wizard_source_text,wizard_supporting,wizard_brand,wizard_preset,wizard_modules,wizard_required_modules,wizard_review_mode,wizard_review_required,wizard_routing,wizard_team],
         [wizard_shell,project_id,project_title,sponsor,mechanism,project_status,agentic_global_notice,requirements_table,section,current_version,baseline_body,preview_box,write_status,editor,current_section_key,current_competitive_update_event,section_update_banner,workspace_workflow_summary,workspace_workflow_status,interview_tab,team_tab,clinical_tab,competitive_tab,compliance_tab,review_tab,diagnostics_tab,wizard_create_status,wizard_create_btn])
     wizard_create_event.then(fn=None,inputs=[wizard_create_status],js=WIZARD_HIDE_AFTER_CREATE_JS,queue=False)
-
     create.click(gateway_callback(create_project),[project_title,sponsor,mechanism,source,source_url,source_text,supporting,brand],[project_id,project_status,agentic_global_notice,requirements_table,section])
     compile_grant_ask_btn.click(gateway_callback(compile_grant_ask),[project_id],[requirements_table,req_status])
     approve_req.click(gateway_callback(approve_requirements),[project_id],[req_status])
@@ -2519,9 +2755,9 @@ This view exposes non-secret runtime/build information and a local HPC benchmark
     generate_comp_profile_btn.click(gateway_callback(generate_competitive_profile),[project_id],[competitive_profile_json,competitive_status])
     load_competitive_btn.click(gateway_callback(load_competitive),[project_id],[competitive_profile_json,competitor_table,asset_table,provider_status_json,competitive_strategy,competitive_raw,competitive_status,agentic_global_notice])
     run_competitive_btn.click(gateway_callback(run_competitive_intelligence),[project_id],[competitor_table,asset_table,provider_status_json,competitive_strategy,competitive_raw,competitive_status,agentic_global_notice])
-    load_compliance_btn.click(gateway_callback(load_compliance),[project_id],[compliance_profile_state,opportunity_source_preview,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules,compliance_provenance,compliance_findings,compliance_json,artifact_table,compliance_status])
-    compile_compliance_btn.click(gateway_callback(compile_compliance),[project_id],[compliance_profile_state,opportunity_source_preview,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules,compliance_provenance,compliance_findings,compliance_json,compliance_status,section])
-    save_compliance_btn.click(gateway_callback(save_compliance),[project_id,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules],[compliance_profile_state,compliance_rules,compliance_provenance,compliance_findings,compliance_json,compliance_status,section])
+    load_compliance_btn.click(gateway_callback(load_compliance),[project_id],[compliance_profile_state,opportunity_source_preview,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules,compliance_rule_id,compliance_provenance,compliance_findings,compliance_json,artifact_table,compliance_status])
+    compile_compliance_btn.click(gateway_callback(compile_compliance),[project_id],[compliance_profile_state,opportunity_source_preview,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules,compliance_rule_id,compliance_provenance,compliance_findings,compliance_json,compliance_status,section])
+    save_compliance_btn.click(gateway_callback(save_compliance),[project_id,compliance_profile_state,compliance_sponsor,compliance_mechanism,submission_system,compliance_deadline,compliance_rules],[compliance_profile_state,compliance_rules,compliance_rule_id,compliance_provenance,compliance_findings,compliance_json,compliance_status,section])
     approve_compliance_btn.click(gateway_callback(approve_compliance),[project_id],[compliance_provenance,compliance_findings,compliance_json,compliance_status])
     resolve_compliance_btn.click(gateway_callback(resolve_compliance),[project_id,compliance_rule_id,compliance_resolution,compliance_resolution_notes,compliance_resolved_by],[compliance_findings,compliance_json,compliance_status])
     register_artifact_btn.click(gateway_callback(register_submission_artifacts),[project_id,artifact_slot,artifact_files],[artifact_table,compliance_findings,compliance_json,compliance_status])

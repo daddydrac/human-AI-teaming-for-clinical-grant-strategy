@@ -119,6 +119,44 @@ temporary passwords. First login is restricted to password change, and reset
 links are single-use, expiring links delivered through the configured TLS SMTP
 relay.
 
+### Deliver invitations and password resets to real inboxes
+
+Grantspace sends mail directly from the `core` container through an SMTP relay.
+The application is an SMTP client; running it locally does not create a public
+mail server. Configure a relay that is authorized to send mail for the address
+in `SMTP_FROM`:
+
+```dotenv
+APP_PUBLIC_URL=https://grantspace.example.org
+SMTP_HOST=smtp.example.org
+SMTP_PORT=587
+SMTP_SECURITY=starttls
+SMTP_TIMEOUT_SECONDS=30
+SMTP_USERNAME=relay-account
+SMTP_PASSWORD=relay-password
+SMTP_FROM="Grantspace <grantspace@example.org>"
+```
+
+`starttls` on port 587 is the default. For a relay that requires implicit TLS,
+use `SMTP_SECURITY=tls` and `SMTP_PORT=465`. A trusted local relay can explicitly
+use `SMTP_SECURITY=none` (normally port 25); that relay, not Grantspace, remains
+responsible for delivering the message to the recipient's real inbox. Username
+and password are optional only when the relay permits unauthenticated delivery,
+and they must otherwise be configured together. The timeout must be between 1
+and 120 seconds.
+
+`APP_PUBLIC_URL` must be reachable by recipients because invitation and password
+reset emails contain links back to it. `localhost` works only when the recipient
+uses the same computer. After changing SMTP settings, rebuild and recreate the
+application containers:
+
+```bash
+docker compose up -d --build --force-recreate core ui
+```
+
+The non-secret `/api/system/info` response reports only whether email delivery
+is configured and its transport mode; it never returns relay credentials.
+
 For an institutional OIDC deployment, configure the `OIDC_*` settings and use
 `./scripts/start_oidc_gateway.sh`. The enterprise Compose override publishes only
 the TLS gateway and changes the UI/API to `trusted_headers`; direct backend host
