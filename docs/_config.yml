@@ -1,8 +1,8 @@
 title: Grantspace Clinician Guide
 description: Deploy Grantspace, assemble a clinical grant team, and move from a sponsor solicitation to a review-ready proposal.
-url: ""
-baseurl: ""
-repository: ""
+url: "https://daddydrac.github.io"
+baseurl: "/human-AI-teaming-for-clinical-grant-strategy"
+repository: "daddydrac/human-AI-teaming-for-clinical-grant-strategy"
 markdown: kramdown
 permalink: pretty
 exclude:
